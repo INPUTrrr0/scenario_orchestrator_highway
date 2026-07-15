@@ -493,7 +493,7 @@ def run_gui(scenario: Scenario, persistence: Persistence,
         a = Actor(id=next_actor_id(), color=ADD_PALETTE[i % len(ADD_PALETTE)],
                   length=4.5, width=2.0, start=(sx, sy, hd),
                   maneuvers=[Maneuver(type="go_straight", duration=8.0,
-                                      slope=0.125, intercept=0.0, length=116.0)])
+                                      intercept=12.0, slope=0.0)])
         a.build_path()
         scenario.actors.append(a)
         persistence.log_structural("add_actor", a.id)
