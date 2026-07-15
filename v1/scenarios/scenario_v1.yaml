@@ -1,31 +1,34 @@
-map:
-  lane_width: 3.5
-  arm_length: 60
-
-render:
-  pixels_per_meter: 6
-
-# Longitudinal maneuvers use a velocity curve (v0 + accel*t) over a duration;
-# distance travelled is emergent (no "length" parameter). Turns use radius +
-# angle + duration. 8-leg naming: SE = South arm east lane (inbound northbound),
-# EN = East arm north lane (inbound westbound).
+# v1 sample: guaranteed perpendicular collision (DESIGN.md section 5).
+# Ego (0) drives north on SE with ordinary maneuvers. Hero (1) drives west on
+# EN with a function segment: v = ego.speed * dist(self,P) / dist(ego,P),
+# P = cross_NE — the crossing point of the two lane centerlines. The distance
+# ratio stays constant, so both reach P at the same instant regardless of
+# where either actor starts along its leg.
+map: {lane_width: 3.5, arm_length: 40}
+render: {pixels_per_meter: 6.5}
 actors:
-  # Ego. Spawns on the SE leg, cruises straight through heading North at 14.5 m/s.
   - id: 0
-    color: [90, 190, 110]          # green
+    color: [90, 190, 110]
     length: 4.5
     width: 2.0
-    start: {x: 1.75, y: -58, heading: 90}
+    start: {x: 1.75, y: -38, heading: 90}      # SE leg, northbound
     maneuvers:
-      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
-      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
-
-  # Spawns on the EN leg, cruises straight through heading West at 14.5 m/s.
+      - {type: go_straight, duration: 12.0, curve: {v0: 5.5, accel: 0.0}}
   - id: 1
-    color: [210, 70, 60]           # red
+    color: [210, 70, 60]
     length: 4.5
     width: 2.0
-    start: {x: 58, y: 1.75, heading: 180}
+    start: {x: 38, y: 1.75, heading: 180}      # EN leg, westbound
     maneuvers:
-      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
-      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
+      - type: function
+        duration: 12.0
+        out: {speed: n7}                       # yaw unbound -> heading held at 180
+        nodes:
+          - {id: n0, kind: obs, source: "0", field: speed, pos: [30, 30]}
+          - {id: n1, kind: obs, source: self, field: pos, pos: [30, 100]}
+          - {id: n2, kind: map_point, name: cross_NE, pos: [30, 170]}
+          - {id: n3, kind: obs, source: "0", field: pos, pos: [30, 240]}
+          - {id: n4, kind: op, op: dist, inputs: [n1, n2], pos: [230, 110]}
+          - {id: n5, kind: op, op: dist, inputs: [n3, n2], pos: [230, 200]}
+          - {id: n6, kind: op, op: div, inputs: [n4, n5], pos: [430, 155]}
+          - {id: n7, kind: op, op: mul, inputs: [n0, n6], pos: [610, 80]}
