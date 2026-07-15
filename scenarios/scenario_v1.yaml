@@ -5,37 +5,41 @@ map:
 render:
   pixels_per_meter: 6
 
+# Lane centers are at +/-1.75 m. Eastbound uses the south lane (y=-1.75),
+# westbound the north lane (y=+1.75); northbound uses the east lane (x=+1.75),
+# southbound the west lane (x=-1.75). Turns are sized to land in the correct
+# lane and stay within the intersection box (|x|,|y| <= 3.5).
 actors:
-  # Eastbound car that turns left (north) at the intersection.
-  - id: car_A
+  # Eastbound, turns left into the northbound lane.
+  - id: 1
     color: [210, 70, 60]
     length: 4.5
     width: 2.0
     start: {x: -55, y: -1.75, heading: 0}
     maneuvers:
-      - {type: go_straight, length: 45, duration: 3.0, curve: {slope: 0.333, intercept: 0.0}}
-      - {type: turn_left,   radius: 5, angle: 90, duration: 2.5, curve: {slope: 0.4, intercept: 0.0}}
-      - {type: go_straight, length: 45, duration: 3.5, curve: {slope: 0.286, intercept: 0.0}}
+      - {type: go_straight, length: 53.25, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
+      - {type: turn_left,   radius: 3.5, angle: 90, duration: 2.0, curve: {slope: 0.5, intercept: 0.0}}
+      - {type: go_straight, length: 56.25, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
 
-  # Southbound car that decelerates, stops at the line, then accelerates through.
-  - id: car_B
+  # Southbound, decelerates to a stop before the intersection, then accelerates through.
+  - id: 2
     color: [60, 120, 210]
     length: 4.5
     width: 2.0
-    start: {x: 1.75, y: 58, heading: 270}
+    start: {x: -1.75, y: 58, heading: 270}
     maneuvers:
       - {type: go_straight, length: 40, duration: 3.0, curve: {slope: 0.333, intercept: 0.0}}
-      - {type: decelerate,  length: 14, duration: 3.0, curve: {slope: -2.667, intercept: 8.0}}
+      - {type: decelerate,  length: 12, duration: 3.0, curve: {slope: -2.667, intercept: 8.0}}
       - {type: stop,        duration: 2.0, curve: {slope: 0.0, intercept: 0.0}}
-      - {type: accelerate,  length: 40, duration: 4.0, curve: {slope: 2.5, intercept: 0.0}}
+      - {type: accelerate,  length: 20, duration: 4.0, curve: {slope: 2.5, intercept: 0.0}}
 
-  # Westbound car that turns right (north).
-  - id: car_C
+  # Westbound, turns right into the northbound lane (tight corner).
+  - id: 3
     color: [90, 190, 110]
     length: 4.5
     width: 2.0
     start: {x: 55, y: 1.75, heading: 180}
     maneuvers:
-      - {type: go_straight, length: 45, duration: 3.5, curve: {slope: 0.286, intercept: 0.0}}
-      - {type: turn_right,  radius: 5, angle: 90, duration: 2.0, curve: {slope: 0.5, intercept: 0.0}}
-      - {type: go_straight, length: 40, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
+      - {type: go_straight, length: 51.5, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
+      - {type: turn_right,  radius: 1.75, angle: 90, duration: 1.5, curve: {slope: 0.667, intercept: 0.0}}
+      - {type: go_straight, length: 54.5, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}

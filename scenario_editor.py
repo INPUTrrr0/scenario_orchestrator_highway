@@ -317,9 +317,11 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
     import pygame
 
     pygame.init()
-    WIDTH, HEIGHT = 1100, 820
+    WIDTH = 1100
     TOPBAR_H = 56
-    SUBWIN_H = 250
+    CANVAS_H = 720          # bird's-eye view region
+    SUBWIN_H = 250          # timing-curve editor, stacked BELOW the BEV
+    HEIGHT = TOPBAR_H + CANVAS_H + SUBWIN_H
     screen = pygame.display.set_mode((WIDTH, HEIGHT))
     pygame.display.set_caption("Scenario Editor")
     clock = pygame.time.Clock()
@@ -343,7 +345,7 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
 
     ppm = scenario.pixels_per_meter
     canvas_cx = WIDTH // 2
-    canvas_cy = TOPBAR_H + (HEIGHT - TOPBAR_H) // 2
+    canvas_cy = TOPBAR_H + CANVAS_H // 2
 
     def w2s(wx: float, wy: float) -> Tuple[int, int]:
         return int(canvas_cx + wx * ppm), int(canvas_cy - wy * ppm)
@@ -366,6 +368,7 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
     btn_play = pygame.Rect(WIDTH // 2 - 55, 10, 110, 36)
     btn_reset = pygame.Rect(WIDTH // 2 - 190, 10, 110, 36)
     btn_save = pygame.Rect(WIDTH // 2 + 80, 10, 110, 36)
+    time_field = pygame.Rect(52, 14, 84, 28)   # editable current-time scrubber
 
     # ---- subwindow geometry (computed when visible) ----
     def subwin_rect() -> pygame.Rect:
@@ -494,22 +497,29 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         draw_button(btn_reset, "Reset")
         draw_button(btn_play, "Pause" if playing else "Play", active=playing)
         draw_button(btn_save, "Save")
-        info = f"T = {T % scenario.period:5.2f}s / {scenario.period:5.2f}s   " \
-               f"{'PLAYING' if playing else 'PAUSED'}"
-        txt = font.render(info, True, C_TEXT)
-        screen.blit(txt, (20, 18))
+        # editable current-time field: click and type a time to scrub there
+        screen.blit(font.render("T=", True, C_TEXT), (18, 18))
+        focused = (focus_field == "time")
+        pygame.draw.rect(screen, (18, 20, 26), time_field)
+        pygame.draw.rect(screen, C_BTN_HL if focused else (90, 94, 105), time_field, 2)
+        shown = edit_buffer if focused else f"{T % scenario.period:.2f}"
+        screen.blit(font.render(shown, True, C_TEXT), (time_field.x + 6, time_field.y + 5))
+        info = f"/ {scenario.period:.2f}s   {'PLAYING' if playing else 'PAUSED'}"
+        screen.blit(font.render(info, True, C_TEXT), (time_field.right + 10, 18))
         if status_msg and T < status_until:
             st = font_sm.render(status_msg, True, (150, 220, 150))
             screen.blit(st, (WIDTH - st.get_width() - 16, 20))
 
     def draw_subwindow():
-        m = cur_maneuver()
-        if m is None:
-            return
-        a = scenario.actors[selected]
         sw = subwin_rect()
         pygame.draw.rect(screen, C_PANEL, sw)
         pygame.draw.line(screen, (80, 84, 95), (sw.x, sw.y), (sw.right, sw.y), 2)
+        m = cur_maneuver()
+        if playing or selected is None or m is None:
+            hint = "Pause and click an actor to edit its timing curve."
+            screen.blit(font.render(hint, True, (150, 154, 165)), (sw.x + 20, sw.y + 22))
+            return
+        a = scenario.actors[selected]
         title = f"Actor {a.id} — {m.type}  [{man_index + 1}/{len(a.maneuvers)}]"
         screen.blit(font_big.render(title, True, C_TEXT), (sw.x + 16, sw.y + 8))
         bp, bn = btn_prev_next()
@@ -568,6 +578,11 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             fname = persistence.save_version(scenario)
             set_status(f"saved {fname} (parent v{persistence.versions[-1]['parent']})")
             return
+        if time_field.collidepoint(mx, my):
+            playing = False
+            focus_field = "time"
+            edit_buffer = ""
+            return
         # subwindow interactions (only when visible)
         if not playing and selected is not None and cur_maneuver() is not None:
             sw = subwin_rect()
@@ -597,8 +612,8 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                 dragging = "right"; focus_field = None; return
             if sw.collidepoint(mx, my):
                 return  # click inside panel, no actor pick
-        # actor picking (paused only)
-        if not playing and my > TOPBAR_H and my < HEIGHT - (SUBWIN_H if selected is not None else 0):
+        # actor picking (paused only) — canvas region only, never the subwindow
+        if not playing and TOPBAR_H < my < TOPBAR_H + CANVAS_H:
             wx, wy = s2w(mx, my)
             phase = T % scenario.period
             for i, a in enumerate(scenario.actors):
@@ -629,11 +644,15 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             apply_param("slope", new_slope)
 
     def commit_field():
-        nonlocal focus_field, edit_buffer
+        nonlocal focus_field, edit_buffer, T
         if focus_field is None:
             return
         try:
-            apply_param(focus_field, float(edit_buffer))
+            val = float(edit_buffer)
+            if focus_field == "time":
+                T = max(0.0, val)
+            else:
+                apply_param(focus_field, val)
         except ValueError:
             set_status("invalid number")
         focus_field = None
@@ -674,9 +693,8 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         draw_map()
         for i, a in enumerate(scenario.actors):
             draw_actor(i, a)
+        draw_subwindow()   # always stacked below the BEV (no overlap)
         draw_topbar()
-        if not playing and selected is not None:
-            draw_subwindow()
         pygame.display.flip()
 
     pygame.quit()
