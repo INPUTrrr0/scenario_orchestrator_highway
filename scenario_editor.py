@@ -316,10 +316,11 @@ class Persistence:
         with open(self.hist_path, "a") as f:
             f.write(yaml.safe_dump([entry], sort_keys=False))
 
-    def log_structural(self, action: str, actor_id: str) -> None:
+    def log_structural(self, action: str, actor_id: str, **extra) -> None:
         entry = {"timestamp": datetime.now().isoformat(timespec="seconds"),
                  "base_version": self.base_version, "action": action,
                  "actor_id": actor_id}
+        entry.update(extra)
         with open(self.hist_path, "a") as f:
             f.write(yaml.safe_dump([entry], sort_keys=False))
 
@@ -386,7 +387,9 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
     man_index = 0                        # maneuver index within selected actor
     focus_field: Optional[str] = None    # 'slope' | 'intercept' | 'duration'
     edit_buffer = ""
-    dragging: Optional[str] = None       # 'left' | 'right'
+    dragging: Optional[str] = None       # 'left'|'right' (curve) | 'spawn'|'rotate'
+    drag_grab: Optional[Tuple[float, float]] = None   # world point where a spawn drag began
+    drag_orig: Optional[Pose] = None                  # actor start pose at drag begin
     status_msg = ""
     status_until = 0.0
 
@@ -409,20 +412,36 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
 
     def plot_rect() -> pygame.Rect:
         sw = subwin_rect()
-        return pygame.Rect(sw.x + 60, sw.y + 44, 520, SUBWIN_H - 90)
+        return pygame.Rect(sw.x + 55, sw.y + 56, 470, SUBWIN_H - 96)
 
-    def field_rects() -> dict:
-        sw = subwin_rect()
-        y = sw.y + 70
-        x = sw.x + 640
-        return {"slope": pygame.Rect(x + 70, y, 110, 26),
-                "intercept": pygame.Rect(x + 70, y + 44, 110, 26),
-                "duration": pygame.Rect(x + 70, y + 88, 110, 26)}
+    def geom_field_names(m: Maneuver) -> List[str]:
+        if m.type in ("go_straight", "accelerate", "decelerate"):
+            return ["length"]
+        if m.type in ("turn_left", "turn_right"):
+            return ["radius", "angle"]
+        return []
 
-    def btn_prev_next() -> Tuple[pygame.Rect, pygame.Rect]:
+    def field_rects(m: Maneuver) -> dict:
         sw = subwin_rect()
-        return (pygame.Rect(sw.right - 150, sw.y + 10, 60, 26),
-                pygame.Rect(sw.right - 82, sw.y + 10, 60, 26))
+        base_y = sw.y + 56
+        colA_x, colB_x = sw.x + 620, sw.x + 850
+        rects = {"slope": pygame.Rect(colA_x, base_y, 90, 26),
+                 "intercept": pygame.Rect(colA_x, base_y + 42, 90, 26),
+                 "duration": pygame.Rect(colA_x, base_y + 84, 90, 26)}
+        for i, name in enumerate(geom_field_names(m)):
+            rects[name] = pygame.Rect(colB_x, base_y + i * 42, 90, 26)
+        return rects
+
+    def field_value(m: Maneuver, name: str) -> float:
+        return getattr(m, name)
+
+    def header_buttons() -> dict:
+        sw = subwin_rect()
+        y = sw.y + 12
+        return {"prev": pygame.Rect(sw.right - 300, y, 54, 26),
+                "next": pygame.Rect(sw.right - 240, y, 54, 26),
+                "add_mvr": pygame.Rect(sw.right - 178, y, 80, 26),
+                "del_mvr": pygame.Rect(sw.right - 92, y, 80, 26)}
 
     def cur_maneuver() -> Optional[Maneuver]:
         if selected is None:
@@ -470,6 +489,52 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         selected = None
         man_index = 0
         set_status(f"removed actor {a.id}")
+
+    def do_add_maneuver() -> None:
+        nonlocal man_index
+        if selected is None:
+            return
+        a = scenario.actors[selected]
+        # insert a default straight segment right after the current maneuver
+        new_m = Maneuver(type="go_straight", duration=2.0, slope=0.5,
+                         intercept=0.0, length=20.0)
+        at = man_index + 1 if a.maneuvers else 0
+        a.maneuvers.insert(at, new_m)
+        a.build_path()
+        man_index = at
+        persistence.log_structural("add_maneuver", a.id,
+                                   maneuver_index=at, maneuver_type="go_straight")
+        set_status(f"added maneuver to actor {a.id} at {at}")
+
+    def do_del_maneuver() -> None:
+        nonlocal man_index
+        if selected is None:
+            return
+        a = scenario.actors[selected]
+        if len(a.maneuvers) <= 1:
+            set_status("cannot delete the last maneuver")
+            return
+        removed = a.maneuvers.pop(man_index)
+        a.build_path()
+        persistence.log_structural("del_maneuver", a.id,
+                                   maneuver_index=man_index,
+                                   maneuver_type=removed.type)
+        man_index = min(man_index, len(a.maneuvers) - 1)
+        set_status(f"deleted maneuver from actor {a.id}")
+
+    def commit_spawn_edit() -> None:
+        # log the net spawn change once, on drag release
+        if selected is None or drag_orig is None:
+            return
+        a = scenario.actors[selected]
+        if a.start != drag_orig:
+            persistence.log_structural(
+                "move_actor", a.id,
+                old_start={"x": round(drag_orig[0], 3), "y": round(drag_orig[1], 3),
+                           "heading": round(drag_orig[2], 3)},
+                new_start={"x": round(a.start[0], 3), "y": round(a.start[1], 3),
+                           "heading": round(a.start[2], 3)})
+            set_status(f"moved actor {a.id} spawn")
 
     # ---- editing helpers ----
     def apply_param(param: str, new_val: float) -> None:
@@ -527,24 +592,52 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                                (-half, half, -half, 0), (half, -half, half, 0)]:
             pygame.draw.line(screen, C_EDGE, w2s(sx, sy), w2s(ex, ey), 2)
 
-    def draw_actor(idx: int, a: Actor):
-        phase = T % scenario.period
-        x, y, hd = a.pose_at_time(phase)
+    def actor_corners_world(pose: Pose, a: Actor):
+        x, y, hd = pose
         h = math.radians(hd)
         fx, fy = math.cos(h), math.sin(h)
         px, py = -math.sin(h), math.cos(h)
         L, W = a.length / 2, a.width / 2
-        corners_w = [(x + fx * L + px * W, y + fy * L + py * W),
-                     (x + fx * L - px * W, y + fy * L - py * W),
-                     (x - fx * L - px * W, y - fy * L - py * W),
-                     (x - fx * L + px * W, y - fy * L + py * W)]
-        pts = [w2s(*c) for c in corners_w]
+        return [(x + fx * L + px * W, y + fy * L + py * W),
+                (x + fx * L - px * W, y + fy * L - py * W),
+                (x - fx * L - px * W, y - fy * L - py * W),
+                (x - fx * L + px * W, y - fy * L + py * W)]
+
+    def rotation_handle_world(a: Actor) -> Tuple[float, float]:
+        sx, sy, hd = a.start
+        h = math.radians(hd)
+        r = a.length / 2 + 2.5
+        return (sx + math.cos(h) * r, sy + math.sin(h) * r)
+
+    def point_in_pose(a: Actor, pose: Pose, wx: float, wy: float) -> bool:
+        cx, cy, hd = pose
+        h = math.radians(hd)
+        dx, dy = wx - cx, wy - cy
+        along = dx * math.cos(h) + dy * math.sin(h)
+        lat = -dx * math.sin(h) + dy * math.cos(h)
+        return abs(along) <= a.length / 2 + 0.5 and abs(lat) <= a.width / 2 + 0.5
+
+    def draw_actor(idx: int, a: Actor):
+        phase = T % scenario.period
+        x, y, hd = a.pose_at_time(phase)
+        pts = [w2s(*c) for c in actor_corners_world((x, y, hd), a)]
         pygame.draw.polygon(screen, a.color, pts)
         pygame.draw.polygon(screen, (20, 20, 20), pts, 1)
         # heading indicator (front edge)
         pygame.draw.line(screen, (250, 250, 250), pts[0], pts[1], 3)
         if idx == selected:
             pygame.draw.polygon(screen, C_SEL, pts, 3)
+            # spawn marker (draggable) + rotation handle, only when paused
+            if not playing:
+                spts = [w2s(*c) for c in actor_corners_world(a.start, a)]
+                pygame.draw.polygon(screen, C_SEL, spts, 2)
+                sc0 = w2s(a.start[0], a.start[1])
+                hpt = w2s(*rotation_handle_world(a))
+                pygame.draw.line(screen, C_SEL, sc0, hpt, 2)
+                pygame.draw.circle(screen, C_SEL, hpt, 6)
+                tag = font_sm.render("spawn (drag to move, handle to rotate)",
+                                     True, C_SEL)
+                screen.blit(tag, (spts[3][0], spts[3][1] + 4))
         label = font_sm.render(a.id, True, C_TEXT)
         lp = w2s(x, y)
         screen.blit(label, (lp[0] - label.get_width() // 2, lp[1] - 8))
@@ -591,10 +684,12 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             return
         a = scenario.actors[selected]
         title = f"Actor {a.id} — {m.type}  [{man_index + 1}/{len(a.maneuvers)}]"
-        screen.blit(font_big.render(title, True, C_TEXT), (sw.x + 16, sw.y + 8))
-        bp, bn = btn_prev_next()
-        draw_button(bp, "prev")
-        draw_button(bn, "next")
+        screen.blit(font_big.render(title, True, C_TEXT), (sw.x + 16, sw.y + 10))
+        hb = header_buttons()
+        draw_button(hb["prev"], "prev")
+        draw_button(hb["next"], "next")
+        draw_button(hb["add_mvr"], "+ mvr")
+        draw_button(hb["del_mvr"], "- mvr", enabled=(len(a.maneuvers) > 1))
 
         pr = plot_rect()
         pygame.draw.rect(screen, (18, 20, 26), pr)
@@ -621,23 +716,23 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             mx = t2x(tl)
             pygame.draw.line(screen, (250, 120, 120), (mx, pr.y), (mx, pr.bottom), 1)
 
-        # fields
-        fr = field_rects()
-        vals = {"slope": m.slope, "intercept": m.intercept, "duration": m.duration}
+        # fields: timing (slope/intercept/duration) + geometry (length | radius,angle)
+        fr = field_rects(m)
         for key, rect in fr.items():
             screen.blit(font.render(key, True, C_TEXT), (rect.x - 78, rect.y + 4))
             focused = (focus_field == key)
             pygame.draw.rect(screen, (18, 20, 26), rect)
             pygame.draw.rect(screen, C_BTN_HL if focused else (90, 94, 105), rect, 2)
-            shown = edit_buffer if focused else f"{vals[key]:.4g}"
+            shown = edit_buffer if focused else f"{field_value(m, key):.4g}"
             screen.blit(font.render(shown, True, C_TEXT), (rect.x + 6, rect.y + 4))
-        hint = "drag endpoints, or click a field and type; Enter to apply"
+        hint = "drag curve endpoints or a field + type (Enter). +/- mvr add/delete."
         screen.blit(font_sm.render(hint, True, (140, 144, 155)),
-                    (fr["slope"].x - 78, fr["duration"].bottom + 12))
+                    (pr.x, pr.bottom + 10))
 
     # ---- event handling ----
     def handle_click(mx, my):
         nonlocal playing, T, selected, man_index, focus_field, edit_buffer, dragging
+        nonlocal drag_grab, drag_orig
         if btn_play.collidepoint(mx, my):
             playing = not playing
             return
@@ -662,22 +757,26 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         # subwindow interactions (only when visible)
         if not playing and selected is not None and cur_maneuver() is not None:
             sw = subwin_rect()
-            bp, bn = btn_prev_next()
+            hb = header_buttons()
             a = scenario.actors[selected]
-            if bp.collidepoint(mx, my):
+            if hb["prev"].collidepoint(mx, my):
                 man_index = (man_index - 1) % len(a.maneuvers)
                 focus_field = None
                 return
-            if bn.collidepoint(mx, my):
+            if hb["next"].collidepoint(mx, my):
                 man_index = (man_index + 1) % len(a.maneuvers)
                 focus_field = None
                 return
-            for key, rect in field_rects().items():
+            if hb["add_mvr"].collidepoint(mx, my):
+                do_add_maneuver(); focus_field = None; return
+            if hb["del_mvr"].collidepoint(mx, my):
+                do_del_maneuver(); focus_field = None; return
+            m = cur_maneuver()
+            for key, rect in field_rects(m).items():
                 if rect.collidepoint(mx, my):
                     focus_field = key
                     edit_buffer = ""
                     return
-            m = cur_maneuver()
             pr = plot_rect()
             t2x, v2y, _, tmax, _, _ = plot_maps(m, pr)
             pl = (t2x(0), v2y(m.intercept))
@@ -688,23 +787,43 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                 dragging = "right"; focus_field = None; return
             if sw.collidepoint(mx, my):
                 return  # click inside panel, no actor pick
-        # actor picking (paused only) — canvas region only, never the subwindow
+        # BEV interactions (paused only) — canvas region, never the subwindow
         if not playing and TOPBAR_H < my < TOPBAR_H + CANVAS_H:
             wx, wy = s2w(mx, my)
+            # spawn drag / rotate on the selected actor's start marker
+            if selected is not None:
+                a = scenario.actors[selected]
+                hpt = w2s(*rotation_handle_world(a))
+                if (mx - hpt[0]) ** 2 + (my - hpt[1]) ** 2 < 100:
+                    dragging = "rotate"; drag_orig = a.start; focus_field = None
+                    return
+                if point_in_pose(a, a.start, wx, wy):
+                    dragging = "spawn"; drag_grab = (wx, wy); drag_orig = a.start
+                    focus_field = None
+                    return
+            # otherwise pick an actor by its (moving) body
             phase = T % scenario.period
             for i, a in enumerate(scenario.actors):
-                x, y, hd = a.pose_at_time(phase)
-                h = math.radians(hd)
-                dx, dy = wx - x, wy - y
-                along = dx * math.cos(h) + dy * math.sin(h)
-                lat = -dx * math.sin(h) + dy * math.cos(h)
-                if abs(along) <= a.length / 2 + 0.5 and abs(lat) <= a.width / 2 + 0.5:
+                if point_in_pose(a, a.pose_at_time(phase), wx, wy):
                     selected = i
                     man_index = a.active_index(phase) if a.total > phase else 0
                     focus_field = None
                     return
 
     def handle_drag(mx, my):
+        # spawn move / heading rotate on the selected actor
+        if dragging in ("spawn", "rotate") and selected is not None:
+            a = scenario.actors[selected]
+            wx, wy = s2w(mx, my)
+            if dragging == "spawn" and drag_grab is not None:
+                nx = drag_orig[0] + (wx - drag_grab[0])
+                ny = drag_orig[1] + (wy - drag_grab[1])
+                a.start = (nx, ny, a.start[2])
+            else:  # rotate about the start point
+                hd = math.degrees(math.atan2(wy - a.start[1], wx - a.start[0]))
+                a.start = (a.start[0], a.start[1], round(hd, 1))
+            a.build_path()
+            return
         m = cur_maneuver()
         if m is None:
             return
@@ -747,7 +866,11 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 handle_click(*event.pos)
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                if dragging in ("spawn", "rotate"):
+                    commit_spawn_edit()
                 dragging = None
+                drag_grab = None
+                drag_orig = None
             elif event.type == pygame.MOUSEMOTION and dragging:
                 handle_drag(*event.pos)
             elif event.type == pygame.KEYDOWN:

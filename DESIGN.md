@@ -89,6 +89,8 @@ The default sample places the ego (ID 0, green) on `SE` and actor 1 (red) on `EN
 - Selection only while paused: click an actor → outline + open the subwindow titled with its ID.
 - Subwindow shows the maneuver active at the paused time (prev/next steps through the list). Y-axis label switches between "progress" and "velocity (m/s)" by `curve_kind`. Edit via text fields **and** draggable plot endpoints (left endpoint → intercept, right endpoint → end value → slope). Every commit re-precomputes the path and is logged.
 - **Add actor:** spawns a new actor with the next integer ID on the next inbound leg (cycling SE/EN/WS/NW) with a default straight-through maneuver. **Remove actor:** drops the selected actor. Both are recorded in the edit log as structural entries (`action: add_actor|remove_actor`).
+- **Spawn editing (drag in BEV):** the selected actor shows a highlighted **start marker** at its start pose plus a **rotation handle**. Drag the marker body to move the spawn `(x, y)` (the whole trajectory shifts rigidly); drag the handle to set the start heading. Committed on release and logged (`action: move_actor` with old/new start).
+- **Maneuver list editing:** `+ mvr` inserts a default `go_straight` after the current maneuver; `- mvr` deletes the current one (kept ≥ 1). Per maneuver, geometry params are editable alongside the timing curve — `length` for straight/accel/decel, or `radius` + `angle` for turns — as text fields. (Reordering and changing a maneuver's type remain YAML-only by design.)
 
 ## 7. Persistence, versioning & provenance (D5)
 
