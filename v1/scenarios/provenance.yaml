@@ -19,3 +19,7 @@ versions:
   file: scenario_v5.yaml
   parent: 4
   created: '2026-07-15T17:22:38'
+- version: 6
+  file: scenario_v6.yaml
+  parent: 1
+  created: '2026-07-15T17:25:57'

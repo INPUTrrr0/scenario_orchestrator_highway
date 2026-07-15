@@ -248,3 +248,19 @@
   parameter: duration
   old_value: 2.0
   new_value: 5.0
+- timestamp: '2026-07-15T17:24:46'
+  base_version: 1
+  action: add_actor
+  actor_id: '2'
+- timestamp: '2026-07-15T17:25:07'
+  base_version: 1
+  action: add_actor
+  actor_id: '3'
+- timestamp: '2026-07-15T17:25:21'
+  base_version: 1
+  action: add_actor
+  actor_id: '4'
+- timestamp: '2026-07-15T17:25:33'
+  base_version: 1
+  action: add_actor
+  actor_id: '5'
