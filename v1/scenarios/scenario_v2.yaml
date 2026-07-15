@@ -1,0 +1,108 @@
+map:
+  lane_width: 3.5
+  arm_length: 40.0
+render:
+  pixels_per_meter: 6.5
+actors:
+- id: '0'
+  color:
+  - 90
+  - 190
+  - 110
+  length: 4.5
+  width: 2.0
+  start:
+    x: 1.75
+    y: -38.0
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 3.0
+    curve:
+      v0: 10.0
+      accel: 0.0
+  - type: go_straight
+    duration: 9.0
+    curve:
+      v0: 2.0
+      accel: 0.0
+- id: '1'
+  color:
+  - 210
+  - 70
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: 38.0
+    y: 1.75
+    heading: 180.0
+  maneuvers:
+  - type: function
+    duration: 12.0
+    out:
+      speed: n7
+    nodes:
+    - id: n0
+      kind: obs
+      pos:
+      - 30
+      - 30
+      source: '0'
+      field: speed
+    - id: n1
+      kind: obs
+      pos:
+      - 30
+      - 100
+      source: self
+      field: pos
+    - id: n2
+      kind: map_point
+      pos:
+      - 30
+      - 170
+      name: cross_NE
+    - id: n3
+      kind: obs
+      pos:
+      - 30
+      - 240
+      source: '0'
+      field: pos
+    - id: n4
+      kind: op
+      pos:
+      - 230
+      - 110
+      op: dist
+      inputs:
+      - n1
+      - n2
+    - id: n5
+      kind: op
+      pos:
+      - 230
+      - 200
+      op: dist
+      inputs:
+      - n3
+      - n2
+    - id: n6
+      kind: op
+      pos:
+      - 430
+      - 155
+      op: div
+      inputs:
+      - n4
+      - n5
+    - id: n7
+      kind: op
+      pos:
+      - 610
+      - 80
+      op: mul
+      inputs:
+      - n0
+      - n6
