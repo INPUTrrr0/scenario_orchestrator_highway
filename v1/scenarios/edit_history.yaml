@@ -226,3 +226,25 @@
   node: n8
   old: 0.05
   new: 0.02
+- timestamp: '2026-07-15T17:21:48'
+  base_version: 4
+  actor_id: '0'
+  maneuver_index: 1
+  maneuver_type: function
+  parameter: duration
+  old_value: 10.0
+  new_value: 5.0
+- timestamp: '2026-07-15T17:21:50'
+  base_version: 4
+  action: add_maneuver
+  actor_id: '0'
+  maneuver_index: 2
+  maneuver_type: go_straight
+- timestamp: '2026-07-15T17:21:56'
+  base_version: 4
+  actor_id: '0'
+  maneuver_index: 2
+  maneuver_type: go_straight
+  parameter: duration
+  old_value: 2.0
+  new_value: 5.0
