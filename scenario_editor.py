@@ -50,6 +50,9 @@ Pose = Tuple[float, float, float]  # (x, y, heading_deg)
 VELOCITY_KINDS = {"accelerate", "decelerate"}
 GEOMETRIC_KINDS = {"go_straight", "turn_left", "turn_right", "accelerate", "decelerate"}
 ALL_MANEUVER_TYPES = GEOMETRIC_KINDS | {"stop"}
+# order used when cycling a maneuver's type in the editor
+MANEUVER_TYPE_CYCLE = ["go_straight", "turn_left", "turn_right",
+                       "accelerate", "decelerate", "stop"]
 
 
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -441,7 +444,8 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         return {"prev": pygame.Rect(sw.right - 300, y, 54, 26),
                 "next": pygame.Rect(sw.right - 240, y, 54, 26),
                 "add_mvr": pygame.Rect(sw.right - 178, y, 80, 26),
-                "del_mvr": pygame.Rect(sw.right - 92, y, 80, 26)}
+                "del_mvr": pygame.Rect(sw.right - 92, y, 80, 26),
+                "type": pygame.Rect(sw.x + 16, sw.y + 34, 220, 22)}
 
     def cur_maneuver() -> Optional[Maneuver]:
         if selected is None:
@@ -521,6 +525,48 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                                    maneuver_type=removed.type)
         man_index = min(man_index, len(a.maneuvers) - 1)
         set_status(f"deleted maneuver from actor {a.id}")
+
+    def do_cycle_maneuver_type() -> None:
+        nonlocal focus_field
+        if selected is None:
+            return
+        a = scenario.actors[selected]
+        m = a.maneuvers[man_index]
+        old_type = m.type
+        idx = MANEUVER_TYPE_CYCLE.index(old_type) if old_type in MANEUVER_TYPE_CYCLE else -1
+        new_type = MANEUVER_TYPE_CYCLE[(idx + 1) % len(MANEUVER_TYPE_CYCLE)]
+        old_kind = m.curve_kind
+        m.type = new_type
+        new_kind = m.curve_kind
+        # fill sensible geometry defaults for the new type
+        if new_type in ("go_straight", "accelerate", "decelerate") and m.length <= 0:
+            m.length = 20.0
+        if new_type in ("turn_left", "turn_right"):
+            if m.radius <= 0:
+                m.radius = 5.0
+            if m.angle <= 0:
+                m.angle = 90.0
+        # reset the curve when the curve *kind* changes (progress <-> velocity)
+        if new_kind != old_kind:
+            if new_kind == "progress":
+                m.intercept, m.slope = 0.0, 1.0 / max(0.05, m.duration)
+            else:  # velocity
+                m.intercept, m.slope = (0.0, 2.0) if new_type == "accelerate" else (8.0, -2.0)
+        # nudge signs/values so accel/decel stay meaningful
+        if new_type == "accelerate" and m.slope <= 0:
+            m.slope = 2.0
+        if new_type == "decelerate":
+            if m.slope >= 0:
+                m.slope = -2.0
+            if m.intercept <= 0:
+                m.intercept = 8.0
+        if new_type == "stop":
+            m.slope, m.intercept = 0.0, 0.0
+        a.build_path()
+        focus_field = None
+        persistence.log_structural("set_maneuver_type", a.id, maneuver_index=man_index,
+                                   old_type=old_type, new_type=new_type)
+        set_status(f"actor {a.id} maneuver {man_index}: {old_type} -> {new_type}")
 
     def commit_spawn_edit() -> None:
         # log the net spawn change once, on drag release
@@ -690,6 +736,7 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         draw_button(hb["next"], "next")
         draw_button(hb["add_mvr"], "+ mvr")
         draw_button(hb["del_mvr"], "- mvr", enabled=(len(a.maneuvers) > 1))
+        draw_button(hb["type"], f"type: {m.type}  (cycle)")
 
         pr = plot_rect()
         pygame.draw.rect(screen, (18, 20, 26), pr)
@@ -771,6 +818,8 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                 do_add_maneuver(); focus_field = None; return
             if hb["del_mvr"].collidepoint(mx, my):
                 do_del_maneuver(); focus_field = None; return
+            if hb["type"].collidepoint(mx, my):
+                do_cycle_maneuver_type(); return
             m = cur_maneuver()
             for key, rect in field_rects(m).items():
                 if rect.collidepoint(mx, my):
@@ -796,10 +845,12 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                 hpt = w2s(*rotation_handle_world(a))
                 if (mx - hpt[0]) ** 2 + (my - hpt[1]) ** 2 < 100:
                     dragging = "rotate"; drag_orig = a.start; focus_field = None
+                    T = 0.0  # jump to spawn so the marker and body coincide
                     return
                 if point_in_pose(a, a.start, wx, wy):
                     dragging = "spawn"; drag_grab = (wx, wy); drag_orig = a.start
                     focus_field = None
+                    T = 0.0
                     return
             # otherwise pick an actor by its (moving) body
             phase = T % scenario.period
