@@ -1,0 +1,704 @@
+#!/usr/bin/env python3
+"""
+Scenario Editor
+===============
+Load an orchestrated intersection scenario (YAML), visualize it in a bird's-eye
+(BEV) pygame view, play/loop it, and edit per-maneuver timing curves.
+
+Model (see DESIGN.md):
+  * Chained path primitives: each maneuver is a geometric segment chained at the
+    actually-reached end pose of the previous maneuver (no teleports).
+  * Linear timing curve whose meaning is per-maneuver:
+        - geometric maneuvers  -> progress-fraction vs time
+        - accelerate/decelerate -> velocity vs time (slope = accel, intercept = v0)
+  * Actors run maneuvers sequentially, all in parallel on one looping global
+    clock; an actor that finishes its list holds its final pose until loop reset.
+  * Map: a 4-way intersection (one N-S carriageway, one E-W carriageway).
+  * Edits are logged to edit_history.yaml; saving writes a version-numbered file
+    and records a branching provenance graph in provenance.yaml.
+
+Coordinates: graph/Cartesian, meters, origin at intersection center,
+x = East, y = North (y up), heading in degrees CCW from East.
+
+Usage:
+    python scenario_editor.py [scenario.yaml]
+
+Controls:
+    Space / Play button : play-pause (loops forever)
+    Reset button        : clock -> 0
+    Save button         : write next version + update provenance
+    Click actor (paused): select; opens timing-curve editor below
+    prev / next         : step through the selected actor's maneuvers
+    drag curve endpoints or edit the slope/intercept/duration fields
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import List, Optional, Tuple
+
+import yaml
+
+Pose = Tuple[float, float, float]  # (x, y, heading_deg)
+
+# Maneuver classes whose linear curve is interpreted as velocity(t) rather than
+# progress(t).
+VELOCITY_KINDS = {"accelerate", "decelerate"}
+GEOMETRIC_KINDS = {"go_straight", "turn_left", "turn_right", "accelerate", "decelerate"}
+
+
+def clamp(v: float, lo: float, hi: float) -> float:
+    return lo if v < lo else hi if v > hi else v
+
+
+# --------------------------------------------------------------------------- #
+# Data model
+# --------------------------------------------------------------------------- #
+@dataclass
+class Maneuver:
+    type: str
+    duration: float = 1.0
+    slope: float = 0.0
+    intercept: float = 0.0
+    # geometry params (only some apply per type)
+    length: float = 0.0
+    radius: float = 0.0
+    angle: float = 90.0
+
+    @property
+    def curve_kind(self) -> str:
+        return "velocity" if self.type in VELOCITY_KINDS else "progress"
+
+    # progress fraction u in [0, 1] at maneuver-local time t
+    def progress(self, t: float) -> float:
+        if self.type == "stop":
+            return 0.0
+        if self.curve_kind == "progress":
+            return clamp(self.slope * t + self.intercept, 0.0, 1.0)
+        # velocity kind: integrate v(t) = intercept + slope*t -> distance -> u
+        t_eff = t
+        if self.slope < 0:  # do not let velocity go negative
+            t_stop = -self.intercept / self.slope if self.slope != 0 else t
+            t_eff = clamp(t, 0.0, max(0.0, t_stop))
+        s = self.intercept * t_eff + 0.5 * self.slope * t_eff * t_eff
+        if self.length <= 0:
+            return 0.0
+        return clamp(s / self.length, 0.0, 1.0)
+
+    # world pose after travelling fraction u along this segment, given start pose
+    def pose_at(self, start: Pose, u: float) -> Pose:
+        sx, sy, sh = start
+        h = math.radians(sh)
+        if self.type == "stop":
+            return (sx, sy, sh)
+        if self.type in ("go_straight", "accelerate", "decelerate"):
+            x = sx + self.length * u * math.cos(h)
+            y = sy + self.length * u * math.sin(h)
+            return (x, y, sh)
+        if self.type == "turn_left":  # CCW arc
+            cx = sx - self.radius * math.sin(h)
+            cy = sy + self.radius * math.cos(h)
+            phi0 = math.atan2(sy - cy, sx - cx)
+            delta = math.radians(self.angle) * u
+            x = cx + self.radius * math.cos(phi0 + delta)
+            y = cy + self.radius * math.sin(phi0 + delta)
+            return (x, y, sh + self.angle * u)
+        if self.type == "turn_right":  # CW arc
+            cx = sx + self.radius * math.sin(h)
+            cy = sy - self.radius * math.cos(h)
+            phi0 = math.atan2(sy - cy, sx - cx)
+            delta = -math.radians(self.angle) * u
+            x = cx + self.radius * math.cos(phi0 + delta)
+            y = cy + self.radius * math.sin(phi0 + delta)
+            return (x, y, sh - self.angle * u)
+        # unknown type -> hold
+        return (sx, sy, sh)
+
+    # pose reached at end of the maneuver's own duration (used for chaining)
+    def end_pose(self, start: Pose) -> Pose:
+        return self.pose_at(start, self.progress(self.duration))
+
+    def to_dict(self) -> dict:
+        d: dict = {"type": self.type, "duration": round(self.duration, 4),
+                   "curve": {"slope": round(self.slope, 4),
+                             "intercept": round(self.intercept, 4)}}
+        if self.type in ("go_straight", "accelerate", "decelerate"):
+            d["length"] = round(self.length, 4)
+        elif self.type in ("turn_left", "turn_right"):
+            d["radius"] = round(self.radius, 4)
+            d["angle"] = round(self.angle, 4)
+        return d
+
+
+@dataclass
+class Actor:
+    id: str
+    color: Tuple[int, int, int]
+    length: float
+    width: float
+    start: Pose
+    maneuvers: List[Maneuver] = field(default_factory=list)
+    # precomputed:
+    start_poses: List[Pose] = field(default_factory=list)
+    cum: List[float] = field(default_factory=list)
+    total: float = 0.0
+    final_pose: Pose = (0.0, 0.0, 0.0)
+
+    def build_path(self) -> None:
+        p = self.start
+        self.start_poses = []
+        self.cum = [0.0]
+        for m in self.maneuvers:
+            self.start_poses.append(p)
+            p = m.end_pose(p)
+            self.cum.append(self.cum[-1] + max(0.0, m.duration))
+        self.total = self.cum[-1]
+        self.final_pose = p
+
+    def active_index(self, phase: float) -> int:
+        # index of maneuver active at local phase (assumes phase < total)
+        for i in range(len(self.maneuvers)):
+            if self.cum[i] <= phase < self.cum[i + 1]:
+                return i
+        return max(0, len(self.maneuvers) - 1)
+
+    def pose_at_time(self, phase: float) -> Pose:
+        if self.total <= 0 or not self.maneuvers:
+            return self.final_pose or self.start
+        if phase >= self.total:
+            return self.final_pose
+        i = self.active_index(phase)
+        t_local = phase - self.cum[i]
+        u = self.maneuvers[i].progress(t_local)
+        return self.maneuvers[i].pose_at(self.start_poses[i], u)
+
+    def to_dict(self) -> dict:
+        return {"id": self.id, "color": list(self.color),
+                "length": self.length, "width": self.width,
+                "start": {"x": round(self.start[0], 4), "y": round(self.start[1], 4),
+                          "heading": round(self.start[2], 4)},
+                "maneuvers": [m.to_dict() for m in self.maneuvers]}
+
+
+@dataclass
+class MapConfig:
+    lane_width: float = 3.5
+    arm_length: float = 60.0
+
+
+@dataclass
+class Scenario:
+    map: MapConfig
+    actors: List[Actor]
+    pixels_per_meter: float = 6.0
+
+    def build_paths(self) -> None:
+        for a in self.actors:
+            a.build_path()
+
+    @property
+    def period(self) -> float:
+        return max([a.total for a in self.actors] + [1e-6])
+
+    def to_dict(self) -> dict:
+        return {"map": {"lane_width": self.map.lane_width, "arm_length": self.map.arm_length},
+                "render": {"pixels_per_meter": self.pixels_per_meter},
+                "actors": [a.to_dict() for a in self.actors]}
+
+
+# --------------------------------------------------------------------------- #
+# Loading
+# --------------------------------------------------------------------------- #
+def load_scenario(path: str) -> Scenario:
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f)
+    mp = raw.get("map", {}) or {}
+    mapcfg = MapConfig(lane_width=float(mp.get("lane_width", 3.5)),
+                       arm_length=float(mp.get("arm_length", 60.0)))
+    ppm = float((raw.get("render", {}) or {}).get("pixels_per_meter", 6.0))
+    actors: List[Actor] = []
+    for ad in raw.get("actors", []):
+        st = ad.get("start", {})
+        mans: List[Maneuver] = []
+        for md in ad.get("maneuvers", []):
+            curve = md.get("curve", {}) or {}
+            mans.append(Maneuver(
+                type=md["type"],
+                duration=float(md.get("duration", 1.0)),
+                slope=float(curve.get("slope", 0.0)),
+                intercept=float(curve.get("intercept", 0.0)),
+                length=float(md.get("length", 0.0)),
+                radius=float(md.get("radius", 0.0)),
+                angle=float(md.get("angle", 90.0)),
+            ))
+        actors.append(Actor(
+            id=str(ad["id"]),
+            color=tuple(ad.get("color", [200, 80, 80])),
+            length=float(ad.get("length", 4.5)),
+            width=float(ad.get("width", 2.0)),
+            start=(float(st.get("x", 0.0)), float(st.get("y", 0.0)),
+                   float(st.get("heading", 0.0))),
+            maneuvers=mans,
+        ))
+    sc = Scenario(map=mapcfg, actors=actors, pixels_per_meter=ppm)
+    sc.build_paths()
+    return sc
+
+
+# --------------------------------------------------------------------------- #
+# Persistence: edit log + versioned save + provenance graph
+# --------------------------------------------------------------------------- #
+class Persistence:
+    def __init__(self, scenarios_dir: str, loaded_file: Optional[str]):
+        self.dir = scenarios_dir
+        os.makedirs(self.dir, exist_ok=True)
+        self.prov_path = os.path.join(self.dir, "provenance.yaml")
+        self.hist_path = os.path.join(self.dir, "edit_history.yaml")
+        self.versions: List[dict] = self._load_provenance()
+        self.base_version = self._resolve_base(loaded_file)
+
+    def _load_provenance(self) -> List[dict]:
+        if os.path.exists(self.prov_path):
+            data = yaml.safe_load(open(self.prov_path)) or {}
+            return list(data.get("versions", []))
+        return []
+
+    def _write_provenance(self) -> None:
+        with open(self.prov_path, "w") as f:
+            yaml.safe_dump({"versions": self.versions}, f, sort_keys=False)
+
+    def _next_number(self) -> int:
+        return (max([v["version"] for v in self.versions]) + 1) if self.versions else 1
+
+    def _resolve_base(self, loaded_file: Optional[str]) -> Optional[int]:
+        if loaded_file:
+            base = os.path.basename(loaded_file)
+            for v in self.versions:
+                if v.get("file") == base:
+                    return v["version"]
+            # register the loaded file as a root version
+            n = self._next_number()
+            self.versions.append({"version": n, "file": base, "parent": None,
+                                  "created": datetime.now().isoformat(timespec="seconds")})
+            self._write_provenance()
+            return n
+        return None
+
+    def log_edit(self, actor_id: str, mi: int, mtype: str,
+                 param: str, old: float, new: float) -> None:
+        entry = {"timestamp": datetime.now().isoformat(timespec="seconds"),
+                 "base_version": self.base_version, "actor_id": actor_id,
+                 "maneuver_index": mi, "maneuver_type": mtype,
+                 "parameter": param, "old_value": round(old, 4),
+                 "new_value": round(new, 4)}
+        with open(self.hist_path, "a") as f:
+            f.write(yaml.safe_dump([entry], sort_keys=False))
+
+    def save_version(self, scenario: Scenario) -> str:
+        n = self._next_number()
+        fname = f"scenario_v{n}.yaml"
+        fpath = os.path.join(self.dir, fname)
+        with open(fpath, "w") as f:
+            yaml.safe_dump(scenario.to_dict(), f, sort_keys=False)
+        self.versions.append({"version": n, "file": fname, "parent": self.base_version,
+                              "created": datetime.now().isoformat(timespec="seconds")})
+        self._write_provenance()
+        self.base_version = n  # new working base; branch by reloading an earlier one
+        return fname
+
+
+# --------------------------------------------------------------------------- #
+# GUI (pygame)
+# --------------------------------------------------------------------------- #
+def run_gui(scenario: Scenario, persistence: Persistence) -> None:
+    import pygame
+
+    pygame.init()
+    WIDTH, HEIGHT = 1100, 820
+    TOPBAR_H = 56
+    SUBWIN_H = 250
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Scenario Editor")
+    clock = pygame.time.Clock()
+    font = pygame.font.SysFont("consolas,menlo,monospace", 16)
+    font_sm = pygame.font.SysFont("consolas,menlo,monospace", 13)
+    font_big = pygame.font.SysFont("consolas,menlo,monospace", 20, bold=True)
+
+    # colors
+    C_GRASS = (32, 44, 34)
+    C_ROAD = (60, 60, 66)
+    C_LINE = (220, 210, 120)
+    C_EDGE = (200, 200, 200)
+    C_BAR = (24, 26, 32)
+    C_BTN = (54, 58, 70)
+    C_BTN_HL = (80, 120, 200)
+    C_TEXT = (230, 230, 235)
+    C_PANEL = (30, 32, 40)
+    C_SEL = (255, 220, 40)
+    C_AXIS = (150, 150, 160)
+    C_CURVE = (120, 200, 255)
+
+    ppm = scenario.pixels_per_meter
+    canvas_cx = WIDTH // 2
+    canvas_cy = TOPBAR_H + (HEIGHT - TOPBAR_H) // 2
+
+    def w2s(wx: float, wy: float) -> Tuple[int, int]:
+        return int(canvas_cx + wx * ppm), int(canvas_cy - wy * ppm)
+
+    def s2w(sx: float, sy: float) -> Tuple[float, float]:
+        return (sx - canvas_cx) / ppm, (canvas_cy - sy) / ppm
+
+    # ---- state ----
+    playing = True
+    T = 0.0
+    selected: Optional[int] = None       # actor index
+    man_index = 0                        # maneuver index within selected actor
+    focus_field: Optional[str] = None    # 'slope' | 'intercept' | 'duration'
+    edit_buffer = ""
+    dragging: Optional[str] = None       # 'left' | 'right'
+    status_msg = ""
+    status_until = 0.0
+
+    # ---- top bar rects ----
+    btn_play = pygame.Rect(WIDTH // 2 - 55, 10, 110, 36)
+    btn_reset = pygame.Rect(WIDTH // 2 - 190, 10, 110, 36)
+    btn_save = pygame.Rect(WIDTH // 2 + 80, 10, 110, 36)
+
+    # ---- subwindow geometry (computed when visible) ----
+    def subwin_rect() -> pygame.Rect:
+        return pygame.Rect(0, HEIGHT - SUBWIN_H, WIDTH, SUBWIN_H)
+
+    def plot_rect() -> pygame.Rect:
+        sw = subwin_rect()
+        return pygame.Rect(sw.x + 60, sw.y + 44, 520, SUBWIN_H - 90)
+
+    def field_rects() -> dict:
+        sw = subwin_rect()
+        y = sw.y + 70
+        x = sw.x + 640
+        return {"slope": pygame.Rect(x + 70, y, 110, 26),
+                "intercept": pygame.Rect(x + 70, y + 44, 110, 26),
+                "duration": pygame.Rect(x + 70, y + 88, 110, 26)}
+
+    def btn_prev_next() -> Tuple[pygame.Rect, pygame.Rect]:
+        sw = subwin_rect()
+        return (pygame.Rect(sw.right - 150, sw.y + 10, 60, 26),
+                pygame.Rect(sw.right - 82, sw.y + 10, 60, 26))
+
+    def cur_maneuver() -> Optional[Maneuver]:
+        if selected is None:
+            return None
+        a = scenario.actors[selected]
+        if not a.maneuvers:
+            return None
+        return a.maneuvers[man_index]
+
+    def set_status(msg: str) -> None:
+        nonlocal status_msg, status_until
+        status_msg = msg
+        status_until = T + 3.0
+
+    # ---- editing helpers ----
+    def apply_param(param: str, new_val: float) -> None:
+        a = scenario.actors[selected]
+        m = a.maneuvers[man_index]
+        old = getattr(m, param)
+        if param == "duration":
+            new_val = max(0.05, new_val)
+        setattr(m, param, new_val)
+        a.build_path()
+        persistence.log_edit(a.id, man_index, m.type, param, old, new_val)
+        set_status(f"{a.id}.{m.type}.{param}: {old:.3g} -> {new_val:.3g}")
+
+    def plot_maps(m: Maneuver, pr: pygame.Rect):
+        tmax = max(1e-6, m.duration)
+        if m.curve_kind == "progress":
+            vmin, vmax = -0.05, 1.05
+        else:
+            v0, v1 = m.intercept, m.intercept + m.slope * m.duration
+            vmax = max(v0, v1, 1.0) * 1.15
+            vmin = min(v0, v1, 0.0) - 0.15 * abs(max(v0, v1, 1.0))
+            if vmax - vmin < 1e-6:
+                vmax = vmin + 1.0
+
+        def t2x(t): return pr.x + (t / tmax) * pr.width
+        def v2y(v): return pr.bottom - (v - vmin) / (vmax - vmin) * pr.height
+        def y2v(y): return vmin + (pr.bottom - y) / pr.height * (vmax - vmin)
+        return t2x, v2y, y2v, tmax, vmin, vmax
+
+    # ---- drawing ----
+    def draw_map():
+        screen.fill(C_GRASS)
+        arm = scenario.map.arm_length
+        half = scenario.map.lane_width  # half road width = one lane each way
+        # E-W road
+        x0, y0 = w2s(-arm, half)
+        x1, y1 = w2s(arm, -half)
+        pygame.draw.rect(screen, C_ROAD, pygame.Rect(x0, y0, x1 - x0, y1 - y0))
+        # N-S road
+        x0, y0 = w2s(-half, arm)
+        x1, y1 = w2s(half, -arm)
+        pygame.draw.rect(screen, C_ROAD, pygame.Rect(x0, y0, x1 - x0, y1 - y0))
+        # dashed center lines
+        dash = 3.0
+        d = -arm
+        while d < arm:
+            if abs(d) > half:  # skip intersection box
+                a1 = w2s(d, 0); a2 = w2s(min(d + dash, arm), 0)
+                pygame.draw.line(screen, C_LINE, a1, a2, 2)
+                b1 = w2s(0, d); b2 = w2s(0, min(d + dash, arm))
+                pygame.draw.line(screen, C_LINE, b1, b2, 2)
+            d += dash * 2
+        # stop lines
+        for sx, sy, ex, ey in [(-half, -half, 0, -half), (0, half, half, half),
+                               (-half, half, -half, 0), (half, -half, half, 0)]:
+            pygame.draw.line(screen, C_EDGE, w2s(sx, sy), w2s(ex, ey), 2)
+
+    def draw_actor(idx: int, a: Actor):
+        phase = T % scenario.period
+        x, y, hd = a.pose_at_time(phase)
+        h = math.radians(hd)
+        fx, fy = math.cos(h), math.sin(h)
+        px, py = -math.sin(h), math.cos(h)
+        L, W = a.length / 2, a.width / 2
+        corners_w = [(x + fx * L + px * W, y + fy * L + py * W),
+                     (x + fx * L - px * W, y + fy * L - py * W),
+                     (x - fx * L - px * W, y - fy * L - py * W),
+                     (x - fx * L + px * W, y - fy * L + py * W)]
+        pts = [w2s(*c) for c in corners_w]
+        pygame.draw.polygon(screen, a.color, pts)
+        pygame.draw.polygon(screen, (20, 20, 20), pts, 1)
+        # heading indicator (front edge)
+        pygame.draw.line(screen, (250, 250, 250), pts[0], pts[1], 3)
+        if idx == selected:
+            pygame.draw.polygon(screen, C_SEL, pts, 3)
+        label = font_sm.render(a.id, True, C_TEXT)
+        lp = w2s(x, y)
+        screen.blit(label, (lp[0] - label.get_width() // 2, lp[1] - 8))
+
+    def draw_button(rect, label, active=False, enabled=True):
+        col = C_BTN_HL if active else C_BTN
+        if not enabled:
+            col = (44, 46, 52)
+        pygame.draw.rect(screen, col, rect, border_radius=6)
+        pygame.draw.rect(screen, (90, 94, 105), rect, 1, border_radius=6)
+        txt = font.render(label, True, C_TEXT if enabled else (120, 120, 130))
+        screen.blit(txt, (rect.centerx - txt.get_width() // 2,
+                          rect.centery - txt.get_height() // 2))
+
+    def draw_topbar():
+        pygame.draw.rect(screen, C_BAR, pygame.Rect(0, 0, WIDTH, TOPBAR_H))
+        draw_button(btn_reset, "Reset")
+        draw_button(btn_play, "Pause" if playing else "Play", active=playing)
+        draw_button(btn_save, "Save")
+        info = f"T = {T % scenario.period:5.2f}s / {scenario.period:5.2f}s   " \
+               f"{'PLAYING' if playing else 'PAUSED'}"
+        txt = font.render(info, True, C_TEXT)
+        screen.blit(txt, (20, 18))
+        if status_msg and T < status_until:
+            st = font_sm.render(status_msg, True, (150, 220, 150))
+            screen.blit(st, (WIDTH - st.get_width() - 16, 20))
+
+    def draw_subwindow():
+        m = cur_maneuver()
+        if m is None:
+            return
+        a = scenario.actors[selected]
+        sw = subwin_rect()
+        pygame.draw.rect(screen, C_PANEL, sw)
+        pygame.draw.line(screen, (80, 84, 95), (sw.x, sw.y), (sw.right, sw.y), 2)
+        title = f"Actor {a.id} — {m.type}  [{man_index + 1}/{len(a.maneuvers)}]"
+        screen.blit(font_big.render(title, True, C_TEXT), (sw.x + 16, sw.y + 8))
+        bp, bn = btn_prev_next()
+        draw_button(bp, "prev")
+        draw_button(bn, "next")
+
+        pr = plot_rect()
+        pygame.draw.rect(screen, (18, 20, 26), pr)
+        pygame.draw.rect(screen, C_AXIS, pr, 1)
+        t2x, v2y, _, tmax, vmin, vmax = plot_maps(m, pr)
+        ylab = "velocity (m/s)" if m.curve_kind == "velocity" else "progress"
+        screen.blit(font_sm.render(ylab, True, C_AXIS), (pr.x - 52, pr.y - 18))
+        screen.blit(font_sm.render("time (s)", True, C_AXIS),
+                    (pr.right - 60, pr.bottom + 6))
+        # zero line for velocity
+        if vmin < 0 < vmax:
+            zy = v2y(0)
+            pygame.draw.line(screen, (70, 74, 85), (pr.x, zy), (pr.right, zy), 1)
+        # the curve
+        p_left = (t2x(0), v2y(m.intercept))
+        p_right = (t2x(tmax), v2y(m.intercept + m.slope * tmax))
+        pygame.draw.line(screen, C_CURVE, p_left, p_right, 2)
+        pygame.draw.circle(screen, C_SEL, (int(p_left[0]), int(p_left[1])), 6)
+        pygame.draw.circle(screen, C_SEL, (int(p_right[0]), int(p_right[1])), 6)
+        # current-time marker if this maneuver is active now
+        phase = T % scenario.period
+        if a.cum[man_index] <= phase < a.cum[man_index + 1]:
+            tl = phase - a.cum[man_index]
+            mx = t2x(tl)
+            pygame.draw.line(screen, (250, 120, 120), (mx, pr.y), (mx, pr.bottom), 1)
+
+        # fields
+        fr = field_rects()
+        vals = {"slope": m.slope, "intercept": m.intercept, "duration": m.duration}
+        for key, rect in fr.items():
+            screen.blit(font.render(key, True, C_TEXT), (rect.x - 78, rect.y + 4))
+            focused = (focus_field == key)
+            pygame.draw.rect(screen, (18, 20, 26), rect)
+            pygame.draw.rect(screen, C_BTN_HL if focused else (90, 94, 105), rect, 2)
+            shown = edit_buffer if focused else f"{vals[key]:.4g}"
+            screen.blit(font.render(shown, True, C_TEXT), (rect.x + 6, rect.y + 4))
+        hint = "drag endpoints, or click a field and type; Enter to apply"
+        screen.blit(font_sm.render(hint, True, (140, 144, 155)),
+                    (fr["slope"].x - 78, fr["duration"].bottom + 12))
+
+    # ---- event handling ----
+    def handle_click(mx, my):
+        nonlocal playing, T, selected, man_index, focus_field, edit_buffer, dragging
+        if btn_play.collidepoint(mx, my):
+            playing = not playing
+            return
+        if btn_reset.collidepoint(mx, my):
+            T = 0.0
+            return
+        if btn_save.collidepoint(mx, my):
+            fname = persistence.save_version(scenario)
+            set_status(f"saved {fname} (parent v{persistence.versions[-1]['parent']})")
+            return
+        # subwindow interactions (only when visible)
+        if not playing and selected is not None and cur_maneuver() is not None:
+            sw = subwin_rect()
+            bp, bn = btn_prev_next()
+            a = scenario.actors[selected]
+            if bp.collidepoint(mx, my):
+                man_index = (man_index - 1) % len(a.maneuvers)
+                focus_field = None
+                return
+            if bn.collidepoint(mx, my):
+                man_index = (man_index + 1) % len(a.maneuvers)
+                focus_field = None
+                return
+            for key, rect in field_rects().items():
+                if rect.collidepoint(mx, my):
+                    focus_field = key
+                    edit_buffer = ""
+                    return
+            m = cur_maneuver()
+            pr = plot_rect()
+            t2x, v2y, _, tmax, _, _ = plot_maps(m, pr)
+            pl = (t2x(0), v2y(m.intercept))
+            prg = (t2x(tmax), v2y(m.intercept + m.slope * tmax))
+            if (mx - pl[0]) ** 2 + (my - pl[1]) ** 2 < 100:
+                dragging = "left"; focus_field = None; return
+            if (mx - prg[0]) ** 2 + (my - prg[1]) ** 2 < 100:
+                dragging = "right"; focus_field = None; return
+            if sw.collidepoint(mx, my):
+                return  # click inside panel, no actor pick
+        # actor picking (paused only)
+        if not playing and my > TOPBAR_H and my < HEIGHT - (SUBWIN_H if selected is not None else 0):
+            wx, wy = s2w(mx, my)
+            phase = T % scenario.period
+            for i, a in enumerate(scenario.actors):
+                x, y, hd = a.pose_at_time(phase)
+                h = math.radians(hd)
+                dx, dy = wx - x, wy - y
+                along = dx * math.cos(h) + dy * math.sin(h)
+                lat = -dx * math.sin(h) + dy * math.cos(h)
+                if abs(along) <= a.length / 2 + 0.5 and abs(lat) <= a.width / 2 + 0.5:
+                    selected = i
+                    man_index = a.active_index(phase) if a.total > phase else 0
+                    focus_field = None
+                    return
+
+    def handle_drag(mx, my):
+        m = cur_maneuver()
+        if m is None:
+            return
+        pr = plot_rect()
+        _, _, y2v, tmax, _, _ = plot_maps(m, pr)
+        val = y2v(clamp(my, pr.y, pr.bottom))
+        if m.curve_kind == "progress":
+            val = clamp(val, 0.0, 1.0)
+        if dragging == "left":
+            apply_param("intercept", val)
+        elif dragging == "right":
+            new_slope = (val - m.intercept) / max(1e-6, m.duration)
+            apply_param("slope", new_slope)
+
+    def commit_field():
+        nonlocal focus_field, edit_buffer
+        if focus_field is None:
+            return
+        try:
+            apply_param(focus_field, float(edit_buffer))
+        except ValueError:
+            set_status("invalid number")
+        focus_field = None
+        edit_buffer = ""
+
+    # ---- main loop ----
+    running = True
+    while running:
+        dt = clock.tick(60) / 1000.0
+        if playing:
+            T += dt
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                handle_click(*event.pos)
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                dragging = None
+            elif event.type == pygame.MOUSEMOTION and dragging:
+                handle_drag(*event.pos)
+            elif event.type == pygame.KEYDOWN:
+                if focus_field is not None:
+                    if event.key == pygame.K_RETURN:
+                        commit_field()
+                    elif event.key == pygame.K_ESCAPE:
+                        focus_field = None; edit_buffer = ""
+                    elif event.key == pygame.K_BACKSPACE:
+                        edit_buffer = edit_buffer[:-1]
+                    elif event.unicode in "0123456789.-+eE":
+                        edit_buffer += event.unicode
+                else:
+                    if event.key == pygame.K_SPACE:
+                        playing = not playing
+                    elif event.key == pygame.K_ESCAPE:
+                        selected = None
+
+        draw_map()
+        for i, a in enumerate(scenario.actors):
+            draw_actor(i, a)
+        draw_topbar()
+        if not playing and selected is not None:
+            draw_subwindow()
+        pygame.display.flip()
+
+    pygame.quit()
+
+
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description="Intersection scenario editor")
+    here = os.path.dirname(os.path.abspath(__file__))
+    default_dir = os.path.join(here, "scenarios")
+    ap.add_argument("scenario", nargs="?",
+                    default=os.path.join(default_dir, "scenario_v1.yaml"),
+                    help="path to a scenario YAML")
+    ap.add_argument("--scenarios-dir", default=None,
+                    help="folder for versioned saves / provenance (default: scenario's folder)")
+    args = ap.parse_args()
+
+    scenario = load_scenario(args.scenario)
+    sdir = args.scenarios_dir or os.path.dirname(os.path.abspath(args.scenario))
+    persistence = Persistence(sdir, args.scenario)
+    run_gui(scenario, persistence)
+
+
+if __name__ == "__main__":
+    main()
