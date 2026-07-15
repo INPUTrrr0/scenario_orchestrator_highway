@@ -38,10 +38,12 @@ Controls:
     Maneuver segments   : drag curve endpoints or edit fields (v0)
     Function segments   : double-click canvas = new node; click node = choose
                           its value; drag from a node's right port = wire
-                          (to node: binary op, to empty: unary op, to an op:
-                          fill next input slot, to OUT sink: bind); click an
-                          op = choose operation; <> badge swaps inputs;
-                          Delete = remove selected node + everything downstream
+                          (to a node BODY: new binary op combining the two,
+                          works for op outputs too; to an op's input SLOT:
+                          fill or rewire that slot; to empty: unary op; to an
+                          OUT sink: bind); click an op = choose operation;
+                          <> badge swaps inputs; Delete = remove selected
+                          node + everything downstream
 """
 from __future__ import annotations
 
@@ -1372,7 +1374,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         set_status(f"unbound OUT:{which}")
 
     def fe_hit(mx: int, my: int):
-        """('sink', key) | ('port', id) | ('swap', id) | ('node', id) | ('canvas', None)"""
+        """('sink', key) | ('port', id) | ('swap', id) | ('slot', (id, idx)) |
+        ('node', id) | ('canvas', None)"""
         fn = cur_segment()
         for key, r in sink_rects().items():
             if r.collidepoint(mx, my):
@@ -1385,6 +1388,10 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
                     and len(node.inputs) >= 2
                     and swap_badge_rect(node).collidepoint(mx, my)):
                 return ("swap", node.id)
+            if node.kind == "op":
+                for i, (sx_, sy_) in enumerate(slot_centers(node)):
+                    if (mx - sx_) ** 2 + (my - sy_) ** 2 <= 81:
+                        return ("slot", (node.id, i))
             if node_rect(node).collidepoint(mx, my):
                 return ("node", node.id)
         return ("canvas", None)
@@ -1406,9 +1413,10 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             scenario.simulate()
             log_struct("fn_swap_inputs", maneuver_index=man_index, node=ident)
             set_status(f"swapped inputs of {ident}")
-        elif kind == "node":
-            sel_node = ident
-            node = fn.node(ident)
+        elif kind in ("node", "slot"):
+            nid = ident if kind == "node" else ident[0]
+            sel_node = nid
+            node = fn.node(nid)
             dragging = "nodepress"
             node_press = (mx, my)
             node_orig = node.pos
@@ -1460,42 +1468,53 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         if kind == "sink":
             fe_bind_sink(ident, src)
             return
-        if kind in ("node", "port", "swap") and ident != src:
-            tgt = fn.node(ident)
-            if tgt.kind == "op":
-                sig, _ = OPS[tgt.op]
-                if len(tgt.inputs) >= len(sig):
-                    set_status(f"{tgt.op} has no free input slot")
+        if kind == "slot":
+            # fill (or rewire) a specific input slot of an op node
+            oid, idx = ident
+            tgt = fn.node(oid)
+            slot = idx if idx < len(tgt.inputs) else len(tgt.inputs)
+            if not slot_accepts(fn, tgt, slot, node_value_type(fn, src)):
+                set_status(f"{tgt.op} slot {slot + 1} rejects that type")
+                return
+            if would_cycle(fn, tgt.id, src):
+                set_status("refused: that wire would create a cycle")
+                return
+            if slot < len(tgt.inputs):
+                old = tgt.inputs[slot]
+                if old == src:
                     return
-                slot = len(tgt.inputs)
-                if not slot_accepts(fn, tgt, slot, node_value_type(fn, src)):
-                    set_status(f"{tgt.op} slot {slot + 1} rejects that type")
-                    return
-                if would_cycle(fn, tgt.id, src):
-                    set_status("refused: that wire would create a cycle")
-                    return
+                tgt.inputs[slot] = src
+                scenario.simulate()
+                log_struct("fn_wire", maneuver_index=man_index, src=src,
+                           dst=tgt.id, slot=slot, replaced=old)
+                set_status(f"rewired {tgt.id}.{tgt.op}[{slot + 1}]: {old} -> {src}")
+            else:
                 tgt.inputs.append(src)
                 scenario.simulate()
                 log_struct("fn_wire", maneuver_index=man_index,
                            src=src, dst=tgt.id, slot=slot)
                 set_status(f"wired {src} -> {tgt.id}.{tgt.op}[{slot + 1}]")
-            else:
-                op = fe_default_binary(fn, src, ident)
-                if op is None:
-                    set_status("no operation takes those two input types")
-                    return
-                nid = fn.next_node_id()
-                ra, rb = node_rect(fn.node(src)), node_rect(tgt)
-                c = node_canvas_rect()
-                px, py = clamp_node_pos(max(ra.x, rb.x) - c.x + NODE_W + 40,
-                                        (ra.y + rb.y) / 2 - c.y)
-                fn.nodes.append(Node(id=nid, kind="op", pos=(px, py),
-                                     op=op, inputs=[src, ident]))
-                sel_node = nid
-                scenario.simulate()
-                log_struct("fn_wire", maneuver_index=man_index,
-                           src=src, dst=ident, new_op=nid, op=op)
-                set_status(f"{nid} = {op}({src}, {ident}) — click it to change the op")
+            return
+        if kind in ("node", "port", "swap") and ident != src:
+            # drop on a node BODY (value or op output): combine into a new
+            # binary op — click the new op afterwards to choose the operation
+            tgt = fn.node(ident)
+            op = fe_default_binary(fn, src, ident)
+            if op is None:
+                set_status("no operation takes those two input types")
+                return
+            nid = fn.next_node_id()
+            ra, rb = node_rect(fn.node(src)), node_rect(tgt)
+            c = node_canvas_rect()
+            px, py = clamp_node_pos(max(ra.x, rb.x) - c.x + NODE_W + 40,
+                                    (ra.y + rb.y) / 2 - c.y)
+            fn.nodes.append(Node(id=nid, kind="op", pos=(px, py),
+                                 op=op, inputs=[src, ident]))
+            sel_node = nid
+            scenario.simulate()
+            log_struct("fn_wire", maneuver_index=man_index,
+                       src=src, dst=ident, new_op=nid, op=op)
+            set_status(f"{nid} = {op}({src}, {ident}) — click it to change the op")
             return
         if kind == "canvas":
             op = fe_default_unary(fn, src)
@@ -1627,7 +1646,7 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             screen.blit(sl, (r.x + 8, r.centery - sl.get_height() // 2))
         screen.set_clip(None)
         hint = ("2xclick: new node | click node: value | drag port: wire "
-                "(node=op, empty=unary, op=next slot, OUT=bind) | Del: delete")
+                "(body=combine op, slot=fill/rewire, empty=unary, OUT=bind) | Del: delete")
         screen.blit(font_sm.render(hint, True, (140, 144, 155)),
                     (c.x, subwin_rect().bottom - 22))
 
