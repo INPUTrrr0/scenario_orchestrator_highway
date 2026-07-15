@@ -358,7 +358,11 @@ class Persistence:
 # --------------------------------------------------------------------------- #
 # GUI (pygame)
 # --------------------------------------------------------------------------- #
-def run_gui(scenario: Scenario, persistence: Persistence) -> None:
+def run_gui(scenario: Scenario, persistence: Persistence,
+            capture: Optional[str] = None, fps: int = 30, loops: int = 1) -> None:
+    """Interactive editor, or — when `capture` is a path — a headless recorder
+    that renders the whole window for exactly `loops` loop(s) at `fps` and pipes
+    the frames to ffmpeg to produce an MP4 (no user interaction)."""
     import pygame
 
     pygame.init()
@@ -920,7 +924,36 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         focus_field = None
         edit_buffer = ""
 
-    # ---- main loop ----
+    def render_frame():
+        draw_map()
+        for i, a in enumerate(scenario.actors):
+            draw_actor(i, a)
+        draw_subwindow()   # always stacked below the BEV (no overlap)
+        draw_topbar()
+        pygame.display.flip()
+
+    # ---- headless capture: fixed-step render of exactly `loops` loop(s) ----
+    if capture:
+        import subprocess
+        total_frames = max(1, int(round(scenario.period * loops * fps)))
+        ff = subprocess.Popen(
+            ["ffmpeg", "-y", "-f", "rawvideo", "-pixel_format", "rgb24",
+             "-video_size", f"{WIDTH}x{HEIGHT}", "-framerate", str(fps),
+             "-i", "-", "-pix_fmt", "yuv420p", "-vcodec", "libx264",
+             "-loglevel", "error", capture],
+            stdin=subprocess.PIPE)
+        playing = True
+        for n in range(total_frames):
+            T = n / fps               # deterministic timeline over the loop(s)
+            pygame.event.pump()
+            render_frame()
+            ff.stdin.write(pygame.image.tostring(screen, "RGB"))
+        ff.stdin.close()
+        ff.wait()
+        pygame.quit()
+        return
+
+    # ---- interactive main loop ----
     running = True
     while running:
         dt = clock.tick(60) / 1000.0
@@ -961,12 +994,7 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                     elif event.key == pygame.K_a:
                         do_add_actor()
 
-        draw_map()
-        for i, a in enumerate(scenario.actors):
-            draw_actor(i, a)
-        draw_subwindow()   # always stacked below the BEV (no overlap)
-        draw_topbar()
-        pygame.display.flip()
+        render_frame()
 
     pygame.quit()
 
@@ -983,6 +1011,10 @@ def main():
                     help="folder for versioned saves / provenance (default: scenario's folder)")
     ap.add_argument("--validate", action="store_true",
                     help="load the scenario, report validity against the current format, and exit")
+    ap.add_argument("--capture", default=None, metavar="OUT.mp4",
+                    help="headless: record the whole window to an MP4 (no GUI) and exit")
+    ap.add_argument("--fps", type=int, default=30, help="capture frame rate")
+    ap.add_argument("--loops", type=int, default=1, help="number of loops to capture")
     args = ap.parse_args()
 
     if args.validate:
@@ -996,9 +1028,14 @@ def main():
             sys.exit(1)
 
     scenario = load_scenario(args.scenario)
-    sdir = args.scenarios_dir or os.path.dirname(os.path.abspath(args.scenario))
-    persistence = Persistence(sdir, args.scenario)
-    run_gui(scenario, persistence)
+    if args.capture:
+        run_gui(scenario, None, capture=args.capture, fps=args.fps, loops=args.loops)
+        print(f"captured {args.capture} "
+              f"({scenario.period * args.loops:.2f}s x{args.loops} @ {args.fps}fps)")
+    else:
+        sdir = args.scenarios_dir or os.path.dirname(os.path.abspath(args.scenario))
+        persistence = Persistence(sdir, args.scenario)
+        run_gui(scenario, persistence)
 
 
 if __name__ == "__main__":
