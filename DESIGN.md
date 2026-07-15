@@ -58,7 +58,7 @@ Editable per maneuver: **slope**, **intercept**, **duration**.
 ## 5. Map & leg naming
 One N-S carriageway and one E-W carriageway crossing at the origin (each bidirectional, width `2·lane_width`). Rendered: grass background, asphalt, dashed center line, solid edge lines, stop lines. No lane-change lanes.
 
-**Legs (8).** Each arm has two lanes, named `[arm][side]`: the first letter is the arm (N/E/S/W), the second the side. Ordered counter-clockwise from `EN`: `EN, NW, NE, WN, WS, SW, SE, ES`. Inbound (toward-center) lanes follow right-hand traffic:
+**Legs (8).** Each arm has two lanes, named `[arm][side]`: the first letter is the arm (N/E/S/W), the second the side. Ordered counter-clockwise from `EN`: `EN, NE, NW, WN, WS, SW, SE, ES`. Inbound (toward-center) lanes follow right-hand traffic:
 - `SE` = South arm, east lane (x=+1.75) — inbound **northbound**.
 - `EN` = East arm, north lane (y=+1.75) — inbound **westbound**.
 - `WS` = West arm, south lane (y=−1.75) — inbound **eastbound**.
