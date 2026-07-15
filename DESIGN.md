@@ -55,13 +55,21 @@ Editable per maneuver: **slope**, **intercept**, **duration**.
 - **Chaining:** maneuver `i+1` starts at maneuver `i`'s *actually reached* end pose `pose_at(u_end)` where `u_end = progress_i(duration_i)` — avoids discontinuities when a curve doesn't complete a segment.
 - Paths are precomputed at load and after each edit.
 
-## 5. Map
+## 5. Map & leg naming
 One N-S carriageway and one E-W carriageway crossing at the origin (each bidirectional, width `2·lane_width`). Rendered: grass background, asphalt, dashed center line, solid edge lines, stop lines. No lane-change lanes.
+
+**Legs (8).** Each arm has two lanes, named `[arm][side]`: the first letter is the arm (N/E/S/W), the second the side. Ordered counter-clockwise from `EN`: `EN, NW, NE, WN, WS, SW, SE, ES`. Inbound (toward-center) lanes follow right-hand traffic:
+- `SE` = South arm, east lane (x=+1.75) — inbound **northbound**.
+- `EN` = East arm, north lane (y=+1.75) — inbound **westbound**.
+- `WS` = West arm, south lane (y=−1.75) — inbound **eastbound**.
+- `NW` = North arm, west lane (x=−1.75) — inbound **southbound**.
+
+The default sample places the ego (ID 0, green) on `SE` and actor 1 (red) on `EN`, both going straight through so their paths cross near the center.
 
 ## 6. GUI layout
 ```
 +---------------------------------------------------------+
-|        [▶/⏸]   Reset   Save        T = 1.23 s           |  top bar
+| T=[1.23]/8.0s  Reset [▶/⏸] Save     +Actor  -Actor      |  top bar
 +---------------------------------------------------------+
 |                                                         |
 |                BEV visualization (map + actors)         |  center canvas
@@ -69,16 +77,18 @@ One N-S carriageway and one E-W carriageway crossing at the origin (each bidirec
 |                                                         |
 +---------------------------------------------------------+
 |  Actor <ID> — <maneuver> [i/n]              < prev next>|  timing-curve subwindow
-|  velocity/progress  ____----     • current-time marker  |  (shown when an actor is
-|      |         __----                                   |   selected while paused)
-|      |____---------------------  time                   |
-|   slope:[ ] intercept:[ ] duration:[ ]                  |
+|  velocity/progress  ____----     • current-time marker  |  (stacked BELOW the BEV,
+|      |         __----                                   |   always visible; editor
+|      |____---------------------  time                   |   shown when paused + an
+|   slope:[ ] intercept:[ ] duration:[ ]                  |   actor is selected)
 +---------------------------------------------------------+
 ```
-- Top bar: centered Play/Pause toggle (infinite loop when playing), plus Reset and Save; time readout.
-- BEV: each actor a colored rectangle with ID label and heading indicator; selected actor outlined.
+- Top bar: editable current-time field `T=[..]` (click and type a time to scrub; auto-pauses), centered Play/Pause toggle (infinite loop when playing) plus Reset/Save, and **+Actor / -Actor** for adding/removing actors (`-Actor` enabled only with a selection; `a` and `Delete` are keyboard shortcuts).
+- BEV: each actor a colored rectangle with numeric ID label and heading indicator; selected actor outlined.
+- The timing-curve subwindow is stacked **below** the BEV (fixed region, no overlap; the window height is `topbar + canvas + subwindow`).
 - Selection only while paused: click an actor → outline + open the subwindow titled with its ID.
 - Subwindow shows the maneuver active at the paused time (prev/next steps through the list). Y-axis label switches between "progress" and "velocity (m/s)" by `curve_kind`. Edit via text fields **and** draggable plot endpoints (left endpoint → intercept, right endpoint → end value → slope). Every commit re-precomputes the path and is logged.
+- **Add actor:** spawns a new actor with the next integer ID on the next inbound leg (cycling SE/EN/WS/NW) with a default straight-through maneuver. **Remove actor:** drops the selected actor. Both are recorded in the edit log as structural entries (`action: add_actor|remove_actor`).
 
 ## 7. Persistence, versioning & provenance (D5)
 
@@ -102,17 +112,25 @@ versions:
   - {version: 3, file: scenario_v3.yaml, parent: 1,    created: <iso>}   # branch
 ```
 
-**`edit_history.yaml`** (append-only):
+**`edit_history.yaml`** (append-only; parameter edits and structural add/remove):
 ```yaml
 - timestamp: 2026-07-14T15:04:05
   base_version: 1
-  actor_id: car_A
+  actor_id: "0"
   maneuver_index: 1
   maneuver_type: turn_left
   parameter: slope
   old_value: 0.33
   new_value: 0.50
+- timestamp: 2026-07-14T15:05:10
+  base_version: 1
+  action: add_actor
+  actor_id: "2"
 ```
+
+**Format drift & regeneration.** The persisted files (`edit_history.yaml`, `provenance.yaml`, saved `scenario_v*.yaml`) can fall out of step as the editor's format evolves. Two tools keep them consistent:
+- `scenario_editor.py --validate <file>` loads a scenario against the *current* format and exits 0 (OK) or 1 (with the reason). No GUI.
+- `regen_state.sh [scenarios_dir]` regenerates state: resets `edit_history.yaml`, validates each `scenario_v*.yaml` and **moves** (never deletes) incompatible ones to `scenarios/incompatible/`, then rebuilds `provenance.yaml` to reference only surviving files (parent links preserved where the parent still exists). `scenario_v1.yaml` is the source of truth; everything else is regenerable.
 
 ## 8. YAML scenario schema
 ```yaml

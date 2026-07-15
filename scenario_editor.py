@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Optional, Tuple
@@ -48,6 +49,7 @@ Pose = Tuple[float, float, float]  # (x, y, heading_deg)
 # progress(t).
 VELOCITY_KINDS = {"accelerate", "decelerate"}
 GEOMETRIC_KINDS = {"go_straight", "turn_left", "turn_right", "accelerate", "decelerate"}
+ALL_MANEUVER_TYPES = GEOMETRIC_KINDS | {"stop"}
 
 
 def clamp(v: float, lo: float, hi: float) -> float:
@@ -248,6 +250,23 @@ def load_scenario(path: str) -> Scenario:
     return sc
 
 
+def validate_scenario(path: str) -> Scenario:
+    """Load and check a scenario against the CURRENT format. Raises on problems."""
+    sc = load_scenario(path)
+    if not sc.actors:
+        raise ValueError("scenario has no actors")
+    ids = [a.id for a in sc.actors]
+    if len(ids) != len(set(ids)):
+        raise ValueError(f"duplicate actor ids: {ids}")
+    for a in sc.actors:
+        for i, m in enumerate(a.maneuvers):
+            if m.type not in ALL_MANEUVER_TYPES:
+                raise ValueError(f"actor {a.id} maneuver {i}: unknown type {m.type!r}")
+            if m.duration <= 0:
+                raise ValueError(f"actor {a.id} maneuver {i}: duration must be > 0")
+    return sc
+
+
 # --------------------------------------------------------------------------- #
 # Persistence: edit log + versioned save + provenance graph
 # --------------------------------------------------------------------------- #
@@ -294,6 +313,13 @@ class Persistence:
                  "maneuver_index": mi, "maneuver_type": mtype,
                  "parameter": param, "old_value": round(old, 4),
                  "new_value": round(new, 4)}
+        with open(self.hist_path, "a") as f:
+            f.write(yaml.safe_dump([entry], sort_keys=False))
+
+    def log_structural(self, action: str, actor_id: str) -> None:
+        entry = {"timestamp": datetime.now().isoformat(timespec="seconds"),
+                 "base_version": self.base_version, "action": action,
+                 "actor_id": actor_id}
         with open(self.hist_path, "a") as f:
             f.write(yaml.safe_dump([entry], sort_keys=False))
 
@@ -368,7 +394,14 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
     btn_play = pygame.Rect(WIDTH // 2 - 55, 10, 110, 36)
     btn_reset = pygame.Rect(WIDTH // 2 - 190, 10, 110, 36)
     btn_save = pygame.Rect(WIDTH // 2 + 80, 10, 110, 36)
+    btn_add = pygame.Rect(WIDTH - 240, 10, 105, 36)   # add a new actor
+    btn_del = pygame.Rect(WIDTH - 130, 10, 105, 36)   # remove selected actor
     time_field = pygame.Rect(52, 14, 84, 28)   # editable current-time scrubber
+
+    # default inbound-leg spawns (SE, EN, WS, NW), each a straight-through route
+    ADD_PRESETS = [(1.75, -58, 90), (58, 1.75, 180), (-58, -1.75, 0), (-1.75, 58, 270)]
+    ADD_PALETTE = [(90, 190, 110), (210, 70, 60), (60, 120, 210),
+                   (200, 160, 60), (160, 90, 200), (80, 200, 200)]
 
     # ---- subwindow geometry (computed when visible) ----
     def subwin_rect() -> pygame.Rect:
@@ -403,6 +436,40 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         nonlocal status_msg, status_until
         status_msg = msg
         status_until = T + 3.0
+
+    def next_actor_id() -> str:
+        nums = []
+        for a in scenario.actors:
+            try:
+                nums.append(int(a.id))
+            except (ValueError, TypeError):
+                pass
+        return str(max(nums) + 1) if nums else "0"
+
+    def do_add_actor() -> None:
+        nonlocal selected, man_index
+        i = len(scenario.actors)
+        sx, sy, hd = ADD_PRESETS[i % len(ADD_PRESETS)]
+        a = Actor(id=next_actor_id(), color=ADD_PALETTE[i % len(ADD_PALETTE)],
+                  length=4.5, width=2.0, start=(sx, sy, hd),
+                  maneuvers=[Maneuver(type="go_straight", duration=8.0,
+                                      slope=0.125, intercept=0.0, length=116.0)])
+        a.build_path()
+        scenario.actors.append(a)
+        persistence.log_structural("add_actor", a.id)
+        selected = len(scenario.actors) - 1
+        man_index = 0
+        set_status(f"added actor {a.id}")
+
+    def do_remove_actor() -> None:
+        nonlocal selected, man_index
+        if selected is None:
+            return
+        a = scenario.actors.pop(selected)
+        persistence.log_structural("remove_actor", a.id)
+        selected = None
+        man_index = 0
+        set_status(f"removed actor {a.id}")
 
     # ---- editing helpers ----
     def apply_param(param: str, new_val: float) -> None:
@@ -497,6 +564,8 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         draw_button(btn_reset, "Reset")
         draw_button(btn_play, "Pause" if playing else "Play", active=playing)
         draw_button(btn_save, "Save")
+        draw_button(btn_add, "+ Actor")
+        draw_button(btn_del, "- Actor", enabled=(selected is not None))
         # editable current-time field: click and type a time to scrub there
         screen.blit(font.render("T=", True, C_TEXT), (18, 18))
         focused = (focus_field == "time")
@@ -506,17 +575,18 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         screen.blit(font.render(shown, True, C_TEXT), (time_field.x + 6, time_field.y + 5))
         info = f"/ {scenario.period:.2f}s   {'PLAYING' if playing else 'PAUSED'}"
         screen.blit(font.render(info, True, C_TEXT), (time_field.right + 10, 18))
-        if status_msg and T < status_until:
-            st = font_sm.render(status_msg, True, (150, 220, 150))
-            screen.blit(st, (WIDTH - st.get_width() - 16, 20))
 
     def draw_subwindow():
         sw = subwin_rect()
         pygame.draw.rect(screen, C_PANEL, sw)
         pygame.draw.line(screen, (80, 84, 95), (sw.x, sw.y), (sw.right, sw.y), 2)
+        if status_msg and T < status_until:
+            st = font_sm.render(status_msg, True, (150, 220, 150))
+            screen.blit(st, (sw.right - st.get_width() - 16, sw.bottom - 26))
         m = cur_maneuver()
         if playing or selected is None or m is None:
-            hint = "Pause and click an actor to edit its timing curve."
+            hint = "Pause and click an actor to edit its timing curve; " \
+                   "use + Actor / - Actor to add or remove."
             screen.blit(font.render(hint, True, (150, 154, 165)), (sw.x + 20, sw.y + 22))
             return
         a = scenario.actors[selected]
@@ -582,6 +652,12 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             playing = False
             focus_field = "time"
             edit_buffer = ""
+            return
+        if btn_add.collidepoint(mx, my):
+            do_add_actor()
+            return
+        if btn_del.collidepoint(mx, my) and selected is not None:
+            do_remove_actor()
             return
         # subwindow interactions (only when visible)
         if not playing and selected is not None and cur_maneuver() is not None:
@@ -689,6 +765,11 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                         playing = not playing
                     elif event.key == pygame.K_ESCAPE:
                         selected = None
+                    elif event.key in (pygame.K_DELETE, pygame.K_BACKSPACE) \
+                            and selected is not None:
+                        do_remove_actor()
+                    elif event.key == pygame.K_a:
+                        do_add_actor()
 
         draw_map()
         for i, a in enumerate(scenario.actors):
@@ -710,7 +791,19 @@ def main():
                     help="path to a scenario YAML")
     ap.add_argument("--scenarios-dir", default=None,
                     help="folder for versioned saves / provenance (default: scenario's folder)")
+    ap.add_argument("--validate", action="store_true",
+                    help="load the scenario, report validity against the current format, and exit")
     args = ap.parse_args()
+
+    if args.validate:
+        try:
+            sc = validate_scenario(args.scenario)
+            print(f"OK: {args.scenario} — {len(sc.actors)} actor(s), "
+                  f"period {sc.period:.2f}s")
+            sys.exit(0)
+        except Exception as e:
+            print(f"INVALID: {args.scenario} — {e}")
+            sys.exit(1)
 
     scenario = load_scenario(args.scenario)
     sdir = args.scenarios_dir or os.path.dirname(os.path.abspath(args.scenario))
