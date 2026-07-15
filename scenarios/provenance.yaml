@@ -3,3 +3,7 @@ versions:
   file: scenario_v1.yaml
   parent: null
   created: '2026-07-14T23:55:40'
+- version: 2
+  file: scenario_v2.yaml
+  parent: 1
+  created: '2026-07-15T01:11:59'
