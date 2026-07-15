@@ -126,6 +126,23 @@ class Maneuver:
     def end_pose(self, start: Pose) -> Pose:
         return self.pose_at(start, self.progress(self.duration))
 
+    def geom_length(self) -> float:
+        """Arc length of the segment's geometry (meters)."""
+        if self.type in ("go_straight", "accelerate", "decelerate"):
+            return self.length
+        if self.type in ("turn_left", "turn_right"):
+            return self.radius * math.radians(self.angle)
+        return 0.0
+
+    def exit_speed(self) -> float:
+        """Path speed (m/s) at the end of this maneuver — used to seed the next."""
+        if self.type == "stop":
+            return 0.0
+        if self.curve_kind == "velocity":
+            return max(0.0, self.intercept + self.slope * self.duration)
+        # progress kind: path speed = arc_length * du/dt, and du/dt = slope
+        return max(0.0, self.geom_length() * self.slope)
+
     def to_dict(self) -> dict:
         d: dict = {"type": self.type, "duration": round(self.duration, 4),
                    "curve": {"slope": round(self.slope, 4),
@@ -441,11 +458,11 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
     def header_buttons() -> dict:
         sw = subwin_rect()
         y = sw.y + 12
-        return {"prev": pygame.Rect(sw.right - 300, y, 54, 26),
-                "next": pygame.Rect(sw.right - 240, y, 54, 26),
-                "add_mvr": pygame.Rect(sw.right - 178, y, 80, 26),
-                "del_mvr": pygame.Rect(sw.right - 92, y, 80, 26),
-                "type": pygame.Rect(sw.x + 16, sw.y + 34, 220, 22)}
+        return {"type": pygame.Rect(sw.right - 420, y, 160, 26),
+                "prev": pygame.Rect(sw.right - 254, y, 48, 26),
+                "next": pygame.Rect(sw.right - 200, y, 48, 26),
+                "add_mvr": pygame.Rect(sw.right - 146, y, 64, 26),
+                "del_mvr": pygame.Rect(sw.right - 76, y, 64, 26)}
 
     def cur_maneuver() -> Optional[Maneuver]:
         if selected is None:
@@ -499,9 +516,12 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         if selected is None:
             return
         a = scenario.actors[selected]
-        # insert a default straight segment right after the current maneuver
-        new_m = Maneuver(type="go_straight", duration=2.0, slope=0.5,
-                         intercept=0.0, length=20.0)
+        # insert a straight segment that continues at the current exit speed
+        v_in = a.maneuvers[man_index].exit_speed() if a.maneuvers else 10.0
+        length = 20.0
+        new_m = Maneuver(type="go_straight", duration=2.0,
+                         slope=(v_in / length if v_in > 0 else 0.5),
+                         intercept=0.0, length=length)
         at = man_index + 1 if a.maneuvers else 0
         a.maneuvers.insert(at, new_m)
         a.build_path()
@@ -538,6 +558,9 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         old_kind = m.curve_kind
         m.type = new_type
         new_kind = m.curve_kind
+        # speed the actor is carrying into this maneuver (so accel/decel are
+        # continuous with the incoming speed rather than snapping to 0)
+        v_in = a.maneuvers[man_index - 1].exit_speed() if man_index > 0 else 10.0
         # fill sensible geometry defaults for the new type
         if new_type in ("go_straight", "accelerate", "decelerate") and m.length <= 0:
             m.length = 20.0
@@ -549,17 +572,18 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         # reset the curve when the curve *kind* changes (progress <-> velocity)
         if new_kind != old_kind:
             if new_kind == "progress":
-                m.intercept, m.slope = 0.0, 1.0 / max(0.05, m.duration)
-            else:  # velocity
-                m.intercept, m.slope = (0.0, 2.0) if new_type == "accelerate" else (8.0, -2.0)
-        # nudge signs/values so accel/decel stay meaningful
+                # keep the incoming speed as a constant cruise
+                m.intercept = 0.0
+                m.slope = (v_in / m.geom_length()) if m.geom_length() > 0 \
+                    else 1.0 / max(0.05, m.duration)
+            else:  # velocity: start from the incoming speed, then accel/decel
+                m.intercept = v_in
+                m.slope = 2.0 if new_type == "accelerate" else -2.0
+        # nudge signs so accel/decel stay meaningful even without a kind change
         if new_type == "accelerate" and m.slope <= 0:
             m.slope = 2.0
-        if new_type == "decelerate":
-            if m.slope >= 0:
-                m.slope = -2.0
-            if m.intercept <= 0:
-                m.intercept = 8.0
+        if new_type == "decelerate" and m.slope >= 0:
+            m.slope = -2.0
         if new_type == "stop":
             m.slope, m.intercept = 0.0, 0.0
         a.build_path()
@@ -729,14 +753,14 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             screen.blit(font.render(hint, True, (150, 154, 165)), (sw.x + 20, sw.y + 22))
             return
         a = scenario.actors[selected]
-        title = f"Actor {a.id} — {m.type}  [{man_index + 1}/{len(a.maneuvers)}]"
-        screen.blit(font_big.render(title, True, C_TEXT), (sw.x + 16, sw.y + 10))
+        title = f"Actor {a.id}   maneuver {man_index + 1}/{len(a.maneuvers)}"
+        screen.blit(font_big.render(title, True, C_TEXT), (sw.x + 16, sw.y + 14))
         hb = header_buttons()
+        draw_button(hb["type"], f"type: {m.type}")
         draw_button(hb["prev"], "prev")
         draw_button(hb["next"], "next")
-        draw_button(hb["add_mvr"], "+ mvr")
-        draw_button(hb["del_mvr"], "- mvr", enabled=(len(a.maneuvers) > 1))
-        draw_button(hb["type"], f"type: {m.type}  (cycle)")
+        draw_button(hb["add_mvr"], "+mvr")
+        draw_button(hb["del_mvr"], "-mvr", enabled=(len(a.maneuvers) > 1))
 
         pr = plot_rect()
         pygame.draw.rect(screen, (18, 20, 26), pr)
