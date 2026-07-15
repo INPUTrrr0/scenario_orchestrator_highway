@@ -31,23 +31,19 @@ creates *value nodes*; dragging node→node creates an operation with those inpu
 materialized *output node*. Your question — how are ops with more than two inputs
 instantiated — is answered by rule 3:
 
-1. **Drag A → B's body** (any existing node — value nodes *and op outputs alike*):
-   creates a binary op with inputs (A, B). This is how e.g. two `dist` results are
-   combined into a `div`.
+1. **Drag A → B** (both existing nodes): creates a binary op with inputs (A, B).
 2. **Drag A → empty canvas**: creates a unary op on A.
-3. **Drag X → a specific input slot of an op** (the circles on its left edge; empty
-   required slots render hollow red): fills that slot, or — if the slot is already
-   wired — rewires it, replacing the old wire. Type-mismatches are refused with a
-   status message. This is how ops grow beyond two inputs, and how inputs are
-   re-pointed without deleting downstream.
+3. **Drag X → an existing op node**: if the op's signature has an unfilled slot of
+   X's type, X fills the first such slot; otherwise the wire is refused with a status
+   message. This is how ops grow beyond two inputs.
 4. **Click the op label**: opens a dropdown of operations whose signature is
    consistent with the currently wired inputs. Switching *to* a higher-arity op
    (e.g. binary `mul` → ternary `if`) is allowed: missing slots render as hollow red
    ports and the node reads "incomplete" until filled via rule 3. An incomplete
    graph makes the segment hold its entry state, and is flagged by `--validate`.
 
-So the practical route to `if(cond, then, else)`: drag cond→then's body (binary op),
-switch it to `if` via the dropdown, drag the else node onto the hollow third slot. Input order is shown as numbered slots; a
+So the practical route to `if(cond, then, else)`: drag cond→then (binary op), switch
+it to `if` via the dropdown, drag the else node onto the op. Input order is shown as numbered slots; a
 small ⇄ badge on 2-input ops of asymmetric signature (`sub`, `div`, `lt`, `gt`) swaps
 their inputs. Output nodes are connectable, so graphs compose. DAG only — a wire that
 would create a cycle is refused.
