@@ -45,11 +45,14 @@ import yaml
 
 Pose = Tuple[float, float, float]  # (x, y, heading_deg)
 
-# Maneuver classes whose linear curve is interpreted as velocity(t) rather than
-# progress(t).
-VELOCITY_KINDS = {"accelerate", "decelerate"}
-GEOMETRIC_KINDS = {"go_straight", "turn_left", "turn_right", "accelerate", "decelerate"}
-ALL_MANEUVER_TYPES = GEOMETRIC_KINDS | {"stop"}
+# Longitudinal maneuvers move in a straight line and are defined by a
+# velocity-vs-time curve (v0 = intercept, a = slope); distance is emergent
+# (= integral of velocity), so there is no separate "length" parameter.
+LONGITUDINAL_TYPES = {"go_straight", "accelerate", "decelerate"}
+# Turns are defined by geometry (radius, angle) + duration; they always sweep
+# the full angle over the duration.
+TURN_TYPES = {"turn_left", "turn_right"}
+ALL_MANEUVER_TYPES = LONGITUDINAL_TYPES | TURN_TYPES | {"stop"}
 # order used when cycling a maneuver's type in the editor
 MANEUVER_TYPE_CYCLE = ["go_straight", "turn_left", "turn_right",
                        "accelerate", "decelerate", "stop"]
@@ -66,90 +69,79 @@ def clamp(v: float, lo: float, hi: float) -> float:
 class Maneuver:
     type: str
     duration: float = 1.0
-    slope: float = 0.0
-    intercept: float = 0.0
-    # geometry params (only some apply per type)
-    length: float = 0.0
-    radius: float = 0.0
+    # velocity curve for longitudinal maneuvers: v(t) = intercept + slope*t
+    intercept: float = 0.0     # initial speed v0 (m/s)
+    slope: float = 0.0         # acceleration a (m/s^2)
+    # turn geometry
+    radius: float = 5.0
     angle: float = 90.0
 
     @property
     def curve_kind(self) -> str:
-        return "velocity" if self.type in VELOCITY_KINDS else "progress"
+        # 'velocity' -> editable velocity-vs-time plot; 'none' -> geometry only
+        return "velocity" if self.type in LONGITUDINAL_TYPES else "none"
 
-    # progress fraction u in [0, 1] at maneuver-local time t
-    def progress(self, t: float) -> float:
+    def arc_length(self) -> float:
+        return self.radius * math.radians(self.angle)
+
+    def velocity_at(self, t: float) -> float:
+        """Instantaneous path speed (m/s), never negative."""
         if self.type == "stop":
             return 0.0
-        if self.curve_kind == "progress":
-            return clamp(self.slope * t + self.intercept, 0.0, 1.0)
-        # velocity kind: integrate v(t) = intercept + slope*t -> distance -> u
+        if self.type in TURN_TYPES:
+            return self.arc_length() / max(1e-6, self.duration)
+        return max(0.0, self.intercept + self.slope * t)
+
+    def distance(self, t: float) -> float:
+        """Meters travelled along the segment by local time t."""
+        if self.type == "stop":
+            return 0.0
+        if self.type in TURN_TYPES:
+            return self.arc_length() * clamp(t / max(1e-6, self.duration), 0.0, 1.0)
+        # longitudinal: integrate v(t)=intercept+slope*t, clamped so v never < 0
         t_eff = t
-        if self.slope < 0:  # do not let velocity go negative
+        if self.slope < 0:
             t_stop = -self.intercept / self.slope if self.slope != 0 else t
             t_eff = clamp(t, 0.0, max(0.0, t_stop))
-        s = self.intercept * t_eff + 0.5 * self.slope * t_eff * t_eff
-        if self.length <= 0:
-            return 0.0
-        return clamp(s / self.length, 0.0, 1.0)
+        return self.intercept * t_eff + 0.5 * self.slope * t_eff * t_eff
 
-    # world pose after travelling fraction u along this segment, given start pose
-    def pose_at(self, start: Pose, u: float) -> Pose:
+    def pose_at(self, start: Pose, t: float) -> Pose:
+        """World pose at maneuver-local time t, given the segment's start pose."""
         sx, sy, sh = start
         h = math.radians(sh)
         if self.type == "stop":
             return (sx, sy, sh)
-        if self.type in ("go_straight", "accelerate", "decelerate"):
-            x = sx + self.length * u * math.cos(h)
-            y = sy + self.length * u * math.sin(h)
-            return (x, y, sh)
-        if self.type == "turn_left":  # CCW arc
-            cx = sx - self.radius * math.sin(h)
-            cy = sy + self.radius * math.cos(h)
+        if self.type in LONGITUDINAL_TYPES:
+            s = self.distance(t)
+            return (sx + s * math.cos(h), sy + s * math.sin(h), sh)
+        frac = clamp(t / max(1e-6, self.duration), 0.0, 1.0)
+        if self.type == "turn_left":   # CCW arc
+            cx, cy = sx - self.radius * math.sin(h), sy + self.radius * math.cos(h)
             phi0 = math.atan2(sy - cy, sx - cx)
-            delta = math.radians(self.angle) * u
-            x = cx + self.radius * math.cos(phi0 + delta)
-            y = cy + self.radius * math.sin(phi0 + delta)
-            return (x, y, sh + self.angle * u)
+            delta = math.radians(self.angle) * frac
+            return (cx + self.radius * math.cos(phi0 + delta),
+                    cy + self.radius * math.sin(phi0 + delta), sh + self.angle * frac)
         if self.type == "turn_right":  # CW arc
-            cx = sx + self.radius * math.sin(h)
-            cy = sy - self.radius * math.cos(h)
+            cx, cy = sx + self.radius * math.sin(h), sy - self.radius * math.cos(h)
             phi0 = math.atan2(sy - cy, sx - cx)
-            delta = -math.radians(self.angle) * u
-            x = cx + self.radius * math.cos(phi0 + delta)
-            y = cy + self.radius * math.sin(phi0 + delta)
-            return (x, y, sh - self.angle * u)
-        # unknown type -> hold
+            delta = -math.radians(self.angle) * frac
+            return (cx + self.radius * math.cos(phi0 + delta),
+                    cy + self.radius * math.sin(phi0 + delta), sh - self.angle * frac)
         return (sx, sy, sh)
 
     # pose reached at end of the maneuver's own duration (used for chaining)
     def end_pose(self, start: Pose) -> Pose:
-        return self.pose_at(start, self.progress(self.duration))
-
-    def geom_length(self) -> float:
-        """Arc length of the segment's geometry (meters)."""
-        if self.type in ("go_straight", "accelerate", "decelerate"):
-            return self.length
-        if self.type in ("turn_left", "turn_right"):
-            return self.radius * math.radians(self.angle)
-        return 0.0
+        return self.pose_at(start, self.duration)
 
     def exit_speed(self) -> float:
-        """Path speed (m/s) at the end of this maneuver — used to seed the next."""
-        if self.type == "stop":
-            return 0.0
-        if self.curve_kind == "velocity":
-            return max(0.0, self.intercept + self.slope * self.duration)
-        # progress kind: path speed = arc_length * du/dt, and du/dt = slope
-        return max(0.0, self.geom_length() * self.slope)
+        """Path speed (m/s) at the end of this maneuver — seeds the next one."""
+        return self.velocity_at(self.duration)
 
     def to_dict(self) -> dict:
-        d: dict = {"type": self.type, "duration": round(self.duration, 4),
-                   "curve": {"slope": round(self.slope, 4),
-                             "intercept": round(self.intercept, 4)}}
-        if self.type in ("go_straight", "accelerate", "decelerate"):
-            d["length"] = round(self.length, 4)
-        elif self.type in ("turn_left", "turn_right"):
+        d: dict = {"type": self.type, "duration": round(self.duration, 4)}
+        if self.type in LONGITUDINAL_TYPES:
+            d["curve"] = {"v0": round(self.intercept, 4), "accel": round(self.slope, 4)}
+        elif self.type in TURN_TYPES:
             d["radius"] = round(self.radius, 4)
             d["angle"] = round(self.angle, 4)
         return d
@@ -194,8 +186,7 @@ class Actor:
             return self.final_pose
         i = self.active_index(phase)
         t_local = phase - self.cum[i]
-        u = self.maneuvers[i].progress(t_local)
-        return self.maneuvers[i].pose_at(self.start_poses[i], u)
+        return self.maneuvers[i].pose_at(self.start_poses[i], t_local)
 
     def to_dict(self) -> dict:
         return {"id": self.id, "color": list(self.color),
@@ -250,10 +241,10 @@ def load_scenario(path: str) -> Scenario:
             mans.append(Maneuver(
                 type=md["type"],
                 duration=float(md.get("duration", 1.0)),
-                slope=float(curve.get("slope", 0.0)),
-                intercept=float(curve.get("intercept", 0.0)),
-                length=float(md.get("length", 0.0)),
-                radius=float(md.get("radius", 0.0)),
+                # velocity curve: v0 = intercept, accel = slope
+                intercept=float(curve.get("v0", curve.get("intercept", 0.0))),
+                slope=float(curve.get("accel", curve.get("slope", 0.0))),
+                radius=float(md.get("radius", 5.0)),
                 angle=float(md.get("angle", 90.0)),
             ))
         actors.append(Actor(
@@ -272,6 +263,13 @@ def load_scenario(path: str) -> Scenario:
 
 def validate_scenario(path: str) -> Scenario:
     """Load and check a scenario against the CURRENT format. Raises on problems."""
+    with open(path, "r") as f:
+        raw = yaml.safe_load(f) or {}
+    # reject the old format so it can be regenerated rather than silently loaded
+    for ad in raw.get("actors", []):
+        for md in ad.get("maneuvers", []) or []:
+            if "length" in md or "slope" in (md.get("curve") or {}):
+                raise ValueError("old format ('length'/'slope'); regenerate this file")
     sc = load_scenario(path)
     if not sc.actors:
         raise ValueError("scenario has no actors")
@@ -434,26 +432,24 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         sw = subwin_rect()
         return pygame.Rect(sw.x + 55, sw.y + 56, 470, SUBWIN_H - 96)
 
-    def geom_field_names(m: Maneuver) -> List[str]:
-        if m.type in ("go_straight", "accelerate", "decelerate"):
-            return ["length"]
+    def field_specs(m: Maneuver):
+        # (attribute, label) editable fields shown for this maneuver type
+        if m.type == "go_straight":
+            return [("intercept", "speed"), ("duration", "duration")]
+        if m.type in ("accelerate", "decelerate"):
+            return [("intercept", "v0"), ("slope", "accel"), ("duration", "duration")]
         if m.type in ("turn_left", "turn_right"):
-            return ["radius", "angle"]
-        return []
+            return [("radius", "radius"), ("angle", "angle"), ("duration", "duration")]
+        return [("duration", "duration")]  # stop
 
     def field_rects(m: Maneuver) -> dict:
         sw = subwin_rect()
-        base_y = sw.y + 56
-        colA_x, colB_x = sw.x + 620, sw.x + 850
-        rects = {"slope": pygame.Rect(colA_x, base_y, 90, 26),
-                 "intercept": pygame.Rect(colA_x, base_y + 42, 90, 26),
-                 "duration": pygame.Rect(colA_x, base_y + 84, 90, 26)}
-        for i, name in enumerate(geom_field_names(m)):
-            rects[name] = pygame.Rect(colB_x, base_y + i * 42, 90, 26)
-        return rects
+        x = sw.x + 640
+        return {name: pygame.Rect(x, sw.y + 56 + i * 42, 90, 26)
+                for i, (name, _lbl) in enumerate(field_specs(m))}
 
-    def field_value(m: Maneuver, name: str) -> float:
-        return getattr(m, name)
+    def field_label(m: Maneuver, name: str) -> str:
+        return next((lbl for n, lbl in field_specs(m) if n == name), name)
 
     def header_buttons() -> dict:
         sw = subwin_rect()
@@ -518,10 +514,8 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         a = scenario.actors[selected]
         # insert a straight segment that continues at the current exit speed
         v_in = a.maneuvers[man_index].exit_speed() if a.maneuvers else 10.0
-        length = 20.0
         new_m = Maneuver(type="go_straight", duration=2.0,
-                         slope=(v_in / length if v_in > 0 else 0.5),
-                         intercept=0.0, length=length)
+                         intercept=(v_in if v_in > 0 else 10.0), slope=0.0)
         at = man_index + 1 if a.maneuvers else 0
         a.maneuvers.insert(at, new_m)
         a.build_path()
@@ -561,29 +555,21 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         # speed the actor is carrying into this maneuver (so accel/decel are
         # continuous with the incoming speed rather than snapping to 0)
         v_in = a.maneuvers[man_index - 1].exit_speed() if man_index > 0 else 10.0
-        # fill sensible geometry defaults for the new type
-        if new_type in ("go_straight", "accelerate", "decelerate") and m.length <= 0:
-            m.length = 20.0
+        # fill sensible geometry defaults for turns
         if new_type in ("turn_left", "turn_right"):
             if m.radius <= 0:
                 m.radius = 5.0
             if m.angle <= 0:
                 m.angle = 90.0
-        # reset the curve when the curve *kind* changes (progress <-> velocity)
-        if new_kind != old_kind:
-            if new_kind == "progress":
-                # keep the incoming speed as a constant cruise
-                m.intercept = 0.0
-                m.slope = (v_in / m.geom_length()) if m.geom_length() > 0 \
-                    else 1.0 / max(0.05, m.duration)
-            else:  # velocity: start from the incoming speed, then accel/decel
-                m.intercept = v_in
-                m.slope = 2.0 if new_type == "accelerate" else -2.0
-        # nudge signs so accel/decel stay meaningful even without a kind change
-        if new_type == "accelerate" and m.slope <= 0:
-            m.slope = 2.0
-        if new_type == "decelerate" and m.slope >= 0:
-            m.slope = -2.0
+        # seed the velocity curve so motion is continuous with the incoming speed
+        if new_type in LONGITUDINAL_TYPES:
+            m.intercept = v_in                       # start at current speed
+            if new_type == "go_straight":
+                m.slope = 0.0                        # constant speed
+            elif new_type == "accelerate":
+                m.slope = 2.0 if m.slope <= 0 else m.slope
+            else:  # decelerate
+                m.slope = -2.0 if m.slope >= 0 else m.slope
         if new_type == "stop":
             m.slope, m.intercept = 0.0, 0.0
         a.build_path()
@@ -613,21 +599,25 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         old = getattr(m, param)
         if param == "duration":
             new_val = max(0.05, new_val)
+        elif param == "radius":
+            new_val = max(0.5, new_val)
+        elif param == "angle":
+            new_val = clamp(new_val, 1.0, 179.0)
+        elif param == "intercept":  # speed / v0 is non-negative
+            new_val = max(0.0, new_val)
         setattr(m, param, new_val)
         a.build_path()
         persistence.log_edit(a.id, man_index, m.type, param, old, new_val)
         set_status(f"{a.id}.{m.type}.{param}: {old:.3g} -> {new_val:.3g}")
 
     def plot_maps(m: Maneuver, pr: pygame.Rect):
+        # velocity-vs-time mapping (longitudinal maneuvers only)
         tmax = max(1e-6, m.duration)
-        if m.curve_kind == "progress":
-            vmin, vmax = -0.05, 1.05
-        else:
-            v0, v1 = m.intercept, m.intercept + m.slope * m.duration
-            vmax = max(v0, v1, 1.0) * 1.15
-            vmin = min(v0, v1, 0.0) - 0.15 * abs(max(v0, v1, 1.0))
-            if vmax - vmin < 1e-6:
-                vmax = vmin + 1.0
+        v0, v1 = m.intercept, m.intercept + m.slope * m.duration
+        vmax = max(v0, v1, 1.0) * 1.15
+        vmin = min(v0, v1, 0.0) - 0.15 * abs(max(v0, v1, 1.0))
+        if vmax - vmin < 1e-6:
+            vmax = vmin + 1.0
 
         def t2x(t): return pr.x + (t / tmax) * pr.width
         def v2y(v): return pr.bottom - (v - vmin) / (vmax - vmin) * pr.height
@@ -763,42 +753,45 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
         draw_button(hb["del_mvr"], "-mvr", enabled=(len(a.maneuvers) > 1))
 
         pr = plot_rect()
-        pygame.draw.rect(screen, (18, 20, 26), pr)
-        pygame.draw.rect(screen, C_AXIS, pr, 1)
-        t2x, v2y, _, tmax, vmin, vmax = plot_maps(m, pr)
-        ylab = "velocity (m/s)" if m.curve_kind == "velocity" else "progress"
-        screen.blit(font_sm.render(ylab, True, C_AXIS), (pr.x - 52, pr.y - 18))
-        screen.blit(font_sm.render("time (s)", True, C_AXIS),
-                    (pr.right - 60, pr.bottom + 6))
-        # zero line for velocity
-        if vmin < 0 < vmax:
-            zy = v2y(0)
-            pygame.draw.line(screen, (70, 74, 85), (pr.x, zy), (pr.right, zy), 1)
-        # the curve
-        p_left = (t2x(0), v2y(m.intercept))
-        p_right = (t2x(tmax), v2y(m.intercept + m.slope * tmax))
-        pygame.draw.line(screen, C_CURVE, p_left, p_right, 2)
-        pygame.draw.circle(screen, C_SEL, (int(p_left[0]), int(p_left[1])), 6)
-        pygame.draw.circle(screen, C_SEL, (int(p_right[0]), int(p_right[1])), 6)
-        # current-time marker if this maneuver is active now
-        phase = T % scenario.period
-        if a.cum[man_index] <= phase < a.cum[man_index + 1]:
-            tl = phase - a.cum[man_index]
-            mx = t2x(tl)
-            pygame.draw.line(screen, (250, 120, 120), (mx, pr.y), (mx, pr.bottom), 1)
+        if m.curve_kind == "velocity":
+            pygame.draw.rect(screen, (18, 20, 26), pr)
+            pygame.draw.rect(screen, C_AXIS, pr, 1)
+            t2x, v2y, _, tmax, vmin, vmax = plot_maps(m, pr)
+            screen.blit(font_sm.render("velocity (m/s)", True, C_AXIS), (pr.x - 4, pr.y - 18))
+            screen.blit(font_sm.render("time (s)", True, C_AXIS),
+                        (pr.right - 60, pr.bottom + 6))
+            if vmin < 0 < vmax:  # zero line
+                zy = v2y(0)
+                pygame.draw.line(screen, (70, 74, 85), (pr.x, zy), (pr.right, zy), 1)
+            p_left = (t2x(0), v2y(m.intercept))
+            p_right = (t2x(tmax), v2y(m.intercept + m.slope * tmax))
+            pygame.draw.line(screen, C_CURVE, p_left, p_right, 2)
+            pygame.draw.circle(screen, C_SEL, (int(p_left[0]), int(p_left[1])), 6)
+            # right endpoint only steerable for accel/decel (go_straight is flat)
+            if m.type != "go_straight":
+                pygame.draw.circle(screen, C_SEL, (int(p_right[0]), int(p_right[1])), 6)
+            phase = T % scenario.period  # current-time marker
+            if a.cum[man_index] <= phase < a.cum[man_index + 1]:
+                mx = t2x(phase - a.cum[man_index])
+                pygame.draw.line(screen, (250, 120, 120), (mx, pr.y), (mx, pr.bottom), 1)
+        else:
+            note = {"turn_left": "left turn — set radius, angle, duration",
+                    "turn_right": "right turn — set radius, angle, duration",
+                    "stop": "stop — hold position for duration"}.get(m.type, "")
+            screen.blit(font.render(note, True, (150, 154, 165)), (pr.x, pr.y + 8))
 
-        # fields: timing (slope/intercept/duration) + geometry (length | radius,angle)
-        fr = field_rects(m)
-        for key, rect in fr.items():
-            screen.blit(font.render(key, True, C_TEXT), (rect.x - 78, rect.y + 4))
-            focused = (focus_field == key)
+        # editable fields (labels depend on maneuver type)
+        for name, rect in field_rects(m).items():
+            screen.blit(font.render(field_label(m, name), True, C_TEXT),
+                        (rect.x - 90, rect.y + 4))
+            focused = (focus_field == name)
             pygame.draw.rect(screen, (18, 20, 26), rect)
             pygame.draw.rect(screen, C_BTN_HL if focused else (90, 94, 105), rect, 2)
-            shown = edit_buffer if focused else f"{field_value(m, key):.4g}"
+            shown = edit_buffer if focused else f"{getattr(m, name):.4g}"
             screen.blit(font.render(shown, True, C_TEXT), (rect.x + 6, rect.y + 4))
-        hint = "drag curve endpoints or a field + type (Enter). +/- mvr add/delete."
+        hint = "drag curve endpoints or click a field and type (Enter). +/-mvr add/delete."
         screen.blit(font_sm.render(hint, True, (140, 144, 155)),
-                    (pr.x, pr.bottom + 10))
+                    (pr.x, subwin_rect().bottom - 24))
 
     # ---- event handling ----
     def handle_click(mx, my):
@@ -850,14 +843,16 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
                     focus_field = key
                     edit_buffer = ""
                     return
-            pr = plot_rect()
-            t2x, v2y, _, tmax, _, _ = plot_maps(m, pr)
-            pl = (t2x(0), v2y(m.intercept))
-            prg = (t2x(tmax), v2y(m.intercept + m.slope * tmax))
-            if (mx - pl[0]) ** 2 + (my - pl[1]) ** 2 < 100:
-                dragging = "left"; focus_field = None; return
-            if (mx - prg[0]) ** 2 + (my - prg[1]) ** 2 < 100:
-                dragging = "right"; focus_field = None; return
+            if m.curve_kind == "velocity":  # draggable velocity-curve endpoints
+                pr = plot_rect()
+                t2x, v2y, _, tmax, _, _ = plot_maps(m, pr)
+                pl = (t2x(0), v2y(m.intercept))
+                prg = (t2x(tmax), v2y(m.intercept + m.slope * tmax))
+                if (mx - pl[0]) ** 2 + (my - pl[1]) ** 2 < 100:
+                    dragging = "left"; focus_field = None; return
+                if m.type != "go_straight" \
+                        and (mx - prg[0]) ** 2 + (my - prg[1]) ** 2 < 100:
+                    dragging = "right"; focus_field = None; return
             if sw.collidepoint(mx, my):
                 return  # click inside panel, no actor pick
         # BEV interactions (paused only) — canvas region, never the subwindow
@@ -900,18 +895,15 @@ def run_gui(scenario: Scenario, persistence: Persistence) -> None:
             a.build_path()
             return
         m = cur_maneuver()
-        if m is None:
+        if m is None or m.curve_kind != "velocity":
             return
         pr = plot_rect()
         _, _, y2v, tmax, _, _ = plot_maps(m, pr)
         val = y2v(clamp(my, pr.y, pr.bottom))
-        if m.curve_kind == "progress":
-            val = clamp(val, 0.0, 1.0)
         if dragging == "left":
-            apply_param("intercept", val)
+            apply_param("intercept", val)   # initial speed v0
         elif dragging == "right":
-            new_slope = (val - m.intercept) / max(1e-6, m.duration)
-            apply_param("slope", new_slope)
+            apply_param("slope", (val - m.intercept) / max(1e-6, m.duration))  # accel
 
     def commit_field():
         nonlocal focus_field, edit_buffer, T

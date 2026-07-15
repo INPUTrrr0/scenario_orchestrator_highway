@@ -5,27 +5,27 @@ map:
 render:
   pixels_per_meter: 6
 
-# 8-leg naming: [arm][side], e.g. SE = South arm, East-side lane (inbound,
-# northbound); EN = East arm, North-side lane (inbound, westbound).
-# Ego (0) drives north out of the South arm; actor 1 drives west out of the
-# East arm. Their straight-through paths cross near the intersection center.
+# Longitudinal maneuvers use a velocity curve (v0 + accel*t) over a duration;
+# distance travelled is emergent (no "length" parameter). Turns use radius +
+# angle + duration. 8-leg naming: SE = South arm east lane (inbound northbound),
+# EN = East arm north lane (inbound westbound).
 actors:
-  # Ego vehicle. Spawns on the SE leg, travels straight through heading North.
+  # Ego. Spawns on the SE leg, cruises straight through heading North at 14.5 m/s.
   - id: 0
     color: [90, 190, 110]          # green
     length: 4.5
     width: 2.0
     start: {x: 1.75, y: -58, heading: 90}
     maneuvers:
-      - {type: go_straight, length: 58, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
-      - {type: go_straight, length: 58, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
+      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
+      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
 
-  # Spawns on the EN leg, travels straight through heading West.
+  # Spawns on the EN leg, cruises straight through heading West at 14.5 m/s.
   - id: 1
     color: [210, 70, 60]           # red
     length: 4.5
     width: 2.0
     start: {x: 58, y: 1.75, heading: 180}
     maneuvers:
-      - {type: go_straight, length: 58, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
-      - {type: go_straight, length: 58, duration: 4.0, curve: {slope: 0.25, intercept: 0.0}}
+      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
+      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}

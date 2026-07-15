@@ -4,7 +4,7 @@ A single-file Python (pygame) tool to load, visualize, and edit orchestrated dri
 
 **Resolved decisions**
 - **Motion model:** chained path primitives — each maneuver is a geometric segment, chained end-to-end at the actual reached pose (no teleports).
-- **Timing curve:** linear, but its meaning is **per-maneuver** (D1): geometric maneuvers use *progress-fraction vs time*; speed maneuvers expose the physically relevant quantity, e.g. *velocity vs time* for accelerate/decelerate.
+- **Timing curve:** straight-line maneuvers use a linear *velocity-vs-time* curve (`v0` + `accel·t`); distance is emergent (∫v dt), so there is no `length` input. Turns are geometry (`radius`, `angle`) traversed over `duration`.
 - **Scheduling:** each actor runs its maneuvers sequentially; all actors run in parallel on one **global looping clock** (D2). An actor that finishes its sequence **holds its final pose** until the loop restarts.
 - **Lane changes dropped** (D3).
 - **Curve editor:** one maneuver at a time — the maneuver active at the paused timestamp (D4).
@@ -23,36 +23,38 @@ A single-file Python (pygame) tool to load, visualize, and edit orchestrated dri
 ```
 MapConfig: lane_width, arm_length          # single carriageway N-S and E-W
 Actor:  id, color, length, width, start{x,y,heading}, maneuvers[]
-Maneuver: type, duration, curve{slope, intercept}, <geometry params>
+Maneuver: type, duration, curve{v0, accel}   (longitudinal) | radius, angle (turns)
 ```
+
+There is **no `length` parameter**. Distance is a derived quantity, not an input: for straight-line motion it is the integral of the velocity curve over the duration; for a turn it is the arc `radius · angle`. `duration` (seconds) and speed (m/s) are the two independent inputs; distance = ∫speed dt falls out of them.
 
 ### Maneuver catalog
 
-| Type | Curve meaning | Geometry / params | Effect |
-|------|---------------|-------------------|--------|
-| `go_straight` | progress vs time | `length` | forward, heading fixed |
-| `turn_left` | progress vs time | `radius`, `angle`(°, def 90) | CCW arc, heading += |
-| `turn_right` | progress vs time | `radius`, `angle` | CW arc, heading −= |
-| `accelerate` | **velocity vs time** | `length` | forward; velocity = `intercept + slope·t` (slope>0) |
-| `decelerate` | **velocity vs time** | `length` | forward; velocity = `intercept + slope·t` (slope<0) |
-| `stop` | — (hold) | — | holds pose for `duration` |
+| Type | Defined by | Motion |
+|------|-----------|--------|
+| `go_straight` | velocity curve, `accel = 0` | forward at constant speed `v0`; heading fixed |
+| `accelerate` | velocity curve, `accel > 0` | forward, speeding up from `v0` |
+| `decelerate` | velocity curve, `accel < 0` | forward, slowing down from `v0` (never reverses) |
+| `turn_left` | `radius`, `angle`(°, def 90), `duration` | CCW arc, sweeps full `angle` over `duration`, heading += |
+| `turn_right` | `radius`, `angle`, `duration` | CW arc, heading −= |
+| `stop` | `duration` | holds pose for `duration` |
 
-Each maneuver reports a `curve_kind` (`progress` or `velocity`) that determines both how the curve maps to motion and the y-axis label in the editor.
+`curve_kind` is `velocity` for the three longitudinal types (editable velocity-vs-time plot) and `none` for turns/stop (geometry fields only).
 
-## 3. Timing curve → motion
+## 3. Motion
 
-Local time `t ∈ [0, duration]`, `curve(t) = slope·t + intercept`.
+Local time `t ∈ [0, duration]`.
 
-- **progress kind:** `u = clamp(curve(t), 0, 1)`; pose = `pose_along_segment(u)`.
-- **velocity kind:** `v(t) = curve(t)` (m/s); distance `s(t) = intercept·t + ½·slope·t²`; `u = clamp(s/length, 0, 1)`. This yields real intra-segment speed change even though the curve is linear (linear in velocity). `intercept` = initial velocity, `slope` = acceleration.
-- **stop:** `u` held; actor stationary for `duration`.
+- **Longitudinal** (`go_straight`/`accelerate`/`decelerate`): velocity `v(t) = v0 + accel·t`, clamped so it never goes negative; distance `s(t) = v0·t + ½·accel·t²`; pose = start + heading·`s(t)`. Distance is emergent — the maneuver can never "finish early and hold." `go_straight` is simply `accel = 0`.
+- **Turns:** `frac = clamp(t/duration, 0, 1)`; the actor sweeps `angle·frac` along an arc of the given `radius`. Always completes exactly the specified angle at `t = duration`.
+- **stop:** stationary for `duration`.
 
-Editable per maneuver: **slope**, **intercept**, **duration**.
+Editable per maneuver: **v0** (speed), **accel** (for accel/decel), **radius**/**angle** (turns), **duration**. `Maneuver.exit_speed()` gives the path speed at the end, used to seed the next maneuver's `v0` so speed is continuous across boundaries.
 
 ## 4. Simulation & scheduling
 - Per actor, cumulative maneuver start times; `total` = Σ durations. Global loop period = `max(total)` over actors.
-- At clock `T` (mod period): if `T ≥ actor.total`, hold final pose; else locate active maneuver `i`, `t = T − cum[i]`, `u = progress_i(t)`, pose from the chained segment.
-- **Chaining:** maneuver `i+1` starts at maneuver `i`'s *actually reached* end pose `pose_at(u_end)` where `u_end = progress_i(duration_i)` — avoids discontinuities when a curve doesn't complete a segment.
+- At clock `T` (mod period): if `T ≥ actor.total`, hold final pose; else locate active maneuver `i`, `t = T − cum[i]`, pose = `maneuver_i.pose_at(start_pose_i, t)`.
+- **Chaining:** maneuver `i+1` starts at maneuver `i`'s end pose `pose_at(start, duration)`. Longitudinal distance is emergent and turns always complete their angle, so segments join continuously.
 - Paths are precomputed at load and after each edit.
 
 ## 5. Map & leg naming
@@ -77,23 +79,23 @@ The default sample places the ego (ID 0, green) on `SE` and actor 1 (red) on `EN
 |                                                         |
 +---------------------------------------------------------+
 |  Actor <ID> — <maneuver> [i/n]              < prev next>|  timing-curve subwindow
-|  velocity/progress  ____----     • current-time marker  |  (stacked BELOW the BEV,
+|  velocity (m/s)    ____----      • current-time marker  |  (stacked BELOW the BEV,
 |      |         __----                                   |   always visible; editor
 |      |____---------------------  time                   |   shown when paused + an
-|   slope:[ ] intercept:[ ] duration:[ ]                  |   actor is selected)
+|   v0:[ ]  accel:[ ]  duration:[ ]                       |   actor is selected)
 +---------------------------------------------------------+
 ```
 - Top bar: editable current-time field `T=[..]` (click and type a time to scrub; auto-pauses), centered Play/Pause toggle (infinite loop when playing) plus Reset/Save, and **+Actor / -Actor** for adding/removing actors (`-Actor` enabled only with a selection; `a` and `Delete` are keyboard shortcuts).
 - BEV: each actor a colored rectangle with numeric ID label and heading indicator; selected actor outlined.
 - The timing-curve subwindow is stacked **below** the BEV (fixed region, no overlap; the window height is `topbar + canvas + subwindow`).
 - Selection only while paused: click an actor → outline + open the subwindow titled with its ID.
-- Subwindow shows the maneuver active at the paused time (prev/next steps through the list). Y-axis label switches between "progress" and "velocity (m/s)" by `curve_kind`. Edit via text fields **and** draggable plot endpoints (left endpoint → intercept, right endpoint → end value → slope). Every commit re-precomputes the path and is logged.
+- Subwindow shows the maneuver active at the paused time (prev/next steps through the list). Longitudinal maneuvers show a velocity-vs-time plot editable via text fields **and** draggable endpoints (left → `v0`, right → `accel`; `go_straight` has only the left/`v0` handle since it is flat). Turns/stop show geometry fields (`radius`/`angle`/`duration`) instead of a plot. Every commit re-precomputes the path and is logged.
 - **Add actor:** spawns a new actor with the next integer ID on the next inbound leg (cycling SE/EN/WS/NW) with a default straight-through maneuver. **Remove actor:** drops the selected actor. Both are recorded in the edit log as structural entries (`action: add_actor|remove_actor`).
 - **Spawn editing (drag in BEV):** the selected actor shows a highlighted **start marker** at its start pose plus a **rotation handle**. Drag the marker body to move the spawn `(x, y)` (the whole trajectory shifts rigidly); drag the handle to set the start heading. Grabbing either jumps the clock to `T=0` so the marker and the animated body coincide. Committed on release and logged (`action: move_actor` with old/new start).
-- **Maneuver list editing:** `+ mvr` inserts a default `go_straight` after the current maneuver; `- mvr` deletes the current one (kept ≥ 1). Per maneuver, geometry params are editable alongside the timing curve — `length` for straight/accel/decel, or `radius` + `angle` for turns — as text fields.
-- **Change maneuver type:** the `type: <t>` button (in the top-right header row with prev/next/+mvr/-mvr) cycles `go_straight → turn_left → turn_right → accelerate → decelerate → stop`. Missing geometry defaults are filled (radius 5 / angle 90 for turns, length 20 for straights). When the curve *kind* flips (progress ↔ velocity) the curve is re-seeded from the **incoming speed** `v_in` (the previous maneuver's exit speed, or 10 m/s for the first): a velocity maneuver starts at `v₀ = v_in` with `a = ±2`, and a progress maneuver cruises at `v_in`. Logged as `action: set_maneuver_type`. (Reordering maneuvers remains YAML-only by design.)
+- **Maneuver list editing:** `+ mvr` inserts a `go_straight` (continuing at the current speed) after the current maneuver; `- mvr` deletes the current one (kept ≥ 1). Editable params depend on type: `v0`/`duration` for `go_straight`, `v0`/`accel`/`duration` for accel/decel, `radius`/`angle`/`duration` for turns.
+- **Change maneuver type:** the `type: <t>` button (top-right header row with prev/next/+mvr/-mvr) cycles `go_straight → turn_left → turn_right → accelerate → decelerate → stop`. Turn defaults are filled (radius 5, angle 90). Longitudinal types are seeded from the **incoming speed** `v_in` (previous maneuver's exit speed, or 10 m/s for the first): `v0 = v_in`, with `accel = 0` (go_straight) / `+2` (accelerate) / `−2` (decelerate). Logged as `action: set_maneuver_type`. (Reordering maneuvers remains YAML-only by design.)
 
-**Speed continuity.** Because each maneuver's velocity was previously seeded independently, inserting/cycling to an `accelerate` after a moving maneuver used to snap v₀ to 0 — the car visibly *slowed* at the boundary before speeding up. Now `accelerate`/`decelerate` (and inserted `go_straight`s) inherit the incoming speed, so they build from the current speed rather than dropping to zero. `Maneuver.exit_speed()` computes this: `v₀ + a·duration` for velocity maneuvers, `arc_length · slope` for progress maneuvers, 0 for `stop`.
+**Speed continuity.** Longitudinal maneuvers inherit the incoming speed as `v0`, so an `accelerate` inserted after a moving maneuver builds from the current speed instead of snapping to 0 (which used to read as a *deceleration* at the boundary). `Maneuver.exit_speed()` computes the carried-over speed: `v0 + accel·duration` for longitudinal, `arc_length / duration` for turns, 0 for `stop`.
 
 ## 7. Persistence, versioning & provenance (D5)
 
@@ -142,32 +144,32 @@ versions:
 map: {lane_width: 3.5, arm_length: 60}
 render: {pixels_per_meter: 6}
 actors:
-  - id: car_A
-    color: [210, 70, 60]
+  - id: 0
+    color: [90, 190, 110]
     length: 4.5
     width: 2.0
-    start: {x: -55, y: -1.75, heading: 0}     # eastbound
+    start: {x: 1.75, y: -58, heading: 90}     # SE leg, northbound
     maneuvers:
-      - {type: go_straight, length: 35, duration: 3.0, curve: {slope: 0.333, intercept: 0.0}}
-      - {type: turn_left,   radius: 6, angle: 90, duration: 2.5, curve: {slope: 0.4, intercept: 0.0}}
-      - {type: go_straight, length: 40, duration: 3.5, curve: {slope: 0.286, intercept: 0.0}}
-  - id: car_B
+      - {type: go_straight, duration: 4.0, curve: {v0: 14.5, accel: 0.0}}
+      - {type: turn_left,   radius: 6, angle: 90, duration: 2.5}
+  - id: 1
     color: [60, 120, 210]
     length: 4.5
     width: 2.0
-    start: {x: 1.75, y: 55, heading: 270}     # southbound
+    start: {x: 58, y: 1.75, heading: 180}     # EN leg, westbound
     maneuvers:
-      - {type: go_straight, length: 25, duration: 2.5, curve: {slope: 0.4, intercept: 0.0}}
-      - {type: decelerate,  length: 12, duration: 3.0, curve: {slope: -2.0, intercept: 8.0}}  # v: 8→2 m/s
-      - {type: stop,        duration: 2.0, curve: {slope: 0.0, intercept: 0.0}}
-      - {type: accelerate,  length: 30, duration: 3.0, curve: {slope: 2.0, intercept: 0.0}}   # v: 0→6 m/s
+      - {type: go_straight, duration: 2.5, curve: {v0: 12.0, accel: 0.0}}
+      - {type: decelerate,  duration: 3.0, curve: {v0: 12.0, accel: -4.0}}  # 12 → 0 m/s
+      - {type: stop,        duration: 2.0}
+      - {type: accelerate,  duration: 3.0, curve: {v0: 0.0, accel: 3.0}}    # 0 → 9 m/s
 ```
+`length` (actor body length) and `width` describe the drawn rectangle; they are unrelated to distance travelled.
 
 ## 9. Single-file structure (`scenario_editor.py`)
 Dependencies: `pygame`, `pyyaml`.
 1. Dataclasses — `Maneuver`, `Actor`, `MapConfig`, `Scenario`.
 2. Loader/validator (YAML → objects).
-3. Geometry — per-type `pose_at(u)` + arc length; per-actor path precompute (chained by reached pose).
+3. Geometry — per-type `pose_at(start, t)` (time-based); per-actor path precompute (chained by end pose).
 4. Simulator — global clock → per-actor pose; loop + end-hold.
 5. Renderer — map, actors, top bar, curve subwindow.
 6. UI/input — play/pause, actor hit-test, field editing, drag handles, prev/next.
