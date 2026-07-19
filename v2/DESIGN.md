@@ -193,41 +193,53 @@ evaluation time t:
   car-following bound for `blocks` (w slower than hero's required speed with gap
   closing to < `g_min` before `t*`).
 
-## 6. Minimal intervention
+## 6. Minimal intervention (causal)
 
-**P5 — intervention space: edits to the *state*, never to the ego** (the ego is the
-system under test; Q3). Per non-ego actor:
+**P5 — interventions are *causal*: control edits applied from the evaluation
+instant forward, never edits to the state itself.** An intervention may not change
+the past — nor the present, discontinuously: every actor keeps its pose, speed, and
+history; what changes is its **future control**, executed under P1 kinematics.
+Never applied to the ego (Q3). Per non-ego actor:
 
-| Knob | Cost |
-|---|---|
-| `Δv` — change constant speed (result ∈ (0, v_max]) | `w_v·|Δv|`, w_v = 1 /(m/s) |
-| `Δs` — slide along its lane (spawn shift) | `w_s·|Δs|`, w_s = 0.5 /m |
-| `route(v) ← r` | `w_r = 5` |
-| `remove(v)` (last resort) | `w_x = 20` |
+| Intervention | Semantics | Cost |
+|---|---|---|
+| `retime(v, v')` | ramp at `\|a\| ≤ a_max` from current speed to target `v' ∈ [0, v_max]`, then plateau (`v' = 0` = yield/stop) | `w_v·\|v'−v\|`, w_v = 1 /(m/s) |
+| `reroute(v, r)` | re-choose route — only while v is **uncommitted** (before its path diverges at the stop line) | `w_r = 5` |
 
 Total cost = Σ over edited actors; **minimal intervention = argmin cost s.t. all
-three directives evaluate true on the edited state.** Note `Δv` edits the *initial
-state* (producing a scenario variant), not motion within an evolution — the
-continuity constraint of P1 governs evolutions, not edits, so interventions need no
-ramps.
+three directives evaluate true from the current state under the amended controls.**
+State edits — `Δs` spawn slides, instantaneous `Δv`, add/remove actor — are *not*
+interventions: they rewrite history. They remain available as **authoring edits**
+in the editor at design time (t = 0, where no past exists yet), outside this
+machinery.
+
+The causal restriction is what makes D2 load-bearing: a causal `retime` repair of
+D1 exists for a candidate at time t **iff D2 holds for it at t** — the repair must
+place the candidate's arrival inside ego's window, and `[t_min, t_max]` (§5) is
+exactly what `retime` can reach. D2 is the invariant that keeps D1 causally
+repairable; that is why the family orders D1 → D2 → D3, and why an orchestrator
+should act when D2 gets *tight*, not when D1 finally breaks.
 
 **P6 — repair algorithm: analytic per-directive repair + joint re-check** (approx.
 minimal; exact minimality would need a joint search — see Q4):
 
 1. Evaluate D1–D3; if all true, return ∅.
-2. **D1 repair** — for each hero candidate (ranked by §4): the constant speed that
-   centers hero's occupancy on ego's is `v* = d_h/((e₀+e₁)/2)` — closed form. If
-   `v* > v_max` or hero is past P, fall back to `Δs` (slide back along the lane,
-   also closed form) or a route change; take the cheapest feasible candidate.
-3. **D2 repair** — usually implied by D1 under constant velocity; when it fails on
-   the margin (`d_h(t)/v_max > e₁(t)` for some t < t*), shift `Δs` to restore slack.
-4. **D3 repair** — per interferer: min `|Δv|` or `|Δs|` that clears the conflict
-   window / opens the corridor gap (interval arithmetic again), else reroute, else
-   remove. Cheapest option per interferer.
-5. Re-evaluate all directives on the edited state; iterate (≤ 3 passes). Report the
-   intervention list, total cost, and the post-intervention evaluation. If still
-   infeasible (e.g. no candidate vehicle exists at all), report `INFEASIBLE` with
-   the reason rather than inventing actors.
+2. **D1 repair** — per hero candidate (ranked by §4): solve the ramp+plateau
+   kinematics for the target `v'` placing arrival at P nearest to the midpoint of
+   ego's window (a quadratic in the ramp time; feasible iff
+   `[t_min, t_max] ∩ [e₀, e₁] ≠ ∅` — exactly D2 for that candidate). Else
+   `reroute` if uncommitted. Take the cheapest feasible candidate.
+3. **D2 repair** — if the D2 margin is predicted to cross zero at a future t < t*,
+   `retime` *now* to restore slack — acting early is cheaper than acting late,
+   which is D2's whole point.
+4. **D3 repair** — per interferer: the min-`|v'−v|` `retime` that moves its
+   occupancy off the conflict window / opens the corridor gap (interval arithmetic
+   again; includes `v' = 0`, i.e. make it yield), else `reroute` if uncommitted.
+5. Re-evaluate all directives under the amended controls; iterate (≤ 3 passes).
+   Report interventions, total cost, and the post-intervention evaluation. If
+   infeasible — hero committed past P, no uncommitted candidate, interferer
+   unclearable — report `INFEASIBLE` with the reason: **the past is not available
+   for editing.**
 
 ## 7. Demonstration
 
@@ -251,11 +263,11 @@ green. Demo states:
 | | State | Expected |
 |---|---|---|
 | S1 | hero westbound on `EN` (red), on collision course with northbound ego | D1 ✓ D2 ✓ D3 ✓ |
-| S2 | hero too slow — misses ego's window | D1 ✗ → `Δv` on hero |
-| S3 | hero already through the intersection | D2 ✗ at t=0 → `Δs` (or reroute) |
-| S4 | slow lead vehicle ahead of hero on `EN` | D3 ✗ (`blocks`) → `Δv`/`Δs` on lead |
-| S5 | third vehicle's path crosses P during the collision window | D3 ✗ (`occupies_conflict`) → `Δs` |
-| S6 | no vehicle on any conflicting red approach | D1 ✗, no cheap witness → route change or `INFEASIBLE` |
+| S2 | hero too slow — misses ego's window | D1 ✗ → `retime` hero |
+| S3 | hero already through the intersection | D2 ✗ at t=0; hero committed → `reroute` another uncommitted candidate, else `INFEASIBLE` |
+| S4 | slow lead vehicle ahead of hero on `EN` | D3 ✗ (`blocks`) → `retime` lead |
+| S5 | third vehicle's path crosses P during the collision window | D3 ✗ (`occupies_conflict`) → `retime` it clear of the window |
+| S6 | no vehicle on any conflicting red approach | D1 ✗, no witness → `reroute` an uncommitted vehicle, else `INFEASIBLE` |
 
 S1 is also exercised via the adapter on `scenarios/scenario_v1.yaml` (the v1 worked
 example — whose function graph `v_hero = v_ego·d_h/d_e` is, pleasingly, exactly a
@@ -292,3 +304,7 @@ on every edit); "apply intervention" as an edit-log action; family files under
   constant speed; interventions may edit any non-ego actor, never the ego.
 - **Q4 — minimality: greedy analytic.** Closed-form per-directive repairs with a
   joint re-check, always verified by re-evaluation; approximately minimal.
+- **Q5 — causality (added in review).** Interventions never change the past:
+  causal, forward-in-time control edits only (`retime`, `reroute`), executed under
+  P1 kinematics. State edits are authoring operations belonging to the editor, not
+  the directive machinery.
