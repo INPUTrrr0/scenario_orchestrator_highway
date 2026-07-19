@@ -1352,7 +1352,8 @@ def complex_demo_states() -> List[State]:
     """Populated-world demo inspired by v0 scenario_v20: actors on all legs,
     mid-turn actors inside the intersection, parked vehicles off-road, and two
     states sampled from the inspiring realization itself (if present)."""
-    parked = [("5", -53.0, 12.25, 224.2, 0.0), ("6", -48.33, 11.42, 227.6, 0.0)]
+    # v20 parks these on the west grass at x ~ -53; pulled in to stay in view
+    parked = [("5", -34.0, 10.5, 224.2, 0.0), ("6", -29.33, 9.67, 227.6, 0.0)]
 
     def enl(ang, v):   # on the EN-left fillet (center (3.5,-3.5), r=5.25), CCW
         return _arc_pose(3.5, -3.5, 5.25, ang, +90.0, v)

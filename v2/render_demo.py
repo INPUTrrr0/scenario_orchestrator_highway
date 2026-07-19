@@ -38,8 +38,8 @@ COLORS = {  # actor id -> body color (ego green, hero-ish red, extras)
     "6": (150, 185, 95), "7": (225, 105, 165), "9": (195, 125, 55),
 }
 
-VIEW = 58.0      # half-extent of the world view (m) — wide enough for spawns
-SCALE = 8.0      # px per meter
+VIEW = 42.0      # half-extent of the world view (m)
+SCALE = 10.0     # px per meter
 SIZE = int(2 * VIEW * SCALE)
 GAP = 4          # px between panels in --compare
 
