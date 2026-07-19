@@ -62,25 +62,28 @@ An adapter `state_from_scenario(path, T)` samples a v0/v1 scenario file at clock
 (via the existing simulation) into this form, so directive evaluation composes with
 the editor's saved scenarios.
 
-**P1 — Evolution model M (piecewise-constant, continuous velocity; C¹ paths).**
-Speed profiles along any evolution are **piecewise constant: plateaus joined by
-constant-acceleration ramps** — continuous overall, with discontinuities only in
-*acceleration* (instantaneous changes in `a`, i.e. unbounded jerk; `|a| ≤ a_max`,
-default 3 m/s²). Speeds never jump. Actors follow their lane centerlines; paths are
+**P1 — Evolution model M (piecewise-constant velocity; speed jumps allowed).**
+Speed profiles along any evolution are **piecewise constant, with jump
+discontinuities permitted at decision instants** (a branch choice or an
+intervention): adopting a new speed is instantaneous — an impulsive acceleration.
+Positions are always continuous. Actors follow their lane centerlines; paths are
 polyline+arc: inbound leg → intersection → outbound leg, where turns are circular
-fillets **tangent to both centerlines** — so the velocity *direction* is continuous
-too. After exiting, actors continue straight to the map edge and hold there. The
-**nominal evolution ξ\*** is the degenerate case: each actor holds its current speed
-(a single plateau) along its *recognized* route (§4).
+fillets **tangent to both centerlines** — so between decision instants the velocity
+*direction* is continuous as well. After exiting, actors continue straight to the
+map edge and hold there. The **nominal evolution ξ\*** has no jumps at all: each
+actor holds its current speed along its *recognized* route (§4).
+
+A stricter **C⁰-velocity variant** — plateaus joined by constant-acceleration ramps,
+`|a| ≤ a_max` (default 3 m/s²) — is kept behind a flag (`--ramp [a_max]`); §5 notes
+the single place where the derivations differ.
 
 **Branching.** Nondeterminism is (a) the **route choice** at the intersection: an
 actor on an inbound leg has routes `{left, straight, right}` (each mapping to the
 correct outbound leg under right-hand traffic); and (b) for controllable vehicles,
 the speed profile. The **admissible branch set Γ(x, v)** for a controllable vehicle
-`v` allows re-choosing `v`'s route and steering to a **target speed
-`v' ∈ [0, v_max]`** (default `v_max = 20 m/s`), realized admissibly as *one ramp at
-`|a| ≤ a_max` from the current speed, then a plateau* — the modality never teleports
-a speed. All other actors stay on nominal. Γ is what `◇` quantifies over; only the
+`v` allows re-choosing `v`'s route and adopting a **target speed
+`v' ∈ [0, v_max]`** (default `v_max = 20 m/s`) instantaneously (under `--ramp`: via
+one ramp at `|a| ≤ a_max`, then a plateau). All other actors stay on nominal. Γ is what `◇` quantifies over; only the
 hero is treated as controllable (Q3).
 
 ## 2. Formal language
@@ -180,14 +183,17 @@ evaluation time t:
 - **D1** — collide ⟺ hero's occupancy `[h₀, h₁]` overlaps `[e₀, e₁]`; evaluated per
   candidate v and per route of v (disjunction), nominal speeds. `t*` = midpoint of
   the overlap.
-- **D2** — under ramp+plateau controls, hero's *reachable arrival times* at P from
-  the state at t form an interval `[t_min(t), t_max(t)]`: `t_min` = max-accel ramp
-  to `v_max` then hold; `t_max = ∞` iff hero can still stop short of P
-  (`d_h ≥ v_h²/(2·a_max)`), else the max-braking arrival bound. `◇ F collide` at t
-  ⟺ ego's window is not over (`e₁(t) > 0`), hero has not passed P, and
-  `[t_min(t), t_max(t)] ∩ [e₀(t), e₁(t)] ≠ ∅`. Still closed-form interval
-  arithmetic; D2 = G of that test, checked densely over `[0, t*]` with the first
-  violation time reported.
+- **D2** — hero's *reachable arrival times* at P from the state at t form
+  `[d_h(t)/v_max, ∞)`: jump to `v_max` for the earliest arrival, jump toward 0 to
+  delay arbitrarily. `◇ F collide` at t ⟺ ego's window is not over (`e₁(t) > 0`),
+  hero has not passed P, and `d_h(t)/v_max ≤ e₁(t)` — one inequality. D2 = G of
+  that test, checked densely over `[0, t*]` with the first violation time reported.
+  *Under `--ramp`* the reachable set instead becomes an interval `[t_min, t_max]`:
+  `t_min` from the max-accel ramp, and `t_max < ∞` when the hero is *committed to
+  overshoot* (`d_h < v_h²/(2·a_max)` — cannot stop short of P); same window-overlap
+  test, strictly stronger D2. This interval shape is the **only** derivation the
+  continuity assumption changes — everything downstream is window-overlap algebra
+  either way.
 - **D3** — per third vehicle w: closed-form window overlap for
   `occupies_conflict`, first-collision check against ego/hero, and a constant-speed
   car-following bound for `blocks` (w slower than hero's required speed with gap
@@ -197,13 +203,14 @@ evaluation time t:
 
 **P5 — interventions are *causal*: control edits applied from the evaluation
 instant forward, never edits to the state itself.** An intervention may not change
-the past — nor the present, discontinuously: every actor keeps its pose, speed, and
-history; what changes is its **future control**, executed under P1 kinematics.
-Never applied to the ego (Q3). Per non-ego actor:
+the past: every actor keeps its pose and its history; what changes is its **future
+control**, executed under P1 kinematics — a speed jump at the current instant
+alters no past sample, so continuity and causality are orthogonal (Q6). Never
+applied to the ego (Q3). Per non-ego actor:
 
 | Intervention | Semantics | Cost |
 |---|---|---|
-| `retime(v, v')` | ramp at `\|a\| ≤ a_max` from current speed to target `v' ∈ [0, v_max]`, then plateau (`v' = 0` = yield/stop) | `w_v·\|v'−v\|`, w_v = 1 /(m/s) |
+| `retime(v, v')` | adopt target speed `v' ∈ [0, v_max]` from now on (instantaneous; under `--ramp`, via one ramp; `v' = 0` = yield/stop) | `w_v·\|v'−v\|`, w_v = 1 /(m/s) |
 | `reroute(v, r)` | re-choose route — only while v is **uncommitted** (before its path diverges at the stop line) | `w_r = 5` |
 
 Total cost = Σ over edited actors; **minimal intervention = argmin cost s.t. all
@@ -215,8 +222,8 @@ machinery.
 
 The causal restriction is what makes D2 load-bearing: a causal `retime` repair of
 D1 exists for a candidate at time t **iff D2 holds for it at t** — the repair must
-place the candidate's arrival inside ego's window, and `[t_min, t_max]` (§5) is
-exactly what `retime` can reach. D2 is the invariant that keeps D1 causally
+place the candidate's arrival inside ego's window, and the reachable arrival set of
+§5 is exactly what `retime` can reach. D2 is the invariant that keeps D1 causally
 repairable; that is why the family orders D1 → D2 → D3, and why an orchestrator
 should act when D2 gets *tight*, not when D1 finally breaks.
 
@@ -224,11 +231,11 @@ should act when D2 gets *tight*, not when D1 finally breaks.
 minimal; exact minimality would need a joint search — see Q4):
 
 1. Evaluate D1–D3; if all true, return ∅.
-2. **D1 repair** — per hero candidate (ranked by §4): solve the ramp+plateau
-   kinematics for the target `v'` placing arrival at P nearest to the midpoint of
-   ego's window (a quadratic in the ramp time; feasible iff
-   `[t_min, t_max] ∩ [e₀, e₁] ≠ ∅` — exactly D2 for that candidate). Else
-   `reroute` if uncommitted. Take the cheapest feasible candidate.
+2. **D1 repair** — per hero candidate (ranked by §4): the target speed placing
+   arrival at the midpoint of ego's window is `v' = d_h/((e₀+e₁)/2)` — linear;
+   feasible iff `v' ≤ v_max`, exactly D2 for that candidate (under `--ramp`, a
+   quadratic in the ramp time against the interval of §5). Else `reroute` if
+   uncommitted. Take the cheapest feasible candidate.
 3. **D2 repair** — if the D2 margin is predicted to cross zero at a future t < t*,
    `retime` *now* to restore slack — acting early is cheaper than acting late,
    which is D2's whole point.
@@ -308,3 +315,8 @@ on every edit); "apply intervention" as an edit-log action; family files under
   causal, forward-in-time control edits only (`retime`, `reroute`), executed under
   P1 kinematics. State edits are authoring operations belonging to the editor, not
   the directive machinery.
+- **Q6 — velocity continuity (revised in review).** Instantaneous speed changes
+  are the model: jumps at decision instants, positions always continuous. Causality
+  (Q5) is unaffected — a jump alters only the future. The C⁰ ramp variant survives
+  as `--ramp [a_max]` for when physical realizability of interventions matters; it
+  changes exactly one derivation (the reachable arrival set in §5's D2).
