@@ -127,6 +127,40 @@ def test_signals_explicit():
     assert not res.d1.value  # nobody runs a red if every arm is green
 
 
+def test_complex_set():
+    prm = dv.Params()
+    states = {s.label.split(":")[0]: s for s in dv.complex_demo_states()}
+    # X1 all hold with a mid-turn hero
+    a1 = dv.recognize(states["X1"], prm)
+    assert a1.actors["1"].region == "intersection" and a1.actors["1"].turn == "left"
+    assert a1.actors["9"].turn == "right" and a1.actors["5"].region == "offmap"
+    r1 = dv.evaluate_family(a1, prm)
+    assert r1.ok and r1.hero == "1"
+    # X3 repairs the sweeping car (retime or reroute), body-sweep validated
+    rr3 = dv.repair(dv.recognize(states["X3"], prm), prm)
+    assert rr3.feasible and rr3.final.ok
+    assert all(iv.actor == "7" for iv in rr3.interventions)
+    a3 = dv.recognize(states["X3"], prm)
+    c3 = {}
+    for iv in rr3.interventions:
+        c3.setdefault(iv.actor, {})["speed" if iv.kind == "retime" else "turn"] = iv.value
+    assert dv._body_sweep_clear(a3, prm, c3, "7", ["1", "0"], rr3.final.t_star + 0.5)
+    # X5 wakes the stopped candidate
+    rr5 = dv.repair(dv.recognize(states["X5"], prm), prm)
+    assert rr5.feasible and rr5.final.hero == "4" and rr5.final.ok
+    # X6 is infeasible (too late)
+    rr6 = dv.repair(dv.recognize(states["X6"], prm), prm)
+    assert not rr6.feasible
+    # X9 needs two distinct interferer fixes
+    rr9 = dv.repair(dv.recognize(states["X9"], prm), prm)
+    assert rr9.feasible and rr9.final.ok
+    assert len({iv.actor for iv in rr9.interventions}) >= 2
+    # sampled realization: v20 @ 4.5 s is itself a family member
+    if "X7" in states:
+        r7 = dv.evaluate_family(dv.recognize(states["X7"], prm), prm)
+        assert r7.ok and r7.hero == "3"
+
+
 def test_adapter():
     prm = dv.Params()
     here = os.path.dirname(os.path.abspath(__file__))

@@ -32,9 +32,10 @@ ASPHALT = (70, 70, 74)
 LANE_LINE = (230, 230, 230)
 EDGE_LINE = (245, 245, 245)
 HEADER_BG = (24, 24, 28)
-COLORS = {  # actor id -> body color (ego green, hero-ish red, extras amber/blue)
+COLORS = {  # actor id -> body color (ego green, hero-ish red, extras)
     "0": (90, 190, 110), "1": (225, 85, 85), "2": (240, 170, 60),
-    "3": (80, 130, 215), "4": (170, 110, 220),
+    "3": (80, 130, 215), "4": (170, 110, 220), "5": (80, 200, 200),
+    "6": (150, 185, 95), "7": (225, 105, 165), "9": (195, 125, 55),
 }
 
 VIEW = 42.0      # half-extent of the world view (m)
@@ -211,8 +212,10 @@ def render_compare(state, prm, outdir, fps):
             right_cap = "INFEASIBLE - no causal repair; evolution unchanged"
         res_r = rr.final
     evo_r = dv.Evolution(astate, prm, controls)
-    t_end = min(max((res.t_star or 6.0), (res_r.t_star or 6.0)) + 2.0, 9.0)
-    t_end = max(t_end, 6.5)
+    # cut post-scenario noise: run to shortly after the later planned collision
+    tl = res.t_star if (res.d1.value and res.t_star) else 4.0
+    tr = res_r.t_star if (res_r.d1.value and res_r.t_star) else 4.0
+    t_end = min(max(tl, tr) + 2.0, 9.0)
     hit_l = first_contact(astate, evo_l, t_end, fps)
     hit_r = first_contact(astate, evo_r, t_end, fps)
     width = 2 * SIZE + GAP
@@ -258,6 +261,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--compare", action="store_true",
                     help="side-by-side: nominal vs post-intervention")
+    ap.add_argument("--set", dest="which", choices=["basic", "complex"],
+                    default="basic", help="which demo set to render")
     ap.add_argument("--ramp", nargs="?", const=3.0, default=None, type=float)
     ap.add_argument("--fps", type=int, default=20)
     ap.add_argument("--outdir", default=os.path.join(
@@ -265,7 +270,8 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.outdir, exist_ok=True)
     prm = dv.Params(ramp=args.ramp)
-    for st in dv.demo_states():
+    states = dv.demo_states() if args.which == "basic" else dv.complex_demo_states()
+    for st in states:
         if args.compare:
             render_compare(st, prm, args.outdir, args.fps)
         else:

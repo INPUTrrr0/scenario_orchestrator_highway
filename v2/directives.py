@@ -1141,8 +1141,27 @@ class RepairResult:
     reason: str = ""
 
 
+def _body_sweep_clear(astate, prm, controls, w, others, t_hi) -> bool:
+    """Dense oriented-body check: w touches none of `others` before t_hi.
+    Catches near-miss geometry the centerline-crossing abstraction can't see
+    (e.g. corner clips between neighbouring turn fillets)."""
+    evo = Evolution(astate, prm, controls)
+    wa = astate.actors[w]
+    t = 0.0
+    while t <= t_hi + 1e-9:
+        rw = rect_corners(*evo.pose_at(w, t), wa.length, wa.width)
+        for o in others:
+            oa = astate.actors[o]
+            if rects_overlap(rw, rect_corners(*evo.pose_at(o, t),
+                                              oa.length, oa.width)):
+                return False
+        t += 0.05
+    return True
+
+
 def _fix_interferer(astate, prm, controls, w, res) -> Optional[List[Intervention]]:
-    """Min-cost causal edit of w clearing the full `interferes` predicate."""
+    """Min-cost causal edit of w clearing the full `interferes` predicate,
+    validated concretely by a dense body sweep against hero and ego."""
     aa = astate.actors[w]
     v_now = Evolution(astate, prm, controls).items[w][2].v_at(0.0)
 
@@ -1151,7 +1170,11 @@ def _fix_interferer(astate, prm, controls, w, res) -> Optional[List[Intervention
         ctx = Ctx(astate, evo2, 0.0, prm,
                   {"ego": astate.ego, "hero": res.hero},
                   tstar=res.t_star, protected=res.protected)
-        return not p_interferes(ctx, w, res.hero, astate.ego).value
+        if p_interferes(ctx, w, res.hero, astate.ego).value:
+            return False
+        others = [o for o in (res.hero, astate.ego) if o and o != w]
+        return _body_sweep_clear(astate, prm, trial_controls, w, others,
+                                 (res.t_star or prm.H) + 0.5)
 
     cands = []
     # retime: scan speeds by increasing |dv|, refine winner
@@ -1319,6 +1342,73 @@ def parse_signals(txt: str) -> dict:
     return out
 
 
+def _arc_pose(cx, cy, r, ang, dh, v):
+    """Pose on a fillet arc at position-angle `ang` (deg), heading offset dh."""
+    a = math.radians(ang)
+    return (cx + r * math.cos(a), cy + r * math.sin(a), ang + dh, v)
+
+
+def complex_demo_states() -> List[State]:
+    """Populated-world demo inspired by v0 scenario_v20: actors on all legs,
+    mid-turn actors inside the intersection, parked vehicles off-road, and two
+    states sampled from the inspiring realization itself (if present)."""
+    parked = [("5", -53.0, 12.25, 224.2, 0.0), ("6", -48.33, 11.42, 227.6, 0.0)]
+
+    def enl(ang, v):   # on the EN-left fillet (center (3.5,-3.5), r=5.25), CCW
+        return _arc_pose(3.5, -3.5, 5.25, ang, +90.0, v)
+
+    def ser(ang, v):   # on the SE-right fillet (center (3.5,-3.5), r=1.75), CW
+        return _arc_pose(3.5, -3.5, 1.75, ang, -90.0, v)
+
+    x1 = enl(95.0, 3.5)        # mid-left-turn, before ego's lane crossing
+    x1past = enl(170.0, 8.0)   # mid-left-turn, already past the crossing
+    x9 = ser(110.0, 5.0)       # mid-right-turn ahead of ego, clearing its lane
+    states = [
+        mkstate("X1: populated world, mid-turn hero on course (all hold)",
+                [("0", 1.75, -15.0, 90.0, 12.0), ("1", *x1),
+                 ("2", 26.0, 1.75, 180.0, 10.2), ("3", 40.0, 1.75, 180.0, 10.2),
+                 ("4", -30.0, -1.75, 0.0, 0.0), *parked,
+                 ("7", -1.75, 36.0, 270.0, 6.0), ("9", *x9)]),
+        mkstate("X2: turner already through, approach hero too slow",
+                [("0", 1.75, -26.0, 90.0, 12.0), ("1", *x1past),
+                 ("2", 30.0, 1.75, 180.0, 6.0), ("3", 55.0, 1.75, 180.0, 6.0),
+                 ("4", -30.0, -1.75, 0.0, 0.0), *parked,
+                 ("7", -1.75, 32.0, 270.0, 8.0)]),
+        mkstate("X3: southbound car sweeps the conflict and merges with hero",
+                [("0", 1.75, -15.0, 90.0, 12.0), ("1", *x1),
+                 ("3", 40.0, 1.75, 180.0, 10.0), ("4", -30.0, -1.75, 0.0, 0.0),
+                 *parked, ("7", -1.75, 9.0, 270.0, 8.0), ("9", *x9)]),
+        mkstate("X4: slow lead blocks the hero and hits the ego first",
+                [("0", 1.75, -26.0, 90.0, 12.0), ("1", *x1past),
+                 ("2", 26.0, 1.75, 180.0, 10.2), ("3", 12.0, 1.75, 180.0, 3.0),
+                 *parked]),
+        mkstate("X5: only candidate is stopped at the line (wake it)",
+                [("0", 1.75, -26.0, 90.0, 12.0), ("2", 45.0, 1.75, 180.0, 8.0),
+                 ("4", -12.0, -1.75, 0.0, 0.0), *parked,
+                 ("7", -1.75, 32.0, 270.0, 8.0), ("9", *x9)]),
+        mkstate("X6: ego about to clear - too late to stage anything",
+                [("0", 1.75, -6.0, 90.0, 14.0), ("1", *x1past),
+                 ("2", 40.0, 1.75, 180.0, 10.0), ("3", 55.0, 1.75, 180.0, 10.0),
+                 ("4", -35.0, -1.75, 0.0, 0.0), *parked,
+                 ("7", -1.75, 16.0, 270.0, 8.0)]),
+    ]
+    v20 = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "..", "v0", "scenarios", "scenario_v20.yaml")
+    if os.path.exists(v20):
+        for i, (T, tag) in enumerate(
+                ((4.5, "the sampled realization satisfies the family"),
+                 (2.0, "sampled early - repair wakes the stopping car")), start=7):
+            st = state_from_scenario(v20, T, None)
+            st.label = f"X{i}: scenario_v20 @ T={T:g}s ({tag})"
+            states.append(st)
+    states.append(
+        mkstate("X9: two interferers at once (both causally cleared)",
+                [("0", 1.75, -15.0, 90.0, 12.0), ("1", *x1),
+                 ("3", 8.0, 1.75, 180.0, 4.0), ("4", -30.0, -1.75, 0.0, 0.0),
+                 *parked, ("7", -1.75, 9.0, 270.0, 8.0), ("9", *x9)]))
+    return states
+
+
 def demo_states() -> List[State]:
     E = ("0", 1.75, -30.0, 90.0, 12.0)
     return [
@@ -1396,7 +1486,9 @@ def report(state: State, prm: Params) -> RepairResult:
 
 def main():
     ap = argparse.ArgumentParser(description="v2 directive layer (see DESIGN.md)")
-    ap.add_argument("--demo", action="store_true", help="run the built-in demo states")
+    ap.add_argument("--demo", nargs="?", const="basic",
+                    choices=["basic", "complex", "all"], default=None,
+                    help="run built-in demo states (basic | complex | all)")
     ap.add_argument("--state", help="state YAML or v0/v1 scenario YAML")
     ap.add_argument("--time", type=float, default=None,
                     help="clock T for scenario files (adapter)")
@@ -1411,7 +1503,12 @@ def main():
         st = load_state_file(args.state, args.time, signals)
         report(st, prm)
     elif args.demo:
-        for st in demo_states():
+        states = []
+        if args.demo in ("basic", "all"):
+            states += demo_states()
+        if args.demo in ("complex", "all"):
+            states += complex_demo_states()
+        for st in states:
             if signals:
                 st.signals = signals
             report(st, prm)
