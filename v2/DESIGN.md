@@ -271,7 +271,7 @@ green. Demo states:
 |---|---|---|
 | S1 | hero westbound on `EN` (red), on collision course with northbound ego | D1 ✓ D2 ✓ D3 ✓ |
 | S2 | hero too slow — misses ego's window | D1 ✗ → `retime` hero |
-| S3 | hero already through the intersection | D2 ✗ at t=0; hero committed → `reroute` another uncommitted candidate, else `INFEASIBLE` |
+| S3 | hero already through the intersection | D2 ✗ at t=0; hero committed → switch witness to an uncommitted candidate (`retime` it), else `INFEASIBLE` |
 | S4 | slow lead vehicle ahead of hero on `EN` | D3 ✗ (`blocks`) → `retime` lead |
 | S5 | third vehicle's path crosses P during the collision window | D3 ✗ (`occupies_conflict`) → `retime` it clear of the window |
 | S6 | no vehicle on any conflicting red approach | D1 ✗, no witness → `reroute` an uncommitted vehicle, else `INFEASIBLE` |
