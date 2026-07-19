@@ -62,23 +62,26 @@ An adapter `state_from_scenario(path, T)` samples a v0/v1 scenario file at clock
 (via the existing simulation) into this form, so directive evaluation composes with
 the editor's saved scenarios.
 
-**P1 — Evolution model M (piecewise constant velocity, C¹ paths).** Each actor
-follows its lane centerline at its **current speed, held constant** for the whole
-prediction. Paths are polyline+arc: inbound leg → intersection → outbound leg, where
-turns are circular fillets **tangent to both centerlines**, traversed at the same
-speed. Speed is constant and the velocity *direction* is continuous through tangent
-arcs, so the velocity profile has no jump discontinuities — the "continuous"
-strengthening is satisfied. After exiting, actors continue straight to the map edge
-and hold there.
+**P1 — Evolution model M (piecewise-constant, continuous velocity; C¹ paths).**
+Speed profiles along any evolution are **piecewise constant: plateaus joined by
+constant-acceleration ramps** — continuous overall, with discontinuities only in
+*acceleration* (instantaneous changes in `a`, i.e. unbounded jerk; `|a| ≤ a_max`,
+default 3 m/s²). Speeds never jump. Actors follow their lane centerlines; paths are
+polyline+arc: inbound leg → intersection → outbound leg, where turns are circular
+fillets **tangent to both centerlines** — so the velocity *direction* is continuous
+too. After exiting, actors continue straight to the map edge and hold there. The
+**nominal evolution ξ\*** is the degenerate case: each actor holds its current speed
+(a single plateau) along its *recognized* route (§4).
 
-**Branching.** The only nondeterminism is the **route choice** at the intersection:
-an actor on an inbound leg has routes `{left, straight, right}` (each mapping to the
-correct outbound leg under right-hand traffic). An evolution is a route assignment
-per actor; the **nominal evolution ξ\*** takes each actor's *recognized* route (§4).
-The **admissible branch set Γ(x, v)** for a controllable vehicle `v` additionally
-allows re-choosing `v`'s route and re-choosing its constant speed `v' ∈ (0, v_max]`
-(default `v_max = 20 m/s`), with all other actors on nominal. Γ is what `◇`
-quantifies over; only the hero is treated as controllable (Q3).
+**Branching.** Nondeterminism is (a) the **route choice** at the intersection: an
+actor on an inbound leg has routes `{left, straight, right}` (each mapping to the
+correct outbound leg under right-hand traffic); and (b) for controllable vehicles,
+the speed profile. The **admissible branch set Γ(x, v)** for a controllable vehicle
+`v` allows re-choosing `v`'s route and steering to a **target speed
+`v' ∈ [0, v_max]`** (default `v_max = 20 m/s`), realized admissibly as *one ramp at
+`|a| ≤ a_max` from the current speed, then a plateau* — the modality never teleports
+a speed. All other actors stay on nominal. Γ is what `◇` quantifies over; only the
+hero is treated as controllable (Q3).
 
 ## 2. Formal language
 
@@ -177,10 +180,14 @@ evaluation time t:
 - **D1** — collide ⟺ hero's occupancy `[h₀, h₁]` overlaps `[e₀, e₁]`; evaluated per
   candidate v and per route of v (disjunction), nominal speeds. `t*` = midpoint of
   the overlap.
-- **D2** — `◇ F collide` at time t ⟺ hero has not passed P, ego's window is not
-  over (`e₁(t) > 0`), and `∃ v' ∈ (0, v_max]: d_h(t)/v' ∈ [e₀(t), e₁(t)]` ⟺
-  `d_h(t)/v_max ≤ e₁(t)`. So D2 = G of a one-line inequality — checked densely over
-  `[0, t*]` and reported with the first violation time.
+- **D2** — under ramp+plateau controls, hero's *reachable arrival times* at P from
+  the state at t form an interval `[t_min(t), t_max(t)]`: `t_min` = max-accel ramp
+  to `v_max` then hold; `t_max = ∞` iff hero can still stop short of P
+  (`d_h ≥ v_h²/(2·a_max)`), else the max-braking arrival bound. `◇ F collide` at t
+  ⟺ ego's window is not over (`e₁(t) > 0`), hero has not passed P, and
+  `[t_min(t), t_max(t)] ∩ [e₀(t), e₁(t)] ≠ ∅`. Still closed-form interval
+  arithmetic; D2 = G of that test, checked densely over `[0, t*]` with the first
+  violation time reported.
 - **D3** — per third vehicle w: closed-form window overlap for
   `occupies_conflict`, first-collision check against ego/hero, and a constant-speed
   car-following bound for `blocks` (w slower than hero's required speed with gap
@@ -199,7 +206,10 @@ system under test; Q3). Per non-ego actor:
 | `remove(v)` (last resort) | `w_x = 20` |
 
 Total cost = Σ over edited actors; **minimal intervention = argmin cost s.t. all
-three directives evaluate true on the edited state.**
+three directives evaluate true on the edited state.** Note `Δv` edits the *initial
+state* (producing a scenario variant), not motion within an evolution — the
+continuity constraint of P1 governs evolutions, not edits, so interventions need no
+ramps.
 
 **P6 — repair algorithm: analytic per-directive repair + joint re-check** (approx.
 minimal; exact minimality would need a joint search — see Q4):
