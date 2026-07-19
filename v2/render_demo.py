@@ -38,8 +38,8 @@ COLORS = {  # actor id -> body color (ego green, hero-ish red, extras)
     "6": (150, 185, 95), "7": (225, 105, 165), "9": (195, 125, 55),
 }
 
-VIEW = 42.0      # half-extent of the world view (m)
-SCALE = 10.0     # px per meter
+VIEW = 58.0      # half-extent of the world view (m) — wide enough for spawns
+SCALE = 8.0      # px per meter
 SIZE = int(2 * VIEW * SCALE)
 GAP = 4          # px between panels in --compare
 
@@ -129,15 +129,19 @@ def first_contact(astate, evo, t_end, fps):
     return None
 
 
-def draw_panel(d, astate, evo, t, hit, ox, hdr):
-    draw_map(d, astate, ox, hdr)
+def panel_image(astate, evo, t, hit) -> Image.Image:
+    """One panel rendered on its own image, so off-view content is clipped
+    at the panel boundary instead of bleeding into a neighbouring panel."""
+    img = Image.new("RGB", (SIZE, SIZE), GRASS)
+    d = ImageDraw.Draw(img)
+    draw_map(d, astate, 0, 0)
     for aid in sorted(astate.actors):
-        pose = evo.pose_at(aid, t)
-        draw_actor(d, astate, aid, pose, ox, hdr)
+        draw_actor(d, astate, aid, evo.pose_at(aid, t), 0, 0)
     if hit and t >= hit[0]:
         hx, hy, _ = evo.pose_at(hit[1], t)
-        px, py = w2p(hx, hy, ox, hdr)
+        px, py = w2p(hx, hy, 0, 0)
         d.ellipse([px - 30, py - 30, px + 30, py + 30], outline=(255, 60, 60), width=5)
+    return img
 
 
 def encode(tmp, out, fps):
@@ -166,8 +170,8 @@ def render_state(state, prm, outdir, fps):
     for k in range(int(t_end * fps) + 1):
         t = k / fps
         img = Image.new("RGB", (SIZE, hdr + SIZE), HEADER_BG)
+        img.paste(panel_image(astate, evo, t, hit), (0, hdr))
         d = ImageDraw.Draw(img)
-        draw_panel(d, astate, evo, t, hit, 0, hdr)
         d.text((12, 8), state.label, fill=(240, 240, 240), font=font(19, True))
         d.text((12, 36), f"nominal evolution, no intervention   [{mode}]",
                fill=(170, 170, 170), font=font(15))
@@ -225,9 +229,9 @@ def render_compare(state, prm, outdir, fps):
     for k in range(int(t_end * fps) + 1):
         t = k / fps
         img = Image.new("RGB", (width, hdr + SIZE), HEADER_BG)
+        img.paste(panel_image(astate, evo_l, t, hit_l), (0, hdr))
+        img.paste(panel_image(astate, evo_r, t, hit_r), (ox_r, hdr))
         d = ImageDraw.Draw(img)
-        draw_panel(d, astate, evo_l, t, hit_l, 0, hdr)
-        draw_panel(d, astate, evo_r, t, hit_r, ox_r, hdr)
         d.text((12, 8), f"{state.label}    [{mode}]    t = {t:5.2f} s",
                fill=(240, 240, 240), font=font(20, True))
         for ox, cap, r, hit, tag in (
