@@ -221,8 +221,19 @@ minimal; exact minimality would need a joint search — see Q4):
 
 ## 7. Demonstration
 
-`python3 v2/directives.py --demo` (also `--state FILE.yaml` for a single state)
-prints, per state: the abstract-state summary (lanes, routes, roles, assumed
+`python3 v2/directives.py --demo` evaluates the built-in demo states. A single input
+is given with `--state FILE.yaml [--time T] [--signals N=green,E=red,...]`, where
+FILE is either format, distinguished by schema:
+
+- **State file** (§1 schema: actors carry `x/y/heading/speed`) — evaluated as-is;
+  `--time` is rejected (a state has no clock).
+- **Scenario file** (v0/v1 schema: actors carry `start` + `maneuvers`) — passed
+  through `state_from_scenario(path, T)`: the editor's simulation is run headlessly
+  and sampled at clock `T` (default 0, wrapped mod the loop period) to yield
+  poses+speeds. Scenario files carry no signal phases, so phases come from
+  `--signals` or the family-consistent assumption (Q1), flagged as assumed.
+
+For either format the tool prints, per state: the abstract-state summary (lanes, routes, roles, assumed
 signals), each directive's `Eval` (value, witness, t_fail, explanation), and — where
 something is false — the intervention, its cost, and the re-evaluation showing all
 green. Demo states:
