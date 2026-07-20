@@ -1,0 +1,39 @@
+- timestamp: '2026-07-20T15:14:01'
+  tick: 0
+  sim_time: 0.0
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '4'
+    value: 6.1511146666666665
+    cost: 3.8488853333333335
+    why: retime 4 -> 6.15 m/s (arrive conflict at t=9.38)
+  cost: 3.8488853333333335
+- timestamp: '2026-07-20T15:14:03'
+  tick: 30
+  sim_time: 3.0
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '2'
+    value: 2.834347305389221
+    cost: 7.165652694610779
+    why: retime 2 -> 2.83 m/s (arrive conflict at t=2.09)
+  cost: 7.165652694610779
+- timestamp: '2026-07-20T15:14:03'
+  tick: 35
+  sim_time: 3.5
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '3'
+    value: 12.75
+    cost: 7.25
+    why: clear interference
+  cost: 7.25
+- timestamp: '2026-07-20T15:14:03'
+  tick: 52
+  sim_time: 5.2
+  kind: infeasible
+  reason: 'D1 unrepairable: no vehicle on a conflicting red approach can causally
+    reach ego''s window (the past is not available for editing)'

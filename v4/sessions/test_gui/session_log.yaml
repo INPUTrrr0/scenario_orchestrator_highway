@@ -1,0 +1,41 @@
+- timestamp: '2026-07-20T15:20:17'
+  tick: 0
+  sim_time: 0.0
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '4'
+    value: 6.1511146666666665
+    cost: 3.8488853333333335
+    why: retime 4 -> 6.15 m/s (arrive conflict at t=9.38)
+  cost: 3.8488853333333335
+- timestamp: '2026-07-20T15:20:18'
+  tick: 20
+  sim_time: 2.0
+  kind: perturbation
+  perturbation:
+    kind: set_maneuver
+    actor: '2'
+    leg: null
+    turn: left
+    speed: null
+- timestamp: '2026-07-20T15:20:19'
+  tick: 20
+  sim_time: 2.0
+  kind: perturbation
+  perturbation:
+    kind: add_actor
+    actor: null
+    leg: SE
+    turn: straight
+    speed: 10.0
+- timestamp: '2026-07-20T15:20:19'
+  tick: 20
+  sim_time: 2.0
+  kind: perturbation
+  perturbation:
+    kind: set_speed
+    actor: '2'
+    leg: null
+    turn: null
+    speed: 3.0

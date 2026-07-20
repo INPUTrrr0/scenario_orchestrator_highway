@@ -1,0 +1,42 @@
+meta:
+  base_scenario: scenario_v20.yaml
+  ego: '0'
+  signals:
+    N: green
+    S: green
+    E: red
+    W: red
+  dt_tick: 0.1
+  label: v20 red-light (interactive)
+versions:
+- version: 1
+  file: snapshot_v1.yaml
+  parent: null
+  created: '2026-07-20T15:20:31'
+  kind: start
+  tick: 0
+  sim_time: 0.0
+  delta: session start
+  verdict:
+    d1: false
+    d2: false
+    d3: true
+    hero: '4'
+    t_star: 15.0
+    ok: false
+- version: 2
+  file: snapshot_v2.yaml
+  parent: 1
+  created: '2026-07-20T15:20:32'
+  kind: proposal
+  tick: 0
+  sim_time: 0.0
+  delta: 'PROPOSAL: retime(4 -> 6.15 m/s)  cost 3.85   [retime 4 -> 6.15 m/s (arrive
+    conflict at t=9.38)]'
+  verdict:
+    d1: true
+    d2: true
+    d3: true
+    hero: '4'
+    t_star: 9.375
+    ok: true

@@ -1,0 +1,160 @@
+map:
+  lane_width: 3.5
+  arm_length: 60.0
+render:
+  pixels_per_meter: 6.0
+actors:
+- id: '0'
+  color:
+  - 90
+  - 190
+  - 110
+  length: 4.5
+  width: 2.0
+  start:
+    x: 1.75
+    y: -40.0
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 3.5
+    curve:
+      v0: 20.0
+      accel: 0.0
+- id: '1'
+  color:
+  - 210
+  - 70
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: -1.8333
+    y: -11.4166
+    heading: 270.0
+  maneuvers:
+  - type: go_straight
+    duration: 2.5
+    curve:
+      v0: 10.0
+      accel: 0.0
+- id: '2'
+  color:
+  - 60
+  - 120
+  - 210
+  length: 4.5
+  width: 2.0
+  start:
+    x: 7.6667
+    y: 1.75
+    heading: 180.0
+  maneuvers:
+  - type: go_straight
+    duration: 12.3485
+    curve:
+      v0: 2.8343
+      accel: 0.0
+- id: '3'
+  color:
+  - 200
+  - 160
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: 31.25
+    y: 1.8333
+    heading: 180.0
+  maneuvers:
+  - type: stop
+    duration: 0.5
+  - type: go_straight
+    duration: 2.0
+    curve:
+      v0: 20.0
+      accel: 0.0
+  - type: go_straight
+    duration: 1.0
+    curve:
+      v0: 10.0
+      accel: 0.0
+- id: '4'
+  color:
+  - 160
+  - 90
+  - 200
+  length: 4.5
+  width: 2.0
+  start:
+    x: -37.4634
+    y: -1.8333
+    heading: 0.0
+  maneuvers:
+  - type: go_straight
+    duration: 5.1286
+    curve:
+      v0: 6.1511
+      accel: 0.0
+- id: '5'
+  color:
+  - 80
+  - 200
+  - 200
+  length: 4.5
+  width: 2.0
+  start:
+    x: -53.0
+    y: 12.25
+    heading: -135.8
+  maneuvers:
+  - type: stop
+    duration: 3.5
+- id: '6'
+  color:
+  - 90
+  - 190
+  - 110
+  length: 4.5
+  width: 2.0
+  start:
+    x: -48.3333
+    y: 11.4167
+    heading: -132.4
+  maneuvers:
+  - type: stop
+    duration: 3.5
+- id: '7'
+  color:
+  - 210
+  - 70
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: -1.75
+    y: 34.0
+    heading: 270.0
+  maneuvers:
+  - type: go_straight
+    duration: 3.5
+    curve:
+      v0: 8.0
+      accel: 0.0
+- id: '9'
+  color:
+  - 200
+  - 160
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: 7.0903
+    y: -1.4767
+    heading: 0.0
+  maneuvers:
+  - type: go_straight
+    duration: 3.49
+    curve:
+      v0: 9.0276
+      accel: 0.0

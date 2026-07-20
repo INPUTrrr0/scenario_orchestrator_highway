@@ -1,0 +1,107 @@
+- timestamp: '2026-07-20T15:21:43'
+  tick: 0
+  sim_time: 0.0
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '4'
+    value: 6.1511146666666665
+    cost: 3.8488853333333335
+    why: retime 4 -> 6.15 m/s (arrive conflict at t=9.38)
+  cost: 3.8488853333333335
+- timestamp: '2026-07-20T15:21:43'
+  tick: 12
+  sim_time: 1.2
+  kind: perturbation
+  perturbation:
+    kind: add_actor
+    actor: null
+    leg: WS
+    turn: left
+    speed: 8.0
+- timestamp: '2026-07-20T15:21:43'
+  tick: 12
+  sim_time: 1.2
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '4'
+    value: 7.75
+    cost: 1.5988853333333335
+    why: clear interference
+  - kind: retime
+    actor: '7'
+    value: 8.25
+    cost: 0.25
+    why: clear interference
+  cost: 1.8488853333333335
+- timestamp: '2026-07-20T15:21:44'
+  tick: 30
+  sim_time: 3.0
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '2'
+    value: 2.834347305389221
+    cost: 7.165652694610779
+    why: retime 2 -> 2.83 m/s (arrive conflict at t=2.09)
+  cost: 7.165652694610779
+- timestamp: '2026-07-20T15:21:45'
+  tick: 35
+  sim_time: 3.5
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '3'
+    value: 12.75
+    cost: 7.25
+    why: clear interference
+  cost: 7.25
+- timestamp: '2026-07-20T15:21:45'
+  tick: 12
+  sim_time: 1.2
+  kind: perturbation
+  perturbation:
+    kind: set_speed
+    actor: '2'
+    leg: null
+    turn: null
+    speed: 2.5
+- timestamp: '2026-07-20T15:21:45'
+  tick: 12
+  sim_time: 1.2
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '4'
+    value: 7.25
+    cost: 1.0989000000000004
+    why: clear interference
+  cost: 1.0989000000000004
+- timestamp: '2026-07-20T15:21:46'
+  tick: 30
+  sim_time: 3.0
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '2'
+    value: 9.301413173652694
+    cost: 6.801413173652694
+    why: retime 2 -> 9.30 m/s (arrive conflict at t=2.09)
+  - kind: retime
+    actor: '9'
+    value: 2.75
+    cost: 6.2776
+    why: clear interference
+  cost: 13.079013173652694
+- timestamp: '2026-07-20T15:21:46'
+  tick: 35
+  sim_time: 3.5
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '3'
+    value: 13.0
+    cost: 7.0
+    why: clear interference
+  cost: 7.0
