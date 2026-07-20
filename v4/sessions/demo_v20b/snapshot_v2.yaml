@@ -13,11 +13,11 @@ actors:
   width: 2.0
   start:
     x: 1.75
-    y: -58.0
+    y: -50.8
     heading: 90.0
   maneuvers:
   - type: go_straight
-    duration: 3.0
+    duration: 1.8
     curve:
       v0: 6.0
       accel: 0.0
@@ -34,12 +34,12 @@ actors:
   length: 4.5
   width: 2.0
   start:
-    x: 19.1667
+    x: 7.1667
     y: 1.5834
     heading: 180.0
   maneuvers:
   - type: go_straight
-    duration: 1.3
+    duration: 0.1
     curve:
       v0: 10.0
       accel: 0.0
@@ -60,12 +60,12 @@ actors:
   length: 4.5
   width: 2.0
   start:
-    x: 37.6667
+    x: 25.6667
     y: 1.75
     heading: 180.0
   maneuvers:
   - type: go_straight
-    duration: 6.5
+    duration: 5.3
     curve:
       v0: 10.0
       accel: 0.0
@@ -77,12 +77,12 @@ actors:
   length: 4.5
   width: 2.0
   start:
-    x: 56.25
+    x: 44.25
     y: 1.8333
     heading: 180.0
   maneuvers:
   - type: go_straight
-    duration: 2.5
+    duration: 1.3
     curve:
       v0: 10.0
       accel: 0.0
@@ -106,15 +106,17 @@ actors:
   length: 4.5
   width: 2.0
   start:
-    x: -55.9167
+    x: -43.9167
     y: -1.8333
     heading: 0.0
   maneuvers:
   - type: go_straight
-    duration: 8.1286
+    duration: 3.8
     curve:
-      v0: 6.1511
+      v0: 10.0
       accel: 0.0
+  - type: stop
+    duration: 1.5
 - id: '5'
   color:
   - 80
@@ -128,7 +130,7 @@ actors:
     heading: -135.8
   maneuvers:
   - type: stop
-    duration: 6.5
+    duration: 5.3
 - id: '6'
   color:
   - 90
@@ -142,7 +144,7 @@ actors:
     heading: -132.4
   maneuvers:
   - type: stop
-    duration: 6.5
+    duration: 5.3
 - id: '7'
   color:
   - 210
@@ -152,11 +154,11 @@ actors:
   width: 2.0
   start:
     x: -1.75
-    y: 58.0
+    y: 48.4
     heading: 270.0
   maneuvers:
   - type: go_straight
-    duration: 6.5
+    duration: 5.3
     curve:
       v0: 8.0
       accel: 0.0
@@ -169,11 +171,11 @@ actors:
   width: 2.0
   start:
     x: 2.0
-    y: -31.9167
+    y: -17.5167
     heading: 90.0
   maneuvers:
   - type: go_straight
-    duration: 2.12
+    duration: 0.92
     curve:
       v0: 12.0
       accel: 0.0

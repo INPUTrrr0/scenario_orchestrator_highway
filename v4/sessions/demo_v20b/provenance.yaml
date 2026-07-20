@@ -7,43 +7,27 @@ meta:
     E: red
     W: red
   dt_tick: 0.1
-  label: "v20 red-light \u2014 branching demo"
+  label: "v20 red-light \u2014 branching demo (script-grounded)"
 versions:
 - version: 1
   file: snapshot_v1.yaml
   parent: null
-  created: '2026-07-20T15:21:43'
+  created: '2026-07-20T15:47:34'
   kind: start
   tick: 0
   sim_time: 0.0
   delta: session start
   verdict:
-    d1: false
-    d2: false
-    d3: true
-    hero: '4'
-    t_star: 15.0
-    ok: false
-- version: 2
-  file: snapshot_v2.yaml
-  parent: 1
-  created: '2026-07-20T15:21:43'
-  kind: intervention
-  tick: 0
-  sim_time: 0.0
-  delta: retime(4 -> 6.15 m/s)  cost 3.85   [retime 4 -> 6.15 m/s (arrive conflict
-    at t=9.38)]
-  verdict:
     d1: true
     d2: true
     d3: true
-    hero: '4'
-    t_star: 9.375
+    hero: '3'
+    t_star: 4.933
     ok: true
-- version: 3
-  file: snapshot_v3.yaml
-  parent: 2
-  created: '2026-07-20T15:21:43'
+- version: 2
+  file: snapshot_v2.yaml
+  parent: 1
+  created: '2026-07-20T15:47:35'
   kind: checkpoint
   tick: 12
   sim_time: 1.2
@@ -52,13 +36,13 @@ versions:
     d1: true
     d2: true
     d3: true
-    hero: '4'
-    t_star: 8.175
+    hero: '3'
+    t_star: 3.733
     ok: true
-- version: 4
-  file: snapshot_v4.yaml
-  parent: 3
-  created: '2026-07-20T15:21:43'
+- version: 3
+  file: snapshot_v3.yaml
+  parent: 2
+  created: '2026-07-20T15:47:36'
   kind: perturbation
   tick: 12
   sim_time: 1.2
@@ -67,60 +51,43 @@ versions:
     d1: true
     d2: true
     d3: false
-    hero: '10'
-    t_star: 7.744
+    hero: '3'
+    t_star: 3.733
     ok: false
-- version: 5
-  file: snapshot_v5.yaml
-  parent: 4
-  created: '2026-07-20T15:21:43'
+- version: 4
+  file: snapshot_v4.yaml
+  parent: 3
+  created: '2026-07-20T15:47:37'
   kind: intervention
   tick: 12
   sim_time: 1.2
-  delta: retime(4 -> 7.75 m/s)  cost 1.60   [clear interference]; retime(7 -> 8.25
-    m/s)  cost 0.25   [clear interference]
+  delta: retime(10 -> 4.00 m/s)  cost 4.00   [clear interferer 10]
   verdict:
     d1: true
     d2: true
     d3: true
-    hero: '10'
-    t_star: 7.744
+    hero: '3'
+    t_star: 3.733
+    ok: true
+- version: 5
+  file: snapshot_v5.yaml
+  parent: 4
+  created: '2026-07-20T15:47:44'
+  kind: collision
+  tick: 47
+  sim_time: 4.7
+  delta: 'collision realized: ego x 3 @ 4.70s'
+  verdict:
+    d1: true
+    d2: true
+    d3: true
+    hero: '3'
+    t_star: 0.233
     ok: true
 - version: 6
   file: snapshot_v6.yaml
-  parent: 5
-  created: '2026-07-20T15:21:44'
-  kind: intervention
-  tick: 30
-  sim_time: 3.0
-  delta: retime(2 -> 2.83 m/s)  cost 7.17   [retime 2 -> 2.83 m/s (arrive conflict
-    at t=2.09)]
-  verdict:
-    d1: true
-    d2: true
-    d3: true
-    hero: '2'
-    t_star: 2.087
-    ok: true
-- version: 7
-  file: snapshot_v7.yaml
-  parent: 6
-  created: '2026-07-20T15:21:45'
-  kind: intervention
-  tick: 35
-  sim_time: 3.5
-  delta: retime(3 -> 12.75 m/s)  cost 7.25   [clear interference]
-  verdict:
-    d1: true
-    d2: true
-    d3: true
-    hero: '2'
-    t_star: 1.587
-    ok: true
-- version: 8
-  file: snapshot_v8.yaml
-  parent: 3
-  created: '2026-07-20T15:21:45'
+  parent: 2
+  created: '2026-07-20T15:47:44'
   kind: perturbation
   tick: 12
   sim_time: 1.2
@@ -129,52 +96,36 @@ versions:
     d1: true
     d2: true
     d3: false
-    hero: '2'
-    t_star: 8.758
+    hero: '3'
+    t_star: 3.733
     ok: false
-- version: 9
-  file: snapshot_v9.yaml
-  parent: 8
-  created: '2026-07-20T15:21:45'
+- version: 7
+  file: snapshot_v7.yaml
+  parent: 6
+  created: '2026-07-20T15:47:45'
   kind: intervention
   tick: 12
   sim_time: 1.2
-  delta: retime(4 -> 7.25 m/s)  cost 1.10   [clear interference]
+  delta: retime(2 -> 20.00 m/s)  cost 17.50   [clear interferer 2]
   verdict:
     d1: true
     d2: true
     d3: true
-    hero: '2'
-    t_star: 8.758
+    hero: '3'
+    t_star: 3.733
     ok: true
-- version: 10
-  file: snapshot_v10.yaml
-  parent: 9
-  created: '2026-07-20T15:21:46'
-  kind: intervention
-  tick: 30
-  sim_time: 3.0
-  delta: retime(2 -> 9.30 m/s)  cost 6.80   [retime 2 -> 9.30 m/s (arrive conflict
-    at t=2.09)]; retime(9 -> 2.75 m/s)  cost 6.28   [clear interference]
+- version: 8
+  file: snapshot_v8.yaml
+  parent: 7
+  created: '2026-07-20T15:47:47'
+  kind: collision
+  tick: 47
+  sim_time: 4.7
+  delta: 'collision realized: ego x 3 @ 4.70s'
   verdict:
     d1: true
     d2: true
     d3: true
-    hero: '2'
-    t_star: 2.087
-    ok: true
-- version: 11
-  file: snapshot_v11.yaml
-  parent: 10
-  created: '2026-07-20T15:21:46'
-  kind: intervention
-  tick: 35
-  sim_time: 3.5
-  delta: retime(3 -> 13.00 m/s)  cost 7.00   [clear interference]
-  verdict:
-    d1: true
-    d2: true
-    d3: true
-    hero: '2'
-    t_star: 1.587
+    hero: '3'
+    t_star: 0.233
     ok: true

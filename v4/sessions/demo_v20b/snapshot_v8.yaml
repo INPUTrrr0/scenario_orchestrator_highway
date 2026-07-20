@@ -65,9 +65,9 @@ actors:
     heading: 180.0
   maneuvers:
   - type: go_straight
-    duration: 21.2
+    duration: 2.65
     curve:
-      v0: 2.5
+      v0: 20.0
       accel: 0.0
 - id: '3'
   color:
@@ -106,15 +106,17 @@ actors:
   length: 4.5
   width: 2.0
   start:
-    x: -48.5354
+    x: -43.9167
     y: -1.8333
     heading: 0.0
   maneuvers:
   - type: go_straight
-    duration: 6.9286
+    duration: 3.8
     curve:
-      v0: 6.1511
+      v0: 10.0
       accel: 0.0
+  - type: stop
+    duration: 1.5
 - id: '5'
   color:
   - 80

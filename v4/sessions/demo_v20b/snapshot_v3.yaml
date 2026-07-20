@@ -106,15 +106,17 @@ actors:
   length: 4.5
   width: 2.0
   start:
-    x: -48.5354
+    x: -43.9167
     y: -1.8333
     heading: 0.0
   maneuvers:
   - type: go_straight
-    duration: 6.9286
+    duration: 3.8
     curve:
-      v0: 6.1511
+      v0: 10.0
       accel: 0.0
+  - type: stop
+    duration: 1.5
 - id: '5'
   color:
   - 80
@@ -185,4 +187,30 @@ actors:
     duration: 3.5
     curve:
       v0: 9.0276
+      accel: 0.0
+- id: '10'
+  color:
+  - 210
+  - 70
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: -58.0
+    y: -1.75
+    heading: 0.0
+  maneuvers:
+  - type: go_straight
+    duration: 6.8125
+    curve:
+      v0: 8.0
+      accel: 0.0
+  - type: turn_left
+    duration: 1.1781
+    radius: 6.0
+    angle: 90.0
+  - type: go_straight
+    duration: 8.25
+    curve:
+      v0: 8.0
       accel: 0.0

@@ -105,3 +105,55 @@
     cost: 7.0
     why: clear interference
   cost: 7.0
+- timestamp: '2026-07-20T15:47:36'
+  tick: 12
+  sim_time: 1.2
+  kind: perturbation
+  perturbation:
+    kind: add_actor
+    actor: null
+    leg: WS
+    turn: left
+    speed: 8.0
+- timestamp: '2026-07-20T15:47:37'
+  tick: 12
+  sim_time: 1.2
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '10'
+    value: 4.0
+    cost: 4.0
+    why: clear interferer 10
+  cost: 4.0
+- timestamp: '2026-07-20T15:47:44'
+  tick: 47
+  sim_time: 4.7
+  kind: collision
+  actor: '3'
+- timestamp: '2026-07-20T15:47:44'
+  tick: 12
+  sim_time: 1.2
+  kind: perturbation
+  perturbation:
+    kind: set_speed
+    actor: '2'
+    leg: null
+    turn: null
+    speed: 2.5
+- timestamp: '2026-07-20T15:47:45'
+  tick: 12
+  sim_time: 1.2
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '2'
+    value: 20.0
+    cost: 17.5
+    why: clear interferer 2
+  cost: 17.5
+- timestamp: '2026-07-20T15:47:47'
+  tick: 47
+  sim_time: 4.7
+  kind: collision
+  actor: '3'
