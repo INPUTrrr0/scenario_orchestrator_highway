@@ -46,18 +46,40 @@ changes the future — a perturbation or an intervention — is a **maneuver-scr
 so the whole session stays expressible in one language and reuses the v0/v2
 `Scenario`, `Actor`, `Maneuver`, and `Persistence` code directly.
 
-The bridge to the directive layer is v2's existing adapter, run every tick:
+**P1a — the family is evaluated *along the actual script*, not v2's
+constant-velocity projection** (`v4/directives_script.py`). v2's directive layer
+predicts by taking the instantaneous state and rolling everyone forward at constant
+velocity along recognized routes; at t=0 of v20 — ego crawling at 6 m/s far from the
+box — that projection finds no collision and reads D1/D2 false, even though the
+scripted trajectories (what the animation plays, and what actually happens) *do*
+realize the red-light collision at t≈4.9 s. So v4 grounds every predicate on the
+simulated trajectories instead:
 
 ```
-state  = <sample poses+speeds from the live Scenario at clock T>   # like state_from_scenario
-astate = recognize(state, prm)                                     # v2
-result = evaluate_family(astate, prm)                              # v2  (D1,D2,D3, hero, t*)
-rr     = repair(astate, prm)                                       # v2  minimal causal repair
+w      = rebase_scenario(sc, T)          # freeze the past; now = frame 0
+verdict = ds.evaluate(w, ego, signals, prm)   # D1/D2/D3 by sampling the script
+rr      = ds.repair(w, ego, signals, prm)     # minimal causal repair (below)
 ```
 
-`repair` returns v2 `Intervention(kind, actor, value, why, cost)` in state/route terms
-(`retime` → target speed; `reroute` → route turn). §4 translates those back into
+`ds.evaluate` computes `collide` by a dense body sweep over the scripted
+trajectories, the conflict point and the ego's occupancy window by sampling, D2
+reachability from each scripted instant, and D3 interference on the script. `ds.repair`
+returns `Intervention(kind, actor, value, cost, why)` in state/route terms
+(`retime` → target speed; `reroute` → route turn); §4 translates those back into
 maneuver-script edits, closing the loop in the one representation.
+
+**Fidelity of the script-grounded repair.** Retiming a candidate to speed `v'` makes
+*that actor* constant-speed by construction, so its arrival at the conflict point is
+exactly `d/v'` — the same linear solve `v' = d/t_mid` as v2, where `t_mid` is the
+midpoint of the ego's occupancy window, now read off the ego's *scripted* trajectory
+(exact to the sim step) rather than a constant-velocity closed form. Each per-directive
+solve is verified by re-simulating the trial and re-evaluating. The only approximation
+is v2's pre-existing *greedy* directive ordering (fix D1, then D2, then D3, with a joint
+re-check) — unchanged here.
+
+A **realized-collision terminal** closes a rollout when the ego actually collides with
+a red-runner (goal achieved) — a success node (`kind: collision`), distinct from
+`infeasible` (which means a broken family that cannot be causally repaired).
 
 ## 2. The closed-loop kernel
 
@@ -342,9 +364,10 @@ recover, all captured in the tree.
 ```
 v4/
   DESIGN.md               # this document
-  orchestrator.py         # headless closed-loop kernel: tick loop, sample→recognize→repair,
-                          #   maneuver-edit translation, snapshot I/O. Imports v2 scenario_editor
-                          #   + directives + a retargeted Persistence (§6). CLI: run a scripted session.
+  orchestrator.py         # headless closed-loop kernel: tick loop, decision-point I/O,
+                          #   retargeted Persistence (§6). CLI: run a scripted session.
+  directives_script.py    # script-grounded D1/D2/D3 + minimal causal repair (P1a)
+  maneuvers.py            # shared maneuver-script surgery: rebase, retime, reroute, perturbations
   session_editor.py       # interactive pygame front end (§7); kernel import-safe, display optional
   build_tree.py           # session folder → snapshot_v{N}.mp4 (render_demo pipeline) + session.html
   sessions/

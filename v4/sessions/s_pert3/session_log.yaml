@@ -1,0 +1,36 @@
+- timestamp: '2026-07-20T15:41:52'
+  tick: 15
+  sim_time: 1.5
+  kind: perturbation
+  perturbation:
+    kind: add_actor
+    actor: null
+    leg: WS
+    turn: left
+    speed: 8.0
+- timestamp: '2026-07-20T15:41:53'
+  tick: 15
+  sim_time: 1.5
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '10'
+    value: 4.0
+    cost: 4.0
+    why: clear interferer 10
+  cost: 4.0
+- timestamp: '2026-07-20T15:41:59'
+  tick: 40
+  sim_time: 4.0
+  kind: perturbation
+  perturbation:
+    kind: set_speed
+    actor: '9'
+    leg: null
+    turn: null
+    speed: 3.0
+- timestamp: '2026-07-20T15:42:01'
+  tick: 47
+  sim_time: 4.7
+  kind: collision
+  actor: '3'

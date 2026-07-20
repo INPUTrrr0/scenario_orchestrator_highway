@@ -1,113 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-v4/build_tree.py — turn a session folder into a colored, playable game tree.
-
-For each snapshot it renders the *forward realization at that decision point* (the
-re-based maneuver-script scenario rolled forward for a fixed horizon) to a looping
-`snapshot_v{N}.mp4` via the render_demo pipeline, then writes `session.html`: the
-tidy upside-down provenance tree of `v0/outputs/scenario_tree.html`, extended with
-
-  * node/edge coloring by decision kind (amber = user perturbation,
-    cyan = orchestrator intervention, gold = checkpoint, violet = proposal,
-    red = infeasible, slate = start),
-  * edge labels annotating the elapsed sim time of the collapsed NO-OP run,
-  * node labels with kind, clock, the one-line delta, and a D1/D2/D3 badge,
-  * a legend, with the provenance embedded so it opens directly (no fetch).
-
-Usage:  python3 build_tree.py sessions/<session_id> [--fps 15] [--horizon 6]
-"""
-from __future__ import annotations
-
-import argparse
-import json
-import os
-import sys
-import tempfile
-
-import yaml
-from PIL import Image, ImageDraw
-
-HERE = os.path.dirname(os.path.abspath(__file__))
-V2 = os.path.join(HERE, "..", "v2")
-for p in (V2, HERE):
-    if p not in sys.path:
-        sys.path.insert(0, p)
-
-import scenario_editor as se          # noqa: E402
-import render_demo as rd              # noqa: E402  (draw_map/draw_actor/w2p/encode)
-
-KIND_COLOR = {
-    "start": "#8a94a6", "intervention": "#38b2c6", "perturbation": "#e6a23c",
-    "checkpoint": "#d4af37", "proposal": "#a06cd5", "infeasible": "#e05252",
-    "collision": "#58c26a",
-}
-
-
-# --------------------------------------------------------------------------- #
-# Rendering: a snapshot's forward realization -> looping mp4
-# --------------------------------------------------------------------------- #
-class _Shim:
-    pass
-
-
-def _shim_astate(sc: se.Scenario, signals: dict):
-    """Minimal object exposing the attributes render_demo's draw_* touch."""
-    a = _Shim()
-    a.map = _Shim()
-    a.map.lane_width = sc.map.lane_width
-    a.signals = dict(signals or {})
-    a.actors = {}
-    for act in sc.actors:
-        o = _Shim()
-        o.length, o.width, o.id = act.length, act.width, act.id
-        a.actors[act.id] = o
-    return a
-
-
-def render_snapshot(sc_path: str, out_mp4: str, signals: dict, ego: str,
-                    label: str, fps: int, horizon: float) -> None:
-    sc = se.load_scenario(sc_path)
-    sc.simulate()
-    astate = _shim_astate(sc, signals)
-    # normalize the palette to the ego-green convention
-    rd.COLORS[ego] = (90, 190, 110)
-    t_end = min(horizon, max(0.5, sc.period))
-    n = int(t_end * fps) + 1
-    hdr = 40
-    tmp = tempfile.mkdtemp(prefix="v4frames_")
-    for k in range(n):
-        t = k / fps
-        img = Image.new("RGB", (rd.SIZE, hdr + rd.SIZE), rd.HEADER_BG)
-        panel = Image.new("RGB", (rd.SIZE, rd.SIZE), rd.GRASS)
-        pd = ImageDraw.Draw(panel)
-        rd.draw_map(pd, astate, 0, 0)
-        ki = int(round(t / se.DT))
-        for act in sc.actors:
-            kk = max(0, min(ki, len(act.traj) - 1))
-            rd.draw_actor(pd, astate, act.id, act.traj[kk], 0, 0)
-        img.paste(panel, (0, hdr))
-        d = ImageDraw.Draw(img)
-        d.text((10, 8), label, fill=(235, 235, 235), font=rd.font(17, True))
-        d.text((rd.SIZE - 120, 12), f"t={t:4.1f}s", fill=(170, 170, 170),
-               font=rd.font(14))
-        img.save(os.path.join(tmp, f"{k:04d}.png"))
-    rd.encode(tmp, out_mp4, fps)
-
-
-# --------------------------------------------------------------------------- #
-# HTML game tree
-# --------------------------------------------------------------------------- #
-def build_html(prov: dict, out_html: str) -> None:
-    data = json.dumps({"meta": prov.get("meta", {}),
-                       "versions": prov.get("versions", [])})
-    colors = json.dumps(KIND_COLOR)
-    html = _TEMPLATE.replace("__DATA__", data).replace("__COLORS__", colors)
-    with open(out_html, "w") as f:
-        f.write(html)
-
-
-_TEMPLATE = r"""<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8">
 <title>Scenario Rollout — Game Tree</title>
 <style>
@@ -147,7 +38,7 @@ _TEMPLATE = r"""<!DOCTYPE html>
 <div id="viewport"><div id="canvas"><svg id="edges" xmlns="http://www.w3.org/2000/svg"></svg></div></div>
 <script>
 "use strict";
-const DATA = __DATA__, KIND_COLOR = __COLORS__;
+const DATA = {"meta": {"base_scenario": "scenario_v20.yaml", "ego": "0", "signals": {"N": "green", "S": "green", "E": "red", "W": "red"}, "dt_tick": 0.1, "label": "v20 red-light \u2014 script-grounded closed loop"}, "versions": [{"version": 1, "file": "snapshot_v1.yaml", "parent": null, "created": "2026-07-20T15:42:59", "kind": "start", "tick": 0, "sim_time": 0.0, "delta": "session start", "verdict": {"d1": true, "d2": true, "d3": true, "hero": "3", "t_star": 4.933, "ok": true}}, {"version": 2, "file": "snapshot_v2.yaml", "parent": 1, "created": "2026-07-20T15:43:00", "kind": "checkpoint", "tick": 12, "sim_time": 1.2, "delta": "explore point", "verdict": {"d1": true, "d2": true, "d3": true, "hero": "3", "t_star": 3.733, "ok": true}}, {"version": 3, "file": "snapshot_v3.yaml", "parent": 2, "created": "2026-07-20T15:43:00", "kind": "perturbation", "tick": 12, "sim_time": 1.2, "delta": "add actor on WS (left, 8 m/s)", "verdict": {"d1": true, "d2": true, "d3": false, "hero": "3", "t_star": 3.733, "ok": false}}, {"version": 4, "file": "snapshot_v4.yaml", "parent": 3, "created": "2026-07-20T15:43:01", "kind": "intervention", "tick": 12, "sim_time": 1.2, "delta": "retime(10 -> 4.00 m/s)  cost 4.00   [clear interferer 10]", "verdict": {"d1": true, "d2": true, "d3": true, "hero": "3", "t_star": 3.733, "ok": true}}, {"version": 5, "file": "snapshot_v5.yaml", "parent": 4, "created": "2026-07-20T15:43:09", "kind": "collision", "tick": 47, "sim_time": 4.7, "delta": "collision realized: ego x 3 @ 4.70s", "verdict": {"d1": true, "d2": true, "d3": true, "hero": "3", "t_star": 0.233, "ok": true}}, {"version": 6, "file": "snapshot_v6.yaml", "parent": 2, "created": "2026-07-20T15:43:09", "kind": "perturbation", "tick": 12, "sim_time": 1.2, "delta": "set actor 2 route -> left", "verdict": {"d1": true, "d2": true, "d3": true, "hero": "3", "t_star": 3.733, "ok": true}}, {"version": 7, "file": "snapshot_v7.yaml", "parent": 6, "created": "2026-07-20T15:43:12", "kind": "collision", "tick": 47, "sim_time": 4.7, "delta": "collision realized: ego x 3 @ 4.70s", "verdict": {"d1": true, "d2": true, "d3": true, "hero": "3", "t_star": 0.233, "ok": true}}]}, KIND_COLOR = {"start": "#8a94a6", "intervention": "#38b2c6", "perturbation": "#e6a23c", "checkpoint": "#d4af37", "proposal": "#a06cd5", "infeasible": "#e05252", "collision": "#58c26a"};
 const NODE_W=230, NODE_H_EST=200, H_GAP=30, V_GAP=78, PAD=32;
 document.documentElement.style.setProperty("--node-w", NODE_W+"px");
 const canvas=document.getElementById("canvas"), edgesSvg=document.getElementById("edges");
@@ -238,37 +129,3 @@ layout();
 canvas.querySelectorAll("video").forEach(v=>v.addEventListener("loadedmetadata",()=>layout(),{once:true}));
 setTimeout(layout,800);
 </script></body></html>
-"""
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("session_dir")
-    ap.add_argument("--fps", type=int, default=15)
-    ap.add_argument("--horizon", type=float, default=6.0)
-    ap.add_argument("--no-render", action="store_true",
-                    help="rebuild HTML only, skip mp4 rendering")
-    args = ap.parse_args()
-
-    sdir = args.session_dir if os.path.isabs(args.session_dir) \
-        else os.path.join(HERE, args.session_dir)
-    prov = yaml.safe_load(open(os.path.join(sdir, "provenance.yaml")))
-    meta = prov.get("meta", {})
-    signals = meta.get("signals", {})
-    ego = str(meta.get("ego", "0"))
-
-    if not args.no_render:
-        for v in prov["versions"]:
-            sc_path = os.path.join(sdir, v["file"])
-            out = os.path.join(sdir, v["file"].replace(".yaml", ".mp4"))
-            lbl = f"v{v['version']} · {v['kind']}"
-            render_snapshot(sc_path, out, signals, ego, lbl, args.fps, args.horizon)
-            print(f"rendered {os.path.basename(out)}")
-
-    out_html = os.path.join(sdir, "session.html")
-    build_html(prov, out_html)
-    print(f"tree: {out_html}")
-
-
-if __name__ == "__main__":
-    main()

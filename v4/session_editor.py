@@ -59,7 +59,8 @@ TXT = (226, 232, 240)
 MUTED = (138, 148, 166)
 KIND_COLOR = {"start": (138, 148, 166), "intervention": (56, 178, 198),
               "perturbation": (230, 162, 60), "checkpoint": (212, 175, 55),
-              "proposal": (160, 108, 213), "infeasible": (224, 82, 82)}
+              "proposal": (160, 108, 213), "infeasible": (224, 82, 82),
+              "collision": (88, 194, 106)}
 LEGS = ["SE", "EN", "WS", "NW"]
 TURNS = ["straight", "left", "right"]
 

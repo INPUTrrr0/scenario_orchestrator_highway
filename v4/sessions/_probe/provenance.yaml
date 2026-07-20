@@ -1,0 +1,26 @@
+meta:
+  base_scenario: scenario_v20.yaml
+  ego: '0'
+  signals:
+    N: green
+    S: green
+    E: red
+    W: red
+  dt_tick: 0.1
+  label: probe
+versions:
+- version: 1
+  file: snapshot_v1.yaml
+  parent: null
+  created: '2026-07-20T15:26:56'
+  kind: start
+  tick: 0
+  sim_time: 0.0
+  delta: session start
+  verdict:
+    d1: false
+    d2: false
+    d3: true
+    hero: '4'
+    t_star: 15.0
+    ok: false
