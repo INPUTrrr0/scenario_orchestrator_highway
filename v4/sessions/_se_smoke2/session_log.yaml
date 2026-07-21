@@ -1,0 +1,21 @@
+- timestamp: '2026-07-21T08:02:29'
+  tick: 0
+  sim_time: 0.0
+  kind: perturbation
+  note: '1.go_straight.intercept: 10 -> 3'
+- timestamp: '2026-07-21T08:02:32'
+  tick: 47
+  sim_time: 4.7
+  kind: collision
+  actor: '3'
+- timestamp: '2026-07-21T08:02:34'
+  tick: 17
+  sim_time: 1.7
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '3'
+    value: 11.007371007370994
+    cost: 1.0073710073709936
+    why: restore D2 reachability
+  cost: 1.0073710073709936

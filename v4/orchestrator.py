@@ -258,13 +258,49 @@ class Orchestrator:
             return None
         return self.save_proposal(rr, self.build_trial(rr))
 
-    def checkpoint(self, note: str = "") -> int:
+    def checkpoint(self, note: str = "", scenario: Optional[se.Scenario] = None) -> int:
+        if scenario is not None:
+            self.sc = scenario
+            self.sc.simulate()
         self._rebase_here()
         v = self._evaluate()
         self.parent = self.store.save_snapshot(
             self.sc, "checkpoint", self.parent, self.tick, self.T,
             note or f"checkpoint @ {self.T:.2f}s", _verdict_dict(v))
         return self.parent
+
+    def commit_perturbation(self, scenario: se.Scenario, summary: str,
+                            payload: Optional[dict] = None) -> int:
+        """Adopt an edited realization as a perturbation node (child of the
+        current node). The edited scenario is the state at the current node's
+        time, so this is authoring the future from here — a perturbation."""
+        self.sc = scenario
+        self.sc.simulate()
+        self.standing = {}
+        self.infeasible = False
+        self.done = False
+        v = self._evaluate()
+        self.store.log(self.tick, self.T, "perturbation",
+                       payload or {"note": summary})
+        self.parent = self.store.save_snapshot(
+            self.sc, "perturbation", self.parent, self.tick, self.T,
+            summary, _verdict_dict(v))
+        return self.parent
+
+    def advance_to_decision(self, max_ticks: int = 400) -> Optional[int]:
+        """Run the closed loop forward until the next decision-point node is
+        created (orchestrator intervention, or a collision/infeasible terminal),
+        or the budget runs out. Returns the new node version, else None."""
+        if self.done:
+            return None
+        n0 = len(self.store.versions)
+        for _ in range(max_ticks):
+            self.step()
+            if len(self.store.versions) > n0:
+                return self.store.versions[-1]
+            if self.done:
+                return None
+        return None
 
     def load_checkpoint(self, version: int) -> None:
         rec = next(v for v in self.store.versions if v["version"] == version)
