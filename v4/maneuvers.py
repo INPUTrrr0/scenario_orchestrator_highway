@@ -35,6 +35,8 @@ LEG_SPAWN = {  # inbound leg -> (x, y, heading) at the arm end (right-hand lane)
     "WS": lambda lw, arm: (-arm + 2.0, -lw / 2, 0.0),
     "NW": lambda lw, arm: (-lw / 2, arm - 2.0, 270.0),
 }
+LEG_HEADING = {"SE": 90.0, "EN": 180.0, "WS": 0.0, "NW": 270.0}
+LEG_LANE = {"SE": ("x", +1), "EN": ("y", +1), "WS": ("y", -1), "NW": ("x", -1)}
 PALETTE = [(90, 190, 110), (210, 70, 60), (60, 120, 210), (200, 160, 60),
            (160, 90, 200), (80, 200, 200), (150, 185, 95), (225, 105, 165)]
 
@@ -187,10 +189,16 @@ class Perturbation:
     leg: Optional[str] = None
     turn: Optional[str] = None
     speed: Optional[float] = None
+    x: Optional[float] = None        # explicit spawn pose (add_actor); else the arm end
+    y: Optional[float] = None
+    heading: Optional[float] = None
+    note: str = ""                   # optional label for the tree/delta
 
     def summary(self) -> str:
         if self.kind == "add_actor":
-            return f"add actor on {self.leg} ({self.turn}, {self.speed:g} m/s)"
+            where = self.note or (f"{self.leg} @ ({self.x:g},{self.y:g})"
+                                  if self.x is not None else self.leg)
+            return f"add actor on {where} ({self.turn}, {self.speed:g} m/s)"
         if self.kind == "set_maneuver":
             return f"set actor {self.actor} route -> {self.turn}"
         if self.kind == "set_speed":
@@ -207,7 +215,11 @@ def apply_perturbation(sc: se.Scenario, p: Perturbation) -> se.Scenario:
     by_id = {a.id: a for a in actors}
     if p.kind == "add_actor":
         nid = str(max([int(a.id) for a in actors if a.id.isdigit()] + [-1]) + 1)
-        x, y, hdg = LEG_SPAWN[p.leg](lw, arm)
+        if p.x is not None:
+            x, y = p.x, p.y
+            hdg = p.heading if p.heading is not None else LEG_HEADING[p.leg]
+        else:
+            x, y, hdg = LEG_SPAWN[p.leg](lw, arm)
         color = PALETTE[len(actors) % len(PALETTE)]
         man = build_route_maneuvers(x, y, hdg, p.speed or 10.0,
                                     p.turn or "straight", lw, arm)
