@@ -1,0 +1,118 @@
+meta:
+  base_scenario: scenario_v20.yaml
+  ego: '0'
+  signals:
+    N: green
+    S: green
+    E: red
+    W: red
+  dt_tick: 0.1
+  label: v20 red-light (session)
+versions:
+- version: 1
+  file: snapshot_v1.yaml
+  parent: null
+  created: '2026-07-21T08:05:30'
+  kind: start
+  tick: 0
+  sim_time: 0.0
+  delta: session start
+  verdict:
+    d1: true
+    d2: true
+    d3: true
+    hero: '3'
+    t_star: 4.933
+    ok: true
+- version: 2
+  file: snapshot_v2.yaml
+  parent: 1
+  created: '2026-07-21T08:07:23'
+  kind: perturbation
+  tick: 0
+  sim_time: 0.0
+  delta: '4.go_straight.intercept: 10 -> 12; 4.go_straight.duration: 5 -> 6.5'
+  verdict:
+    d1: true
+    d2: true
+    d3: false
+    hero: '4'
+    t_star: 4.75
+    ok: false
+- version: 3
+  file: snapshot_v3.yaml
+  parent: 2
+  created: '2026-07-21T08:07:27'
+  kind: intervention
+  tick: 0
+  sim_time: 0.0
+  delta: retime(3 -> 6.00 m/s)  cost 4.00   [clear interferer 3]
+  verdict:
+    d1: true
+    d2: true
+    d3: true
+    hero: '4'
+    t_star: 4.75
+    ok: true
+- version: 4
+  file: snapshot_v4.yaml
+  parent: 3
+  created: '2026-07-21T08:09:28'
+  kind: perturbation
+  tick: 1
+  sim_time: 0.1
+  delta: '4.turn_right.radius: 5 -> 7; 4.turn_right.radius: 7 -> 6; added maneuver
+    to actor 4'
+  verdict:
+    d1: false
+    d2: true
+    d3: true
+    hero: '2'
+    t_star: null
+    ok: false
+- version: 5
+  file: snapshot_v5.yaml
+  parent: 4
+  created: '2026-07-21T08:09:30'
+  kind: intervention
+  tick: 1
+  sim_time: 0.1
+  delta: retime(2 -> 7.23 m/s)  cost 2.77   [retime 2 -> 7.23 m/s]
+  verdict:
+    d1: true
+    d2: true
+    d3: true
+    hero: '2'
+    t_star: 4.833
+    ok: true
+- version: 6
+  file: snapshot_v6.yaml
+  parent: 5
+  created: '2026-07-21T08:11:37'
+  kind: perturbation
+  tick: 2
+  sim_time: 0.2
+  delta: '0.go_straight.duration: 2.9 -> 8; 0.go_straight.duration: 8 -> 2.9; 0.go_straight.duration:
+    3.5 -> 8'
+  verdict:
+    d1: false
+    d2: true
+    d3: true
+    hero: '1'
+    t_star: null
+    ok: false
+- version: 7
+  file: snapshot_v7.yaml
+  parent: 6
+  created: '2026-07-21T08:11:40'
+  kind: infeasible
+  tick: 2
+  sim_time: 0.2
+  delta: unresolved after max repair passes
+  verdict:
+    d1: false
+    d2: false
+    d3: true
+    hero: '3'
+    t_star: null
+    ok: false

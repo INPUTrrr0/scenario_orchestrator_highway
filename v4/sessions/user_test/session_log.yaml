@@ -1,0 +1,44 @@
+- timestamp: '2026-07-21T08:07:23'
+  tick: 0
+  sim_time: 0.0
+  kind: perturbation
+  note: '4.go_straight.intercept: 10 -> 12; 4.go_straight.duration: 5 -> 6.5'
+- timestamp: '2026-07-21T08:07:27'
+  tick: 0
+  sim_time: 0.0
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '3'
+    value: 6.0
+    cost: 4.0
+    why: clear interferer 3
+  cost: 4.0
+- timestamp: '2026-07-21T08:09:28'
+  tick: 1
+  sim_time: 0.1
+  kind: perturbation
+  note: '4.turn_right.radius: 5 -> 7; 4.turn_right.radius: 7 -> 6; added maneuver
+    to actor 4'
+- timestamp: '2026-07-21T08:09:30'
+  tick: 1
+  sim_time: 0.1
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '2'
+    value: 7.228915662650603
+    cost: 2.7710843373493974
+    why: retime 2 -> 7.23 m/s
+  cost: 2.7710843373493974
+- timestamp: '2026-07-21T08:11:37'
+  tick: 2
+  sim_time: 0.2
+  kind: perturbation
+  note: '0.go_straight.duration: 2.9 -> 8; 0.go_straight.duration: 8 -> 2.9; 0.go_straight.duration:
+    3.5 -> 8'
+- timestamp: '2026-07-21T08:11:40'
+  tick: 2
+  sim_time: 0.2
+  kind: infeasible
+  reason: unresolved after max repair passes
