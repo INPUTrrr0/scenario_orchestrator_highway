@@ -104,15 +104,30 @@ versions:
 - version: 7
   file: snapshot_v7.yaml
   parent: 6
-  created: '2026-07-21T08:11:40'
-  kind: infeasible
+  created: '2026-07-21T08:18:37'
+  kind: intervention
   tick: 2
   sim_time: 0.2
-  delta: unresolved after max repair passes
+  delta: retime(3 -> 7.61 m/s)  cost 1.61   [retime 3 -> 7.61 m/s]
   verdict:
-    d1: false
-    d2: false
+    d1: true
+    d2: true
     d3: true
     hero: '3'
-    t_star: null
-    ok: false
+    t_star: 6.767
+    ok: true
+- version: 8
+  file: snapshot_v8.yaml
+  parent: 7
+  created: '2026-07-21T08:18:45'
+  kind: collision
+  tick: 68
+  sim_time: 6.8
+  delta: 'collision realized: ego x 3 @ 6.80s'
+  verdict:
+    d1: true
+    d2: true
+    d3: true
+    hero: '3'
+    t_star: 0.167
+    ok: true

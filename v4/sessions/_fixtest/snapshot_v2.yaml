@@ -82,19 +82,19 @@ actors:
     heading: 180.0
   maneuvers:
   - type: go_straight
-    duration: 3.2066
+    duration: 4.0667
     curve:
-      v0: 7.6094
+      v0: 6.0
       accel: 0.0
   - type: go_straight
-    duration: 5.2567
+    duration: 6.6667
     curve:
-      v0: 7.6094
+      v0: 6.0
       accel: 0.0
   - type: go_straight
-    duration: 1.3142
+    duration: 1.6667
     curve:
-      v0: 7.6094
+      v0: 6.0
       accel: 0.0
 - id: '4'
   color:

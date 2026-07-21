@@ -1,0 +1,16 @@
+- timestamp: '2026-07-21T08:16:11'
+  tick: 2
+  sim_time: 0.2
+  kind: perturbation
+  note: ego + prior edits (v6 state)
+- timestamp: '2026-07-21T08:16:12'
+  tick: 2
+  sim_time: 0.2
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '3'
+    value: 7.609411764705864
+    cost: 1.6094117647058637
+    why: retime 3 -> 7.61 m/s
+  cost: 1.6094117647058637

@@ -42,3 +42,19 @@
   sim_time: 0.2
   kind: infeasible
   reason: unresolved after max repair passes
+- timestamp: '2026-07-21T08:18:37'
+  tick: 2
+  sim_time: 0.2
+  kind: intervention
+  interventions:
+  - kind: retime
+    actor: '3'
+    value: 7.609411764705864
+    cost: 1.6094117647058637
+    why: retime 3 -> 7.61 m/s
+  cost: 1.6094117647058637
+- timestamp: '2026-07-21T08:18:45'
+  tick: 68
+  sim_time: 6.8
+  kind: collision
+  actor: '3'

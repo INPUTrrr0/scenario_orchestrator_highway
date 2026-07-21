@@ -66,6 +66,15 @@ class SessionStore:
         self.versions: List[dict] = []
         self.meta = meta
 
+    def load(self) -> bool:
+        """Load an existing provenance.yaml into this store (for resuming)."""
+        if not os.path.exists(self.prov_path):
+            return False
+        doc = yaml.safe_load(open(self.prov_path)) or {}
+        self.versions = list(doc.get("versions", []))
+        self.meta = doc.get("meta", self.meta)
+        return bool(self.versions)
+
     def _next(self) -> int:
         return (max(v["version"] for v in self.versions) + 1) if self.versions else 1
 
@@ -122,7 +131,7 @@ class Orchestrator:
 
     def __init__(self, base_scenario: str, session_dir: str,
                  ego: str = "0", signals: Optional[dict] = None,
-                 prm=None, label: str = ""):
+                 prm=None, label: str = "", resume: bool = False):
         self.sc = se.load_scenario(base_scenario)
         self.ego = ego
         self.signals = dict(signals or DEFAULT_SIGNALS)
@@ -138,9 +147,17 @@ class Orchestrator:
                 "signals": self.signals, "dt_tick": DT_TICK,
                 "label": label or os.path.basename(base_scenario)}
         self.store = SessionStore(session_dir, meta)
-        v = self._evaluate()
-        self.parent = self.store.save_snapshot(self.sc, "start", None, 0, 0.0,
-                                               "session start", _verdict_dict(v))
+        if resume and self.store.load():
+            last = self.store.versions[-1]
+            self.parent = last["version"]
+            self.sc = se.load_scenario(os.path.join(self.store.dir, last["file"]))
+            self.T = float(last["sim_time"])
+            self.tick = int(last["tick"])
+            self.t_base = self.T
+        else:
+            v = self._evaluate()
+            self.parent = self.store.save_snapshot(self.sc, "start", None, 0, 0.0,
+                                                   "session start", _verdict_dict(v))
 
     # ---- script-grounded evaluation ---- #
     def _world_now(self) -> se.Scenario:
@@ -262,6 +279,7 @@ class Orchestrator:
         if scenario is not None:
             self.sc = scenario
             self.sc.simulate()
+            self.t_base = self.T        # the edited realization's t=0 is *now*
         self._rebase_here()
         v = self._evaluate()
         self.parent = self.store.save_snapshot(
@@ -276,6 +294,7 @@ class Orchestrator:
         time, so this is authoring the future from here — a perturbation."""
         self.sc = scenario
         self.sc.simulate()
+        self.t_base = self.T            # the edited realization's t=0 is *now*
         self.standing = {}
         self.infeasible = False
         self.done = False
