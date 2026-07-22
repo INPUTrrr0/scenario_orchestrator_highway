@@ -291,9 +291,14 @@ def _copy(sc: se.Scenario) -> se.Scenario:
 
 
 def d1_options(sc: se.Scenario, ego_id: str, prm,
-               turns=("__keep__", "straight", "left", "right")) -> List[tuple]:
+               turns=("__keep__", "straight", "left", "right"),
+               verify: bool = True) -> List[tuple]:
     """Causal retimes that make some red-runner collide the ego, cheapest first:
-    (cost, aid, turn, v_target, why). Solved v'=d/t_mid, verified by sweep."""
+    (cost, aid, turn, v_target, why). Solved v'=d/t_mid. `verify` re-simulates and
+    body-sweeps each candidate (exact but costly); disable it on the real-time
+    pursuer path — a slightly-off aim self-corrects on the next tick. The
+    `__keep__` (no reroute) path needs no scenario copy at all — pure geometry on
+    the already-simulated trajectories."""
     by = {a.id: a for a in sc.actors}
     ego = by[ego_id]
     astate = dv.recognize(state_at(sc, 0, ego_id, {}), prm)
@@ -302,15 +307,17 @@ def d1_options(sc: se.Scenario, ego_id: str, prm,
         if a.id == ego_id or not runs_red(astate, a.id):
             continue
         for turn in turns:
-            trial = _copy(sc)
-            if turn != "__keep__":
-                _apply(trial, a.id, "reroute", turn)
-            cand = {x.id: x for x in trial.actors}[a.id]
-            P = conflict_P(cand, {x.id: x for x in trial.actors}[ego_id])
+            if turn == "__keep__":
+                src, cand, egoa = sc, a, ego
+            else:
+                src = _copy(sc)
+                _apply(src, a.id, "reroute", turn)
+                sby = {x.id: x for x in src.actors}
+                cand, egoa = sby[a.id], sby[ego_id]
+            P = conflict_P(cand, egoa)
             if P is None:
                 continue
-            ego_win = occ_window({x.id: x for x in trial.actors}[ego_id], P,
-                                 _r(ego, prm), prm.H)
+            ego_win = occ_window(egoa, P, _r(ego, prm), prm.H)
             if ego_win is None or ego_win[1] <= 0:
                 continue
             d, _ = arc_to_P(cand, P, 0)
@@ -320,12 +327,12 @@ def d1_options(sc: se.Scenario, ego_id: str, prm,
             v_t = d / t_mid
             if not (0.0 < v_t <= prm.v_max):
                 continue
-            t2 = _copy(trial)
-            _apply(t2, a.id, "retime", v_t)
-            cand2 = {x.id: x for x in t2.actors}[a.id]
-            ego2 = {x.id: x for x in t2.actors}[ego_id]
-            if collide_time(cand2, ego2, prm.H) is None:
-                continue
+            if verify:
+                t2 = _copy(src)
+                _apply(t2, a.id, "retime", v_t)
+                t2by = {x.id: x for x in t2.actors}
+                if collide_time(t2by[a.id], t2by[ego_id], prm.H) is None:
+                    continue
             v_now = a.speeds[0]
             cost = prm.w_v * abs(v_t - v_now) + (0.0 if turn == "__keep__"
                                                  else prm.w_r)

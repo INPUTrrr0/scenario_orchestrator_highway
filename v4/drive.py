@@ -157,6 +157,7 @@ class Drive:
         self.ego, self.asc = spawn(seed)
         self.atime = 0.0                 # elapsed since the actors' last re-base
         self.standing: Dict[str, tuple] = {}
+        self.pursuer: Optional[str] = None      # the red-runner currently tracking the ego
         self.interv_msg = ""
         self.flash = 0
         self.n_interventions = 0
@@ -253,32 +254,40 @@ class Drive:
         return w
 
     def orchestrate(self):
+        """Pursuer orchestration: every tick, designate an uncommitted red-runner
+        and re-aim it onto the ego's predicted crossing (slow it to wait if the ego
+        coasts, speed it if the ego bolts) — rather than sitting idle whenever a
+        collision is merely *predicted*. Also clears any third-vehicle interferer."""
         w = self._world()
         self.verdict = ds.evaluate(w, "0", SIGNALS, self.prm, fast=True)
-        rr = ds.repair(w, "0", SIGNALS, self.prm, fast=True)
-        if rr.feasible and rr.interventions:
-            key = {iv.actor: (("retime", round(float(iv.value), 1))
-                              if iv.kind == "retime" else ("reroute", iv.value))
-                   for iv in rr.interventions if iv.actor != "0"}
-            if key and key != {a: self.standing.get(a) for a in key}:
-                self.asc = mv.rebase_scenario(self.asc, self.atime)
-                self.atime = 0.0
-                by = {a.id: a for a in self.asc.actors}
-                lw, arm = self.asc.map.lane_width, self.asc.map.arm_length
-                for iv in rr.interventions:
-                    if iv.actor == "0" or iv.actor not in by:
-                        continue
-                    if iv.kind == "retime":
-                        mv.retime_actor(by[iv.actor], float(iv.value))
-                    else:
-                        mv.reroute_actor(by[iv.actor], str(iv.value), lw, arm)
-                _cap_scenario(self.asc)
-                self.standing.update(key)
-                self.interv_msg = "  ".join(str(iv) for iv in rr.interventions)
-                self.flash = 10
+        # candidate retimes that put an uncommitted red-runner on the ego (cheapest first)
+        opts = ds.d1_options(w, "0", self.prm, turns=("__keep__",), verify=False)
+        plan = {}                                    # actor -> target speed
+        if opts:
+            # keep shadowing with the same pursuer while it stays viable
+            opt = next((o for o in opts if o[1] == self.pursuer), opts[0])
+            plan[opt[1]] = opt[3]
+            new_pursuer = opt[1]
+        else:
+            new_pursuer = None
+
+        if plan:
+            self.asc = mv.rebase_scenario(self.asc, self.atime)
+            self.atime = 0.0
+            by = {a.id: a for a in self.asc.actors}
+            for aid, v_t in plan.items():
+                if aid in by:
+                    mv.retime_actor(by[aid], float(v_t))
+            _cap_scenario(self.asc)
+            if new_pursuer != self.pursuer:
                 self.n_interventions += 1
-        elif self.verdict.ok:
-            pass
+                self.flash = 10
+            self.interv_msg = ("pursuer %s -> %.1f m/s"
+                               % (new_pursuer, plan.get(new_pursuer, 0.0))
+                               if new_pursuer else "clearing interferer")
+        else:
+            self.interv_msg = "no uncommitted red-runner can reach you"
+        self.pursuer = new_pursuer
 
     def actor_poses(self):
         self.asc.simulate()
