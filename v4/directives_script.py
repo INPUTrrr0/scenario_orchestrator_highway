@@ -43,6 +43,7 @@ import directives as dv               # noqa: E402  (geometry + recognizer reuse
 import maneuvers as mv                # noqa: E402  (rebase/retime/reroute)
 
 DT = se.DT
+SWEEP_STRIDE = 1        # frame stride for body sweeps (raise for speed, e.g. 3 = 0.05s)
 
 
 # --------------------------------------------------------------------------- #
@@ -114,7 +115,7 @@ def _body(a: se.Actor, k: int):
 
 def collide_time(a: se.Actor, b: se.Actor, H: float) -> Optional[float]:
     n = min(int(H / DT) + 1, max(len(a.traj), len(b.traj)))
-    for k in range(n):
+    for k in range(0, n, SWEEP_STRIDE):
         if dv.rects_overlap(_body(a, k), _body(b, k)):
             return k * DT
     return None
@@ -139,7 +140,7 @@ def conflict_P(a: se.Actor, ego: se.Actor) -> Optional[Tuple[float, float]]:
 
 def occ_window(a: se.Actor, P, r: float, H: float) -> Optional[Tuple[float, float]]:
     t0 = t1 = None
-    for k in range(min(int(H / DT) + 1, len(a.traj))):
+    for k in range(0, min(int(H / DT) + 1, len(a.traj)), SWEEP_STRIDE):
         x, y, _ = a.traj[k]
         if (x - P[0]) ** 2 + (y - P[1]) ** 2 <= r * r:
             if t0 is None:
@@ -195,13 +196,15 @@ def runs_red(astate: dv.AbsState, aid: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Evaluation
 # --------------------------------------------------------------------------- #
-def evaluate(sc: se.Scenario, ego_id: str, signals: dict, prm) -> Verdict:
+def evaluate(sc: se.Scenario, ego_id: str, signals: dict, prm,
+             fast: bool = False) -> Verdict:
     """`sc` must be re-based so that frame 0 == 'now'."""
     sc.simulate()
     by = {a.id: a for a in sc.actors}
     ego = by[ego_id]
     astate = dv.recognize(state_at(sc, 0, ego_id, signals), prm)
     H = prm.H
+    turns = ("__keep__",) if fast else ("__keep__", "straight", "left", "right")
 
     # D1: some red-runner collides with the ego on the script
     cands = [a.id for a in sc.actors
@@ -216,7 +219,7 @@ def evaluate(sc: se.Scenario, ego_id: str, signals: dict, prm) -> Verdict:
         t_star, hero = wits[0]
         d1 = Ev(True, f"{hero} collides ego @ {t_star:.2f}s")
     else:
-        opts = d1_options(sc, ego_id, prm)
+        opts = d1_options(sc, ego_id, prm, turns=turns)
         hero = opts[0][1] if opts else (cands[0] if cands else None)
         t_star, d1 = H, Ev(False, "no red-runner collides the ego on the script")
 
@@ -287,7 +290,8 @@ def _copy(sc: se.Scenario) -> se.Scenario:
     return mv.rebase_scenario(sc, 0.0)
 
 
-def d1_options(sc: se.Scenario, ego_id: str, prm) -> List[tuple]:
+def d1_options(sc: se.Scenario, ego_id: str, prm,
+               turns=("__keep__", "straight", "left", "right")) -> List[tuple]:
     """Causal retimes that make some red-runner collide the ego, cheapest first:
     (cost, aid, turn, v_target, why). Solved v'=d/t_mid, verified by sweep."""
     by = {a.id: a for a in sc.actors}
@@ -297,7 +301,7 @@ def d1_options(sc: se.Scenario, ego_id: str, prm) -> List[tuple]:
     for a in sc.actors:
         if a.id == ego_id or not runs_red(astate, a.id):
             continue
-        for turn in ("__keep__", "straight", "left", "right"):
+        for turn in turns:
             trial = _copy(sc)
             if turn != "__keep__":
                 _apply(trial, a.id, "reroute", turn)
@@ -333,13 +337,14 @@ def d1_options(sc: se.Scenario, ego_id: str, prm) -> List[tuple]:
     return out
 
 
-def _clear_interferer(sc, ego_id, hero, w, prm) -> Optional[Intervention]:
+def _clear_interferer(sc, ego_id, hero, w, prm, fast=False) -> Optional[Intervention]:
     """Min-|Δv| retime (incl. yield) or reroute that clears interferer w."""
     by = {a.id: a for a in sc.actors}
     v_now = by[w].speeds[0]
-    trials = [("retime", v) for v in (0.0, 2.0, prm.v_max, max(0.0, v_now - 4),
-                                      v_now + 5)]
-    trials += [("reroute", t) for t in ("left", "right", "straight")]
+    trials = [("retime", v) for v in (0.0, prm.v_max, max(0.0, v_now - 4))]
+    if not fast:
+        trials += [("retime", 2.0), ("retime", v_now + 5)]
+        trials += [("reroute", t) for t in ("left", "right", "straight")]
     best = None
     for kind, val in trials:
         t = _copy(sc)
@@ -362,15 +367,17 @@ def _clear_interferer(sc, ego_id, hero, w, prm) -> Optional[Intervention]:
                         f"clear interferer {w}")
 
 
-def repair(sc: se.Scenario, ego_id: str, signals: dict, prm) -> Rep:
+def repair(sc: se.Scenario, ego_id: str, signals: dict, prm,
+           fast: bool = False) -> Rep:
     trial = _copy(sc)
     plan: List[Intervention] = []
+    turns = ("__keep__",) if fast else ("__keep__", "straight", "left", "right")
     for _ in range(4):
-        v = evaluate(trial, ego_id, signals, prm)
+        v = evaluate(trial, ego_id, signals, prm, fast=fast)
         if v.ok:
             break
         if not v.d1.value:
-            opts = d1_options(trial, ego_id, prm)
+            opts = d1_options(trial, ego_id, prm, turns=turns)
             if not opts:
                 return Rep(False, plan, sum(i.cost for i in plan), v,
                            "D1 unrepairable: no red-runner can causally reach the "
@@ -385,7 +392,8 @@ def repair(sc: se.Scenario, ego_id: str, signals: dict, prm) -> Rep:
         elif not v.d2.value:
             # restore reachability: retime the hero toward the window midpoint
             hero = v.hero
-            opts = [o for o in d1_options(trial, ego_id, prm) if o[1] == hero]
+            opts = [o for o in d1_options(trial, ego_id, prm, turns=turns)
+                    if o[1] == hero]
             if not opts:
                 return Rep(False, plan, sum(i.cost for i in plan), v,
                            f"D2 unrepairable for hero {hero}: committed past P")
@@ -398,7 +406,7 @@ def repair(sc: se.Scenario, ego_id: str, signals: dict, prm) -> Rep:
             w = v.d3_witness
             if w is None:
                 break
-            fix = _clear_interferer(trial, ego_id, v.hero, w, prm)
+            fix = _clear_interferer(trial, ego_id, v.hero, w, prm, fast=fast)
             if fix is None:
                 return Rep(False, plan, sum(i.cost for i in plan), v,
                            f"D3 unrepairable: interferer {w} cannot be cleared")
