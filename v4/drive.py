@@ -24,6 +24,7 @@ Requires pygame; recording requires ffmpeg.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import random
@@ -54,7 +55,7 @@ BOT = 46
 W, H = SIZE, TOP + SIZE + BOT
 FPS = 30
 DT = 1.0 / FPS
-ORCH_EVERY = 6          # run the orchestrator every N frames (physics/render every frame)
+ORCH_EVERY = 3          # run the orchestrator every N frames (physics/render every frame)
 CAP_T = 9.0             # cap actor timeline length (keeps re-simulation cheap)
 
 # bicycle model
@@ -184,18 +185,37 @@ class Drive:
         if self.ff is not None:
             return
         ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-        self.outfile = os.path.join(self.outdir, f"drive_seed{self.seed}_{ts}.mp4")
+        base = os.path.join(self.outdir, f"drive_seed{self.seed}_{ts}")
+        self.outfile = base + ".mp4"
+        self.cmd_file = base + ".commands.json"
+        self.cmd_log: List[dict] = []      # ego actuation commands over the recording
         self.ff = subprocess.Popen(
             ["ffmpeg", "-y", "-f", "rawvideo", "-pixel_format", "rgb24",
              "-video_size", f"{W}x{H}", "-framerate", str(FPS), "-i", "-",
              "-pix_fmt", "yuv420p", "-vcodec", "libx264", "-loglevel", "error",
              self.outfile], stdin=subprocess.PIPE)
 
+    def _record_cmd(self, throttle: float, steer: float):
+        """Log one frame of ego actuation (only while recording)."""
+        if self.ff is None:
+            return
+        self.cmd_log.append({
+            "t": round(self._fcount * DT, 3),
+            "throttle": round(throttle, 3), "steer": round(steer, 3),
+            "x": round(self.ego.x, 3), "y": round(self.ego.y, 3),
+            "heading": round(math.degrees(self.ego.theta), 2),
+            "v": round(self.ego.v, 3)})
+
     def _stop_record(self):
         if self.ff is not None:
             self.ff.stdin.close()
             self.ff.wait()
             self.ff = None
+            with open(self.cmd_file, "w") as f:
+                json.dump({"seed": self.seed, "fps": FPS, "dt": DT,
+                           "wheelbase": WHEELBASE, "v_max": V_MAX,
+                           "commands": self.cmd_log}, f, indent=1)
+            print(f"commands saved: {self.cmd_file}")
 
     def _grab_frame(self):
         if self.ff is not None:
@@ -381,6 +401,7 @@ class Drive:
             elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
                 steer = -1.0
             self.step(throttle, steer)
+            self._record_cmd(throttle, steer)
             self.render()
             self._grab_frame()
         self._stop_record()
@@ -395,6 +416,7 @@ class Drive:
             else:
                 throttle, steer = (1.0 if self.ego.v < 12 else 0.0), 0.0
             self.step(throttle, steer)
+            self._record_cmd(throttle, steer)
             self.render()
             self._grab_frame()
         self._stop_record()
