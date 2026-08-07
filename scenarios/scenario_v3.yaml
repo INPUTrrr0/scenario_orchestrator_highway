@@ -1,0 +1,99 @@
+map:
+  kind: straight
+  lane_width: 3.5
+  num_lanes: 3
+  length: 120.0
+render:
+  pixels_per_meter: 6.0
+actors:
+- id: '0'
+  color:
+  - 90
+  - 190
+  - 110
+  length: 4.5
+  width: 2.0
+  start:
+    x: 0.0
+    y: -50.0
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 8.0
+    curve:
+      v0: 13.0
+      accel: 0.0
+- id: '1'
+  color:
+  - 210
+  - 70
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: 1.6508
+    y: -16.7386
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 30.0
+    curve:
+      v0: 1.893
+      accel: 0.0
+  cutin:
+    t: 2.0
+    along: 11.0
+    lat: 0.0
+    lc_duration: 2.0
+    tail: 4.0
+- id: '3'
+  color:
+  - 240
+  - 175
+  - 65
+  length: 4.5
+  width: 2.0
+  start:
+    x: 3.5
+    y: -9.5
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 8.0
+    curve:
+      v0: 12.5
+      accel: 0.0
+- id: '4'
+  color:
+  - 170
+  - 110
+  - 220
+  length: 4.5
+  width: 2.0
+  start:
+    x: -3.5
+    y: -46.0
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 8.0
+    curve:
+      v0: 12.0
+      accel: 0.0
+- id: '5'
+  color:
+  - 160
+  - 90
+  - 200
+  length: 4.5
+  width: 2.0
+  start:
+    x: 3.6667
+    y: -52.0
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 8.0
+    curve:
+      v0: 12.0
+      accel: 0.0

@@ -1,5 +1,0 @@
-- timestamp: '2026-07-20T15:40:03'
-  tick: 50
-  sim_time: 5.0
-  kind: infeasible
-  reason: 'D2 unrepairable for hero 3: committed past P'

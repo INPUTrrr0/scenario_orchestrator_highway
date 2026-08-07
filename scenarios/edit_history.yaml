@@ -1,0 +1,558 @@
+- timestamp: '2026-08-04T11:30:46'
+  base_version: 1
+  action: set_maneuver_type
+  actor_id: '1'
+  maneuver_index: 0
+  old_type: go_straight
+  new_type: function
+- timestamp: '2026-08-04T11:30:57'
+  base_version: 1
+  action: set_maneuver_type
+  actor_id: '1'
+  maneuver_index: 0
+  old_type: go_straight
+  new_type: function
+- timestamp: '2026-08-04T11:31:02'
+  base_version: 1
+  action: set_maneuver_type
+  actor_id: '1'
+  maneuver_index: 0
+  old_type: go_straight
+  new_type: turn_left
+- timestamp: '2026-08-04T15:52:48'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    x: 0.0
+    y: -8.0
+  new:
+    x: 0.17
+    y: -32.67
+- timestamp: '2026-08-04T15:54:02'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    x: 0.17
+    y: -32.67
+  new:
+    x: 0.17
+    y: -26.5
+- timestamp: '2026-08-04T15:54:28'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    x: 0.17
+    y: -26.5
+  new:
+    x: 0.5
+    y: -23.67
+- timestamp: '2026-08-04T15:58:31'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 3.0
+    along: 6.0
+    lat: 0.0
+  new:
+    t: 1.309
+    along: 10.88
+    lat: 3.5
+- timestamp: '2026-08-04T15:59:11'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 1.309
+    along: 10.88
+    lat: 3.5
+  new:
+    t: 0.602
+    along: 8.53
+    lat: 3.33
+- timestamp: '2026-08-04T15:59:41'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.602
+    along: 8.53
+    lat: 3.33
+  new:
+    t: 2.789
+    along: 6.48
+    lat: 3.5
+- timestamp: '2026-08-04T16:00:22'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.789
+    along: 6.48
+    lat: 3.5
+  new:
+    t: 1.694
+    along: 7.07
+    lat: 3.33
+- timestamp: '2026-08-04T16:01:02'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 1.694
+    along: 7.07
+    lat: 3.33
+  new:
+    t: 1.69
+    along: 23.12
+    lat: 3.17
+- timestamp: '2026-08-04T16:08:32'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 3.0
+    along: 6.0
+    lat: 0.0
+  new:
+    t: 2.142
+    along: 16.05
+    lat: 2.0
+- timestamp: '2026-08-04T16:08:40'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.142
+    along: 16.05
+    lat: 2.0
+  new:
+    t: 2.142
+    along: 10.72
+    lat: 3.33
+- timestamp: '2026-08-04T16:09:09'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.142
+    along: 10.72
+    lat: 3.33
+  new:
+    t: 2.116
+    along: 8.15
+    lat: 3.33
+- timestamp: '2026-08-04T16:09:11'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.5
+    y: -38.0
+    heading: 90.0
+  new_start:
+    x: 3.5
+    y: -38.0
+    heading: 86.8
+- timestamp: '2026-08-04T16:09:13'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.5
+    y: -38.0
+    heading: 86.8
+  new_start:
+    x: 4.0
+    y: -38.0
+    heading: 86.8
+- timestamp: '2026-08-04T16:09:15'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 4.0
+    y: -38.0
+    heading: 86.8
+  new_start:
+    x: 3.167
+    y: 0.333
+    heading: 86.8
+- timestamp: '2026-08-04T16:09:17'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.116
+    along: 8.15
+    lat: 3.33
+  new:
+    t: 0.0
+    along: 35.33
+    lat: 3.83
+- timestamp: '2026-08-04T16:09:24'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.0
+    along: 35.33
+    lat: 3.83
+  new:
+    t: 0.0
+    along: 34.83
+    lat: 3.67
+- timestamp: '2026-08-04T16:10:13'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.0
+    along: 34.83
+    lat: 3.67
+  new:
+    t: 1.604
+    along: 14.87
+    lat: 3.33
+- timestamp: '2026-08-04T16:10:33'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 1.604
+    along: 14.87
+    lat: 3.33
+  new:
+    t: 2.042
+    along: 7.52
+    lat: 3.83
+- timestamp: '2026-08-04T16:34:24'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.167
+    y: 0.333
+    heading: 86.8
+  new_start:
+    x: 3.167
+    y: 0.333
+    heading: 90.0
+- timestamp: '2026-08-04T16:34:27'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.167
+    y: 0.333
+    heading: 90.0
+  new_start:
+    x: 3.833
+    y: -38.333
+    heading: 90.0
+- timestamp: '2026-08-04T16:34:30'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.833
+    y: -38.333
+    heading: 90.0
+  new_start:
+    x: 3.833
+    y: -39.5
+    heading: 90.0
+- timestamp: '2026-08-04T16:35:11'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.042
+    along: 7.52
+    lat: 3.83
+  new:
+    t: 3.0
+    along: 10.67
+    lat: 3.33
+- timestamp: '2026-08-04T18:25:36'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 0.139
+    y: 36.611
+    heading: 90.0
+  new_start:
+    x: 3.806
+    y: -39.889
+    heading: 90.0
+- timestamp: '2026-08-04T18:56:09'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 3.0
+    along: 6.0
+    lat: 0.0
+  new:
+    t: 0.615
+    along: 33.32
+    lat: -0.17
+- timestamp: '2026-08-04T18:56:43'
+  base_version: 2
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.615
+    along: 33.32
+    lat: -0.17
+  new:
+    t: 0.0
+    along: 41.67
+    lat: 0.0
+- timestamp: '2026-08-04T18:57:02'
+  base_version: 2
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.0
+    along: 41.67
+    lat: 0.0
+  new:
+    t: 2.0
+    along: 15.17
+    lat: -1.17
+- timestamp: '2026-08-04T18:57:18'
+  base_version: 2
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.0
+    along: 15.17
+    lat: -1.17
+  new:
+    t: 2.0
+    along: 11.67
+    lat: -0.17
+- timestamp: '2026-08-04T18:57:22'
+  base_version: 2
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.0
+    along: 11.67
+    lat: -0.17
+  new:
+    t: 2.0
+    along: 9.83
+    lat: 0.17
+- timestamp: '2026-08-04T18:57:26'
+  base_version: 2
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.0
+    along: 9.83
+    lat: 0.17
+  new:
+    t: 2.0
+    along: 10.83
+    lat: -0.33
+- timestamp: '2026-08-04T18:57:34'
+  base_version: 2
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 2.0
+    along: 10.83
+    lat: -0.33
+  new:
+    t: 2.0
+    along: 11.5
+    lat: 0.17
+- timestamp: '2026-08-06T16:13:31'
+  base_version: 1
+  action: add_actor
+  actor_id: '2'
+- timestamp: '2026-08-06T16:25:53'
+  base_version: 1
+  action: add_actor
+  actor_id: '2'
+- timestamp: '2026-08-06T16:36:22'
+  base_version: 1
+  action: add_actor
+  actor_id: '2'
+- timestamp: '2026-08-06T19:06:09'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 3.0
+    along: 6.0
+    lat: 0.0
+  new:
+    t: 0.713
+    along: 31.85
+    lat: -0.5
+- timestamp: '2026-08-06T19:06:23'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.713
+    along: 31.85
+    lat: -0.5
+  new:
+    t: 0.713
+    along: 31.35
+    lat: -0.33
+- timestamp: '2026-08-06T19:06:33'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.713
+    along: 31.35
+    lat: -0.33
+  new:
+    t: 3.0
+    along: 9.5
+    lat: -0.17
+- timestamp: '2026-08-06T19:07:47'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 3.0
+    along: 9.5
+    lat: -0.17
+  new:
+    t: 0.0
+    along: 18.0
+    lat: -0.17
+- timestamp: '2026-08-06T19:08:00'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.0
+    along: 18.0
+    lat: -0.17
+  new:
+    t: 0.0
+    along: 30.17
+    lat: 0.0
+- timestamp: '2026-08-06T19:08:12'
+  base_version: 1
+  action: set_maneuver_type
+  actor_id: '3'
+  maneuver_index: 0
+  old_type: go_straight
+  new_type: function
+- timestamp: '2026-08-06T19:09:25'
+  base_version: 1
+  action: remove_actor
+  actor_id: '2'
+- timestamp: '2026-08-06T19:09:27'
+  base_version: 1
+  action: add_actor
+  actor_id: '5'
+- timestamp: '2026-08-06T19:09:31'
+  base_version: 1
+  action: move_actor
+  actor_id: '5'
+  old_start:
+    x: 0.0
+    y: -40.0
+    heading: 90.0
+  new_start:
+    x: 3.667
+    y: -52.0
+    heading: 90.0
+- timestamp: '2026-08-06T19:10:18'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.5
+    y: -38.0
+    heading: 90.0
+  new_start:
+    x: 3.5
+    y: -32.167
+    heading: 90.0
+- timestamp: '2026-08-06T19:10:57'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 3.0
+    along: 6.0
+    lat: 0.0
+  new:
+    t: 0.0
+    along: 50.67
+    lat: -2.5
+- timestamp: '2026-08-06T19:11:01'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.0
+    along: 50.67
+    lat: -2.5
+  new:
+    t: 0.0
+    along: 45.0
+    lat: 0.0
+- timestamp: '2026-08-06T19:11:11'
+  base_version: 1
+  action: move_cutin_target
+  actor_id: '1'
+  old:
+    t: 0.0
+    along: 45.0
+    lat: 0.0
+  new:
+    t: 2.0
+    along: 11.0
+    lat: 0.0
+- timestamp: '2026-08-06T19:11:29'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.5
+    y: -32.167
+    heading: 90.0
+  new_start:
+    x: 3.5
+    y: -25.667
+    heading: 90.0
+- timestamp: '2026-08-06T19:11:49'
+  base_version: 1
+  action: move_actor
+  actor_id: '3'
+  old_start:
+    x: 3.5
+    y: -18.0
+    heading: 90.0
+  new_start:
+    x: 3.5
+    y: -9.5
+    heading: 90.0
+- timestamp: '2026-08-06T19:11:51'
+  base_version: 1
+  action: move_actor
+  actor_id: '1'
+  old_start:
+    x: 3.5
+    y: -25.667
+    heading: 90.0
+  new_start:
+    x: 3.5
+    y: -20.833
+    heading: 90.0

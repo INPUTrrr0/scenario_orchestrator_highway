@@ -1,5 +1,6 @@
+.venv/
 __pycache__/
 *.pyc
 outputs/
-v2/outputs/
-**/.DS_Store
+sessions/
+.DS_Store

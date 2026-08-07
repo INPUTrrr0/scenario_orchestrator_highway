@@ -1,0 +1,37 @@
+# Highway cut-in on a straight 3-lane road.
+# Ego (green) cruises in the center lane. Actor (red) starts in the right
+# lane ahead and lane-changes left into ego's path.
+#
+# Lanes (northbound, heading 90°): left x=-3.5, center x=0, right x=+3.5
+# lane_change lateral_offset: +left / −right of heading.
+
+map:
+  kind: straight
+  num_lanes: 3
+  lane_width: 3.5
+  length: 120
+
+render:
+  pixels_per_meter: 6
+
+actors:
+  # Ego — center lane, constant cruise
+  - id: 0
+    color: [90, 190, 110]
+    length: 4.5
+    width: 2.0
+    start: {x: 0.0, y: -50.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 8.0, curve: {v0: 13.0, accel: 0.0}}
+
+  # Cut-in actor — right lane, then lane-change left into center ahead of ego
+  - id: 1
+    color: [210, 70, 60]
+    length: 4.5
+    width: 2.0
+    start: {x: 3.5, y: -38.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 1.0, curve: {v0: 15.0, accel: 0.0}}
+      - {type: lane_change, duration: 2.0, lateral_offset: 3.5,
+         curve: {v0: 15.0, accel: 0.0}}
+      - {type: go_straight, duration: 5.0, curve: {v0: 15.0, accel: 0.0}}

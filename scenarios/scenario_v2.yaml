@@ -1,0 +1,54 @@
+map:
+  kind: straight
+  lane_width: 3.5
+  num_lanes: 3
+  length: 120.0
+render:
+  pixels_per_meter: 6.0
+actors:
+- id: '0'
+  color:
+  - 90
+  - 190
+  - 110
+  length: 4.5
+  width: 2.0
+  start:
+    x: 0.0
+    y: -50.0
+    heading: 90.0
+  maneuvers:
+  - type: go_straight
+    duration: 8.0
+    curve:
+      v0: 13.0
+      accel: 0.0
+- id: '1'
+  color:
+  - 210
+  - 70
+  - 60
+  length: 4.5
+  width: 2.0
+  start:
+    x: 3.5
+    y: -38.0
+    heading: 90.0
+  maneuvers:
+  - type: lane_change
+    duration: 0.615
+    curve:
+      v0: 40.0
+      accel: 0.0
+    lateral_offset: 3.33
+  - type: go_straight
+    duration: 4.0
+    curve:
+      v0: 40.0
+      accel: 0.0
+  cutin:
+    t: 0.615
+    along: 33.32
+    lat: -0.17
+    lc_duration: 2.0
+    tail: 4.0
