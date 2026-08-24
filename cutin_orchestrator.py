@@ -34,6 +34,7 @@ import pygame                          # noqa: E402
 import scenario_editor as se          # noqa: E402
 import maps as mp                     # noqa: E402
 import maneuvers as mv                # noqa: E402
+import directives as dv               # noqa: E402  (oriented-rect overlap)
 
 # ---- view ---- #
 VIEW = 42.0
@@ -41,7 +42,7 @@ SCALE = 10.0
 SIZE = int(2 * VIEW * SCALE)          # 840
 TOP = 52
 BOT = 46
-PANEL_W = 200
+PANEL_W = 332
 W, H = SIZE, TOP + SIZE + BOT
 FPS = 30
 DT = 1.0 / FPS
@@ -71,7 +72,9 @@ PANEL_BANNER = (36, 40, 50)
 DOT_ON = (72, 190, 100)
 DOT_OFF = (90, 94, 105)
 ROLE_CUTIN = "cutin"
+ROLE_BLOCK = "block"
 ROLE_NOMINAL = "nominal"
+DOT_BLOCK = (235, 150, 60)
 
 DEFAULT_CUTIN_SPEC = {
     "t": 4.0, "along": 6.0, "lat": 0.0, "lc_duration": 2.0, "tail": 4.0,
@@ -135,7 +138,7 @@ def spawn_fleet(seed: int, n_actors: int = 4,
         actors.append(se.Actor(
             id=str(i + 1),
             color=ACTOR_COLORS[i % len(ACTOR_COLORS)],
-            length=4.5, width=2.0, start=start,
+            length=4.5, width=2.0, start=start, cruise=speed,
             maneuvers=se.cruise_plan(start, speed),
         ))
     asc = se.Scenario(map=m, actors=actors, pixels_per_meter=6.0)
@@ -173,11 +176,185 @@ def score_cutin_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
     return lat_score * along_score
 
 
+def score_block_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
+                          lane_width: float, target_lat: float) -> float:
+    """Higher = better block-cut-in candidate.
+
+    The blocker must already live in the ego's *target* lane (lat offset
+    `target_lat` in the ego frame) and sit behind-to-alongside the ego, so
+    that speeding up naturally closes the gap the ego wants to merge into.
+    """
+    along, lat = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
+    dl = abs(lat - target_lat)
+    if dl < 0.5 * lane_width:
+        lat_score = 1.0                       # in the target lane
+    elif dl < 1.5 * lane_width:
+        lat_score = 0.2                       # one lane off
+    else:
+        lat_score = 0.05
+    # longitudinal: prefer slightly behind the ego (best ~8 m back); a car
+    # far ahead can't threaten the gap by accelerating
+    if along > 12.0 or along < -35.0:
+        along_score = 0.05
+    else:
+        along_score = 1.0 / (1.0 + abs(along + 8.0) / 10.0)
+    return lat_score * along_score
+
+
+# --------------------------------------------------------------------------- #
+# Collision directive — predicted body overlap → replan the lower-priority
+# actor.  Priority: current action owner (cut-in / block) first, then the
+# placement score ("probability") of that action.  The owner keeps its plan;
+# the interferer is sped forward if it is ahead (clear the merge slot) or
+# slowed if it is behind.
+# --------------------------------------------------------------------------- #
+COLLISION_H = 3.0          # s of trajectory to scan
+COLLISION_DT = 0.10
+COLLISION_PAD = 0.6        # m of extra body margin (near-miss = conflict)
+SAFE_BUMPER = 2.0          # m bumper-to-bumper the yield should open
+YIELD_HORIZON = 1.2        # s to open that gap
+
+
+def _body(actor: se.Actor, pose: se.Pose, pad: float = COLLISION_PAD):
+    return dv.rect_corners(pose[0], pose[1], pose[2],
+                           actor.length + 2.0 * pad,
+                           actor.width + 2.0 * pad)
+
+
+def actor_plan_speed(actor: se.Actor) -> float:
+    if actor.maneuvers and isinstance(actor.maneuvers[0], se.Maneuver):
+        return max(float(actor.maneuvers[0].intercept), se.CUTIN_MIN_SPEED)
+    return se.actor_cruise_speed(actor)
+
+
+def action_priority(actor: se.Actor,
+                    scores: Optional[Dict[str, Dict[str, float]]]
+                    ) -> Tuple[int, float]:
+    """Higher tuple = more privileged.  Owners outrank nominal traffic;
+    among owners (or among nominals) the placement score of the held /
+    best action breaks the tie."""
+    owner = 1 if (actor.cutin or actor.block) else 0
+    sc = (scores or {}).get(actor.id, {})
+    if actor.cutin:
+        p = float(sc.get(ROLE_CUTIN, 0.0))
+    elif actor.block:
+        p = float(sc.get(ROLE_BLOCK, 0.0))
+    else:
+        p = max(sc.values()) if sc else 0.0
+    return (owner, p)
+
+
+def predicted_collisions(actors: List[se.Actor],
+                         pose_at,
+                         horizon: float = COLLISION_H,
+                         dt: float = COLLISION_DT,
+                         ego_id: str = "0"
+                         ) -> List[Tuple[str, str, float]]:
+    """First time in [0, horizon] that each pair of non-ego bodies overlap.
+    `pose_at(actor, t) -> (x, y, heading_deg)`."""
+    fleet = [a for a in actors if a.id != ego_id]
+    hits: List[Tuple[str, str, float]] = []
+    seen = set()
+    t = 0.0
+    while t <= horizon + 1e-9:
+        poses = {a.id: pose_at(a, t) for a in fleet}
+        bodies = {a.id: _body(a, poses[a.id]) for a in fleet}
+        for i, a in enumerate(fleet):
+            for b in fleet[i + 1:]:
+                key = (a.id, b.id) if a.id < b.id else (b.id, a.id)
+                if key in seen:
+                    continue
+                if dv.rects_overlap(bodies[a.id], bodies[b.id]):
+                    seen.add(key)
+                    hits.append((a.id, b.id, t))
+        t += dt
+    return hits
+
+
+def yield_speed(priv: se.Actor, inter: se.Actor,
+                p_pose: se.Pose, i_pose: se.Pose,
+                v_priv: float, t_hit: float) -> float:
+    """Speed the interferer should adopt.  Ahead of the owner → speed up to
+    pull the merge slot clear; behind → slow down."""
+    h = math.radians(p_pose[2])
+    along = ((i_pose[0] - p_pose[0]) * math.cos(h)
+             + (i_pose[1] - p_pose[1]) * math.sin(h))
+    need = 0.5 * (priv.length + inter.length) + SAFE_BUMPER
+    hz = max(t_hit, YIELD_HORIZON)
+    if along >= 0.0:
+        # interferer is at/ahead of the owner — pull further forward
+        extra = max(need - along, 1.5)
+        return se.clamp(v_priv + extra / hz, se.CUTIN_MIN_SPEED,
+                        se.CUTIN_MAX_SPEED)
+    extra = max(need + along, 1.5)
+    return se.clamp(v_priv - extra / hz, se.CUTIN_MIN_SPEED,
+                    se.CUTIN_MAX_SPEED)
+
+
+def resolve_actor_collisions(
+        actors: List[se.Actor], pose_at,
+        scores: Optional[Dict[str, Dict[str, float]]] = None,
+        ego_id: str = "0"
+        ) -> List[Tuple[se.Actor, float, se.Actor, float]]:
+    """For each predicted overlap, pick the lower-priority actor as the one
+    that yields.  Returns (interferer, new_speed, privileged, t_hit).
+    Self-governed actors and cut-in holders in progress are never yielded
+    (the owner keeps its plan)."""
+    by = {a.id: a for a in actors}
+    out: List[Tuple[se.Actor, float, se.Actor, float]] = []
+    yielded: set = set()
+    hits = predicted_collisions(actors, pose_at, ego_id=ego_id)
+    hits.sort(key=lambda h: h[2])
+    for id_a, id_b, t_hit in hits:
+        a, b = by[id_a], by[id_b]
+        pa, pb = action_priority(a, scores), action_priority(b, scores)
+        if pa >= pb:
+            priv, inter = a, b
+        else:
+            priv, inter = b, a
+        if inter.id in yielded:
+            continue
+        if getattr(inter, "autonomy", "auto") == "self":
+            continue
+        # never strip an in-progress cut-in to make room for someone else
+        if inter.cutin:
+            continue
+        p_pose = pose_at(priv, 0.0)
+        i_pose = pose_at(inter, 0.0)
+        v = yield_speed(priv, inter, p_pose, i_pose,
+                        actor_plan_speed(priv), t_hit)
+        out.append((inter, v, priv, t_hit))
+        yielded.add(inter.id)
+    return out
+
+
+def apply_collision_yields(actors: List[se.Actor], pose_at,
+                           scores: Optional[Dict[str, Dict[str, float]]] = None,
+                           ego_id: str = "0"
+                           ) -> List[str]:
+    """Mutate interferer plans in place.  Returns status strings for the UI."""
+    msgs: List[str] = []
+    for inter, v, priv, t_hit in resolve_actor_collisions(
+            actors, pose_at, scores, ego_id=ego_id):
+        pose = pose_at(inter, 0.0)
+        hd = inter.start[2] if len(inter.start) > 2 else pose[2]
+        start = (pose[0], pose[1], hd)
+        inter.start = start
+        inter.maneuvers = se.cruise_plan(start, v)
+        msgs.append(
+            f"collision: actor {inter.id} yields to {priv.id} "
+            f"(hit in {t_hit:.1f}s) → {v:.1f} m/s")
+    return msgs
+
+
 def cast_roles(actors: List[se.Actor], ego_pose: se.Pose, lane_width: float,
                lock_id: Optional[str] = None) -> List[Casting]:
-    """Pick one cut-in actor (or keep `lock_id`); everyone else drives nominal."""
+    """Pick one cut-in actor (or keep `lock_id`); everyone else drives nominal.
+    Self-governed actors are never conscripted."""
     scored: List[Tuple[float, str]] = []
     for a in actors:
+        if getattr(a, "autonomy", "auto") == "self":
+            continue
         pose = a.start
         scored.append((score_cutin_candidate(pose, ego_pose, lane_width), a.id))
     scored.sort(reverse=True)
@@ -206,12 +383,16 @@ def apply_closed_loop_cutin(actor: se.Actor, ego: Ego, spec: dict,
 
     Returns (status, message) where status is one of:
       'chasing' | 'merged' | 'abandoned'
-    Mutates actor.start / actor.maneuvers in place.
+    Mutates actor.start / actor.maneuvers in place.  A merged actor matches
+    the ego's speed (it sits right in front of it); an unsuccessful cut-in
+    returns to the actor's own cruise speed and keeps driving straight.
     """
     along = float(spec.get("along", 1.0))
     lat = float(spec.get("lat", 0.0))
     wx, wy = se.live_cutin_pin(ego.x, ego.y, ego.theta, along, lat)
-    hd = heading_deg if heading_deg is not None else math.degrees(ego.theta)
+    # default to the actor's own plan-frame heading — copying the ego's live
+    # heading would make the actor steer along with the user's steering
+    hd = heading_deg if heading_deg is not None else actor.start[2]
     start = (actor.start[0], actor.start[1], hd)
 
     if se.cutin_is_merged(actor.start, wx, wy, ego.theta):
@@ -221,10 +402,12 @@ def apply_closed_loop_cutin(actor: se.Actor, ego: Ego, spec: dict,
 
     t_rem = se.closed_loop_cutin_horizon(spec, clock_t)
     if t_rem <= 0.0:
+        v_nom = se.actor_cruise_speed(actor)
         actor.start = start
-        actor.maneuvers = se.cruise_plan(start, ego.v)
+        actor.maneuvers = se.cruise_plan(start, v_nom)
         return ("abandoned",
-                f"cut-in abandoned — past t={float(spec['t']):.1f}s, cruising")
+                f"cut-in abandoned — past t={float(spec['t']):.1f}s, "
+                f"back to cruise {v_nom:.1f} m/s")
 
     actor.start = start
     actor.maneuvers = se.solve_closed_loop_cutin(
@@ -259,6 +442,10 @@ class CutinOrchestrator:
         self.cruise_speed = float(cruise_speed)
         self.roles: Dict[str, str] = {}
         self.scores: Dict[str, float] = {}
+        # nominal (lane-aligned) heading per actor, recorded at first sight —
+        # replanning from a pose sampled mid-lane-change would otherwise leak
+        # the maneuver's temporary yaw into the new plan frame
+        self.headings: Dict[str, float] = {}
         self.cutin_id: Optional[str] = None
         self.committed = False
         self.outcome: Optional[str] = None     # merged | abandoned
@@ -296,9 +483,12 @@ class CutinOrchestrator:
             self.cast(base.actors, ego, lw, sticky=True)
 
         for a in base.actors:
+            hd = self.headings.setdefault(
+                a.id, a.start[2] if len(a.start) > 2 else 90.0)
             role = self.roles.get(a.id, ROLE_NOMINAL)
             if role == ROLE_CUTIN and not self.committed:
-                status, msg = apply_closed_loop_cutin(a, ego, self.spec, clock_t)
+                status, msg = apply_closed_loop_cutin(a, ego, self.spec,
+                                                      clock_t, heading_deg=hd)
                 self.msg = msg
                 if status in ("merged", "abandoned"):
                     self.committed = True
@@ -306,12 +496,36 @@ class CutinOrchestrator:
                     self.flash = 10
                     self.n_interventions += 1
             else:
-                # committed cut-in actor (or never cast) → cruise
-                speed = (ego.v if (self.committed and a.id == self.cutin_id)
-                         else self.cruise_speed)
-                apply_nominal(a, speed)
+                # committed cut-in actor (or never cast) → cruise. Only a
+                # *merged* actor matches the ego; everyone else (including an
+                # abandoned cut-in) holds its own cruise speed.
+                if (self.committed and a.id == self.cutin_id
+                        and self.outcome == "merged"):
+                    speed = ego.v
+                else:
+                    speed = se.actor_cruise_speed(a, default=self.cruise_speed)
+                apply_nominal(a, speed, heading_deg=hd)
 
         base.simulate()
+        # collision directive: if two actors' bodies would overlap, the
+        # lower-priority one yields (owner + score). Re-simulate if anyone moved.
+        def pose_at(a: se.Actor, t: float) -> se.Pose:
+            return a.pose_at_time(t)
+
+        lw = base.map.lane_width
+        ego_pose = (ego.x, ego.y, math.degrees(ego.theta))
+        scores: Dict[str, Dict[str, float]] = {}
+        for a in base.actors:
+            if a.id == "0":
+                continue
+            scores[a.id] = {
+                ROLE_CUTIN: score_cutin_candidate(a.start, ego_pose, lw),
+            }
+        msgs = apply_collision_yields(base.actors, pose_at, scores)
+        if msgs:
+            base.simulate()
+            self.msg = msgs[0]
+            self.n_interventions += 1
         return base, 0.0
 
     # ---- panel ---- #
@@ -327,19 +541,44 @@ class CutinOrchestrator:
 # --------------------------------------------------------------------------- #
 # Role-casting panel (reused by scenario_editor's window)
 # --------------------------------------------------------------------------- #
+# intention columns of the role matrix, in display order
+ROLE_COLUMNS: List[Tuple[str, str]] = [
+    (ROLE_NOMINAL, "none"),
+    (ROLE_CUTIN, "cut-in"),
+    (ROLE_BLOCK, "block"),
+]
+
+
 def draw_role_panel(surface: pygame.Surface,
                     font: pygame.font.Font, font_sm: pygame.font.Font,
                     roles: Dict[str, str],
                     origin: Tuple[int, int] = (36, TOP + 36),
-                    width: int = PANEL_W) -> pygame.Rect:
-    """Card with an 'orchestrator' banner and one row per actor: a round dot
-    that is green when the actor is cast as the cut-in, grey when nominal."""
+                    width: int = PANEL_W,
+                    autonomy: Optional[Dict[str, str]] = None,
+                    scores: Optional[Dict[str, Dict[str, float]]] = None
+                    ) -> Dict[str, pygame.Rect]:
+    """Card with an 'orchestrator' banner and an intention matrix: one row per
+    actor, one column per intention (none | cut-in | block).  The cell of the
+    actor's assigned intention gets a green light; other cells stay hollow.
+
+    When `autonomy` is given ({actor_id: "auto"|"self"}), each row also gets
+    a small dropdown button showing the actor's governance; the returned dict
+    maps actor id -> that button's rect for click handling (empty otherwise).
+
+    When `scores` is given ({actor_id: {role_key: 0..1}}), each cell shows the
+    candidate score as a percentage next to its light — how well placed the
+    actor is to perform that intention right now.
+    """
     x, y = origin
     row_h = 26
     header_h = 28
-    pad = 10
-    h = header_h + pad + max(1, len(roles)) * row_h + pad
+    colhdr_h = 20
+    pad = 8
+    col_x0 = x + 142          # left edge of the intention columns
+    col_w = (width - (col_x0 - x) - 8) // len(ROLE_COLUMNS)
+    h = header_h + colhdr_h + max(1, len(roles)) * row_h + pad
     rect = pygame.Rect(x, y, width, h)
+    buttons: Dict[str, pygame.Rect] = {}
 
     pygame.draw.rect(surface, PANEL_BG, rect, border_radius=6)
     pygame.draw.rect(surface, (70, 74, 86), rect, 1, border_radius=6)
@@ -348,19 +587,50 @@ def draw_role_panel(surface: pygame.Surface,
                      border_top_left_radius=6, border_top_right_radius=6)
     surface.blit(font.render("orchestrator", True, TXT), (x + 10, y + 6))
 
-    yy = y + header_h + pad // 2
+    # column headers
+    hdr_y = y + header_h + 3
+    for i, (_, lbl) in enumerate(ROLE_COLUMNS):
+        cx = col_x0 + i * col_w + col_w // 2
+        t = font_sm.render(lbl, True, MUTED)
+        surface.blit(t, (cx - t.get_width() // 2, hdr_y))
+    # faint column separators
+    for i in range(len(ROLE_COLUMNS) + 1):
+        sx = col_x0 + i * col_w
+        pygame.draw.line(surface, (42, 46, 56),
+                         (sx, y + header_h + colhdr_h - 2),
+                         (sx, y + h - pad + 2))
+
+    yy = y + header_h + colhdr_h
     for aid, role in roles.items():
-        on = role == ROLE_CUTIN
-        cx, cy = x + 18, yy + row_h // 2
-        pygame.draw.circle(surface, DOT_ON if on else DOT_OFF, (cx, cy), 7)
-        pygame.draw.circle(surface, (20, 22, 28), (cx, cy), 7, 1)
         surface.blit(font_sm.render(f"actor {aid}", True, TXT),
-                     (x + 34, yy + 5))
-        tag = "cut-in" if on else "cruise"
-        tc = DOT_ON if on else MUTED
-        surface.blit(font_sm.render(tag, True, tc), (x + width - 58, yy + 5))
+                     (x + 12, yy + 5))
+        if autonomy is not None:
+            gov = autonomy.get(aid, "auto")
+            br = pygame.Rect(x + 80, yy + 3, 56, row_h - 6)
+            pygame.draw.rect(surface, (44, 48, 58), br, border_radius=4)
+            pygame.draw.rect(surface, (90, 94, 105), br, 1, border_radius=4)
+            gc = (120, 190, 235) if gov == "self" else MUTED
+            surface.blit(font_sm.render(gov, True, gc), (br.x + 5, br.y + 3))
+            # dropdown caret
+            tx, ty = br.right - 11, br.centery - 1
+            pygame.draw.polygon(surface, gc,
+                                [(tx - 4, ty - 2), (tx + 4, ty - 2), (tx, ty + 3)])
+            buttons[aid] = br
+        for i, (rkey, _) in enumerate(ROLE_COLUMNS):
+            val = scores.get(aid, {}).get(rkey) if scores else None
+            cx = col_x0 + i * col_w + (16 if val is not None else col_w // 2)
+            cy = yy + row_h // 2
+            if role == rkey:
+                pygame.draw.circle(surface, DOT_ON, (cx, cy), 7)
+                pygame.draw.circle(surface, (20, 22, 28), (cx, cy), 7, 1)
+            else:
+                pygame.draw.circle(surface, (58, 62, 72), (cx, cy), 7, 1)
+            if val is not None:
+                vc = DOT_ON if role == rkey else MUTED
+                t = font_sm.render(f"{val * 100.0:3.0f}%", True, vc)
+                surface.blit(t, (cx + 11, cy - t.get_height() // 2))
         yy += row_h
-    return rect
+    return buttons
 
 
 # --------------------------------------------------------------------------- #

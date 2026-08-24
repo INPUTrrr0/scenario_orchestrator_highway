@@ -529,6 +529,25 @@ class Actor:
     # Offsets are ego-relative; if the ego's script changes, the world place
     # moves with the ego but the relative cut-off stays the same.
     cutin: Optional[dict] = None
+    # block-cut-in constraint: {"t","duration","along","lat"} — the ego wants
+    # to change lanes and this actor denies the gap: it speeds up so that from
+    # time `t` through `t+duration` it holds a station `along` metres ahead /
+    # `lat` metres lateral of the ego (lat = the ego's target lane).  Missing
+    # t/duration/lat are auto-derived from the ego's first scripted
+    # lane_change.  The orchestrator moves this spec between fully-autonomous
+    # actors (role casting), just like `cutin`.
+    block: Optional[dict] = None
+    # nominal cruise speed (m/s). When set and no maneuvers are given in the
+    # YAML, a straight-cruise plan is auto-generated; after an unsuccessful
+    # cut-in the actor returns to this speed and keeps driving straight.
+    cruise: Optional[float] = None
+    # mixed autonomy — who governs this actor:
+    #   "auto": fully autonomous — no independent plan; follows whatever the
+    #           orchestrator casts (cut-in / nominal cruising)
+    #   "self": fully self-governed — executes only user-issued intents
+    #           (speed up, brake, cut-in pin, edited segments); the
+    #           orchestrator neither casts it nor touches its plan
+    autonomy: str = "auto"
     # filled by Scenario.simulate():
     cum: List[float] = field(default_factory=list)
     total: float = 0.0
@@ -558,10 +577,19 @@ class Actor:
         d = {"id": self.id, "color": list(self.color),
              "length": self.length, "width": self.width,
              "start": {"x": round(self.start[0], 4), "y": round(self.start[1], 4),
-                       "heading": round(self.start[2], 4)},
-             "maneuvers": [m.to_dict() for m in self.maneuvers]}
+                       "heading": round(self.start[2], 4)}}
+        if self.cruise is not None:
+            # cruise actors: maneuvers are derived (cruise plan / cut-in
+            # solver), so only the cruise speed is persisted
+            d["cruise"] = round(float(self.cruise), 4)
+        else:
+            d["maneuvers"] = [m.to_dict() for m in self.maneuvers]
         if self.cutin:
             d["cutin"] = {k: round(float(v), 4) for k, v in self.cutin.items()}
+        if self.block:
+            d["block"] = {k: round(float(v), 4) for k, v in self.block.items()}
+        if self.autonomy != "auto":
+            d["autonomy"] = self.autonomy
         return d
 
 
@@ -711,7 +739,9 @@ def load_scenario(path: str) -> Scenario:
     for ad in raw.get("actors", []):
         st = ad.get("start", {})
         cu = ad.get("cutin")
-        actors.append(Actor(
+        bl = ad.get("block")
+        cr = ad.get("cruise")
+        a = Actor(
             id=str(ad["id"]),
             color=tuple(ad.get("color", [200, 80, 80])),
             length=float(ad.get("length", 4.5)),
@@ -721,10 +751,21 @@ def load_scenario(path: str) -> Scenario:
             maneuvers=[_parse_segment(md, mapcfg.lane_width)
                        for md in ad.get("maneuvers", [])],
             cutin={k: float(v) for k, v in cu.items()} if cu else None,
-        ))
+            # `block: {}` means "derive everything from the ego's script"
+            block=(({k: float(v) for k, v in bl.items()} or {"along": 0.0})
+                   if bl is not None else None),
+            cruise=float(cr) if cr is not None else None,
+            autonomy=("self" if str(ad.get("autonomy", "auto")).lower()
+                      == "self" else "auto"),
+        )
+        if not a.maneuvers and a.cruise is not None:
+            a.maneuvers = cruise_plan(a.start, a.cruise,
+                                      duration=NOMINAL_CRUISE_T)
+        actors.append(a)
     sc = Scenario(map=mapcfg, actors=actors, pixels_per_meter=ppm)
     sc.simulate()
     resolve_cutins(sc)
+    resolve_blocks(sc)
     return sc
 
 
@@ -784,6 +825,41 @@ def world_to_ego_offset(ego_pose: Pose, wx: float, wy: float
     return dx * fx + dy * fy, dx * nx + dy * ny
 
 
+CUTIN_FEASIBLE_MIN_V = 2.0     # absolute floor for a viable chase speed
+CUTIN_FEASIBLE_EGO_FRAC = 0.6  # ...and no slower than this fraction of ego_v:
+#                                crawling far below the ego's speed to let the
+#                                pin catch up is not a cut-in — drop the role
+
+
+def live_cutin_required_speed(actor_pose: Pose, ego_x: float, ego_y: float,
+                              ego_theta: float, ego_v: float,
+                              spec: dict, now: float) -> Tuple[float, float]:
+    """(required cruise speed, t_rem) for `actor_pose` to reach the live
+    ego-relative pin by the deadline `spec.t` (same math as the chase solver:
+    the pin advances at ~ego_v, so v = ego_v + along_error / t_rem)."""
+    t_rem = closed_loop_cutin_horizon(spec, now)
+    wx, wy = live_cutin_pin(ego_x, ego_y, ego_theta,
+                            float(spec.get("along", 1.0)),
+                            float(spec.get("lat", 0.0)))
+    fx, fy = math.cos(ego_theta), math.sin(ego_theta)
+    err = (wx - actor_pose[0]) * fx + (wy - actor_pose[1]) * fy
+    return ego_v + err / max(t_rem, 0.4), t_rem
+
+
+def live_cutin_feasible(actor_pose: Pose, ego_x: float, ego_y: float,
+                        ego_theta: float, ego_v: float,
+                        spec: dict, now: float) -> bool:
+    """Can this actor still make the cut-in?  False when the deadline is (all
+    but) gone or the required speed is outside what a car would do — e.g. the
+    ego braked hard and the pin fell hopelessly far behind the actor."""
+    v_req, t_rem = live_cutin_required_speed(actor_pose, ego_x, ego_y,
+                                             ego_theta, ego_v, spec, now)
+    if t_rem <= 0.3:
+        return False
+    lo = max(CUTIN_FEASIBLE_MIN_V, CUTIN_FEASIBLE_EGO_FRAC * ego_v)
+    return lo <= v_req <= CUTIN_MAX_SPEED
+
+
 def closed_loop_cutin_horizon(spec: dict, now: float) -> float:
     """Seconds left until the cut-in deadline `spec.t`.
 
@@ -794,11 +870,23 @@ def closed_loop_cutin_horizon(spec: dict, now: float) -> float:
     return t_cut - now
 
 
+NOMINAL_CRUISE_T = 8.0     # scripted-playback length of a generated cruise plan
+
+
 def cruise_plan(start: Pose, speed: float, duration: float = 30.0
                 ) -> List[Maneuver]:
     """Straight cruise used after a successful merge or an abandoned cut-in."""
     return [Maneuver(type="go_straight", duration=float(duration),
                      intercept=max(speed, CUTIN_MIN_SPEED))]
+
+
+def actor_cruise_speed(a: Actor, default: float = 12.0) -> float:
+    """The speed an actor returns to when driving nominally."""
+    if a.cruise is not None:
+        return float(a.cruise)
+    if a.maneuvers and isinstance(a.maneuvers[0], Maneuver):
+        return max(float(a.maneuvers[0].intercept), CUTIN_MIN_SPEED)
+    return default
 
 
 def solve_closed_loop_cutin(start: Pose, pin_x: float, pin_y: float,
@@ -829,18 +917,20 @@ def solve_closed_loop_cutin(start: Pose, pin_x: float, pin_y: float,
     v = clamp(ego_v + along_err / t_rem, CUTIN_MIN_SPEED, CUTIN_MAX_SPEED)
     plan: List[Maneuver] = []
     need_lc = abs(lat_err) > 0.15
-    # short LC burst so replan ticks still make lateral progress
-    lat_rate = 2.5
-    lc = clamp(abs(lat_err) / lat_rate, 0.25, min(0.9, t_rem)) if need_lc else 0.0
-    # close a gap only when the pin is still ahead; if we're ahead of the pin,
-    # slow via v < ego_v and start the lane-change immediately
-    if along_err > 2.5 and t_rem > lc + 0.1:
-        t1 = t_rem - max(lc, 0.25)
-        plan.append(Maneuver(type="go_straight", duration=t1, intercept=v))
+    # LC burst sized against the ~0.05 s replan cadence: each replan restarts
+    # the smoothstep at zero lateral velocity, so only its first slice ever
+    # executes.  Early-smoothstep progress is ~3*(tau/lc)^2 * lat, hence
+    # lc = sqrt(3*lat*tau/R) yields an effective lateral rate of R ~ 2.5 m/s
+    # regardless of how large the remaining offset is.
+    lc = (clamp(math.sqrt(0.06 * abs(lat_err)), 0.12, min(0.9, t_rem))
+          if need_lc else 0.0)
+    # start the lane-change immediately: delaying it until the actor has
+    # caught the pin longitudinally burns the deadline (and never opens the
+    # conflict the collision-directive needs in order to clear the slot).
     if need_lc:
         plan.append(Maneuver(type="lane_change", duration=lc, intercept=v,
                              lateral_offset=lat_err))
-    if not plan:
+    else:
         plan.append(Maneuver(type="go_straight", duration=min(0.5, t_rem),
                              intercept=v))
     plan.append(Maneuver(type="go_straight", duration=float(tail),
@@ -916,6 +1006,137 @@ def resolve_cutins(sc: Scenario, ego_id: str = "0") -> bool:
     if changed:
         sc.simulate()
     return changed
+
+
+# --------------------------------------------------------------------------- #
+# Block-cut-in solver
+#
+# The ego wants to change lanes; the blocker denies the gap.  A `block` spec
+# {"t","duration","along","lat"} makes its holder speed up so that from time
+# `t` through `t+duration` it holds a station `along` metres ahead / `lat`
+# metres lateral of the ego — `lat` being the ego's target lane — so merging
+# into that lane is dangerous.  The blocker never steers: being alongside in
+# the target lane is the whole block.
+# --------------------------------------------------------------------------- #
+BLOCK_LEAD = 1.0      # be in position this long before the ego's lane change
+BLOCK_TAIL_PAD = 1.0  # keep blocking a little past the lane-change end
+
+
+def derive_block_spec(ego: Actor, spec: dict) -> bool:
+    """Fill missing t/duration/lat of a block spec from the ego's first
+    scripted lane_change.  Returns False when they cannot be determined."""
+    if all(k in spec for k in ("t", "duration", "lat")):
+        return True
+    t_acc = 0.0
+    for m in ego.maneuvers:
+        if isinstance(m, Maneuver) and m.type == "lane_change":
+            spec.setdefault("t", max(0.4, t_acc - BLOCK_LEAD))
+            spec.setdefault("duration",
+                            float(m.duration) + BLOCK_LEAD + BLOCK_TAIL_PAD)
+            spec.setdefault("lat", float(m.lateral_offset))
+            return True
+        t_acc += max(0.0, float(m.duration))
+    return False
+
+
+def block_window(spec: dict) -> Tuple[float, float]:
+    """(start, end) of the blocking window on the session clock."""
+    t0 = float(spec.get("t", 0.0))
+    return t0, t0 + float(spec.get("duration", 3.0))
+
+
+def block_world_target(ego: Actor, spec: dict) -> Tuple[float, float]:
+    """World hold-point of a scripted block at spec time `t`."""
+    t0 = max(0.0, float(spec.get("t", 0.0)))
+    ex, ey, eh = ego.pose_at_time(t0)
+    fx, fy, nx, ny = _heading_axes(eh)
+    along = float(spec.get("along", 0.0))
+    lat = float(spec.get("lat", 0.0))
+    return ex + along * fx + lat * nx, ey + along * fy + lat * ny
+
+
+def solve_block_maneuvers(start: Pose, ego: Actor, spec: dict,
+                          cruise_v: float, tail: float = 8.0
+                          ) -> List[Maneuver]:
+    """Longitudinal block plan: speed up to arrive alongside the ego when its
+    lane change starts, hold that station (ego speed) through the window,
+    then return to cruise."""
+    t0 = max(0.4, float(spec["t"]))
+    dur = max(0.5, float(spec.get("duration", 3.0)))
+    px, py = block_world_target(ego, spec)
+    sx, sy, sh = start
+    h = math.radians(sh)
+    d_along = (px - sx) * math.cos(h) + (py - sy) * math.sin(h)
+    v1 = clamp(d_along / t0, CUTIN_MIN_SPEED, CUTIN_MAX_SPEED)
+    k = max(0, min(int(round(t0 / DT)), len(ego.speeds) - 1))
+    v_e = ego.speeds[k] if ego.speeds else v1
+    return [Maneuver(type="go_straight", duration=t0, intercept=v1),
+            Maneuver(type="go_straight", duration=dur,
+                     intercept=max(v_e, CUTIN_MIN_SPEED)),
+            Maneuver(type="go_straight", duration=float(tail),
+                     intercept=max(cruise_v, CUTIN_MIN_SPEED))]
+
+
+def resolve_blocks(sc: Scenario, ego_id: str = "0") -> bool:
+    """Re-plan every actor carrying a `block` spec against the ego's current
+    script.  Returns True if any plan changed (scenario is re-simulated)."""
+    ego = next((a for a in sc.actors if a.id == ego_id), None)
+    targets = [a for a in sc.actors if a.block and a is not ego]
+    if ego is None or not targets:
+        return False
+    if not ego.traj:
+        sc.simulate()
+    changed = False
+    for a in targets:
+        spec = a.block
+        if not derive_block_spec(ego, spec):
+            continue
+        plan = solve_block_maneuvers(a.start, ego, spec,
+                                     actor_cruise_speed(a))
+        if not _same_plan(a.maneuvers, plan):
+            a.maneuvers = plan
+            changed = True
+    if changed:
+        sc.simulate()
+    return changed
+
+
+BLOCK_SAFE_GAP = 8.0  # m — a merge with less longitudinal clearance is unsafe
+
+
+def ego_lane_gap(blocker_pose: Pose, ex: float, ey: float,
+                 lane_width: float) -> Optional[float]:
+    """Longitudinal gap to the blocker when the ego's center is inside the
+    blocker's lane (measured in the blocker's lane-aligned frame), else None."""
+    bx, by, bh = blocker_pose
+    h = math.radians(bh)
+    lat = -(ex - bx) * math.sin(h) + (ey - by) * math.cos(h)
+    if abs(lat) >= 0.5 * lane_width:
+        return None
+    return abs((ex - bx) * math.cos(h) + (ey - by) * math.sin(h))
+
+
+def scripted_block_result(ego: Actor, blocker: Actor, spec: dict,
+                          lane_width: float) -> Optional[Tuple[bool, float]]:
+    """Grade a scripted block.  The scripted ego merges no matter what, so
+    success means it never found a safe gap: returns (denied, min_gap) where
+    min_gap is the smallest longitudinal clearance the ego has while inside
+    the blocker's lane during the window, and denied = min_gap < BLOCK_SAFE_GAP.
+    None when the ego never enters the lane in the window."""
+    if not ego.traj or not blocker.traj:
+        return None
+    t0, t_end = block_window(spec)
+    gap_min: Optional[float] = None
+    t = t0
+    while t <= t_end:
+        ex, ey, _ = ego.pose_at_time(t)
+        g = ego_lane_gap(blocker.pose_at_time(t), ex, ey, lane_width)
+        if g is not None:
+            gap_min = g if gap_min is None else min(gap_min, g)
+        t += 5 * DT
+    if gap_min is None:
+        return None
+    return gap_min < BLOCK_SAFE_GAP, gap_min
 
 
 def _validate_function(a: Actor, i: int, fn: Function, actor_ids: set) -> None:
@@ -1083,9 +1304,16 @@ class Persistence:
 def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             capture: Optional[str] = None, fps: int = 30, loops: int = 1,
             snapshot: Optional[str] = None, select_id: Optional[str] = None,
-            at_time: float = 0.0) -> None:
+            at_time: float = 0.0, auto_drive: bool = False,
+            on_frame: Optional[callable] = None) -> None:
     """Interactive editor; `capture` records an MP4 headlessly; `snapshot`
-    renders one paused frame (optionally with an actor selected) to a PNG."""
+    renders one paused frame (optionally with an actor selected) to a PNG.
+
+    Experiment hooks (used by experiment.py, no effect on normal use):
+      * auto_drive — enter Drive mode immediately on startup.
+      * on_frame(snapshot) — called every driving frame with a dict of the
+        live state (clock, ego pose+speed, per-actor displayed poses, cut-in /
+        block holders + outcomes).  Return False to end the run."""
     import pygame
 
     import cutin_orchestrator as co   # role casting: scoring + panel drawing
@@ -1138,12 +1366,21 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
     T = 0.0
     drive_mode = False
     live_ego: Optional[dict] = None      # {x,y,theta_rad,v} while Drive is on
+    drive_profile: Optional[List[float]] = None  # scripted ego v(t) to follow
+    #                                      hands-off in Drive; keys override
     cutin_committed = False
     cutin_outcome: Optional[str] = None  # "merged" | "abandoned" | None
-    cutin_phase = 0.0                    # time into cut-in actors' current plan
+    block_committed = False
+    # live/final block status: "breached" while ego is in the target lane
+    # (clears back to None / "feasible" if ego returns before the window ends);
+    # "blocked" | "breached" once committed at window end
+    block_outcome: Optional[str] = None
+    cutin_phase = 0.0                    # time into replanned actors' current plan
     # canonical spawn poses — closed-loop drive mutates Actor.start, so Reset
     # / re-enter Drive must restore from this snapshot (updated on spawn edits)
     spawn_poses: Dict[str, Pose] = {a.id: a.start for a in scenario.actors}
+    live_rebase: set = set()             # nominal actors the collision
+    #                                      directive has taken over (drive clock)
     selected: Optional[int] = None       # actor index
     man_index = 0                        # segment index within selected actor
     focus_field: Optional[str] = None    # field name | 'time' | 'nv:<node id>'
@@ -1172,6 +1409,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
     mouse_pos = (0, 0)
     # dropdown widget state: {'rect','items':[(label,payload)],'cb','scroll'}
     dropdown: Optional[dict] = None
+    # orchestrator-panel autonomy buttons: actor id -> rect (set each frame)
+    orch_buttons: Dict[str, "pygame.Rect"] = {}
     DD_ITEM_H = 22
     DD_MAX_VIS = 12
 
@@ -1256,13 +1495,16 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             persistence.log_structural(action, scenario.actors[selected].id, **extra)
 
     def maybe_resolve_cutins() -> None:
-        """Re-cast the cut-in role, then re-solve plans against the
+        """Re-cast the cut-in / block roles, then re-solve plans against the
         (possibly edited) ego script."""
         nonlocal man_index
         if drive_mode:
             return
         recast = cast_cutin_roles()
-        if (resolve_cutins(scenario) or recast) and selected is not None:
+        recast = cast_block_roles() or recast
+        changed = resolve_cutins(scenario)
+        changed = resolve_blocks(scenario) or changed
+        if (changed or recast) and selected is not None:
             n = len(scenario.actors[selected].maneuvers)
             if n:
                 man_index = min(man_index, n - 1)
@@ -1277,6 +1519,11 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         return next((a for a in scenario.actors
                      if a.id != "0" and a.cutin), None)
 
+    def block_holder() -> Optional[Actor]:
+        """The actor currently cast as the block-cut-in (owns the spec)."""
+        return next((a for a in scenario.actors
+                     if a.id != "0" and a.block), None)
+
     def cast_cutin_roles() -> bool:
         """Role casting: hand the cut-in spec to the best-placed actor.
 
@@ -1290,46 +1537,174 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         others = [a for a in scenario.actors if a.id != "0"]
         if ego is None or holder is None or len(others) < 2:
             return False
+        if holder.autonomy == "self":
+            return False   # user-owned intent — the orchestrator hands off
+        # only fully-autonomous actors without another role can be conscripted
+        cands = [a for a in others
+                 if a is not holder and a.autonomy != "self" and not a.block]
+        if not cands:
+            return False
+        lw = scenario.map.lane_width
         if drive_mode and live_ego is not None:
             e = live_ego
             ego_pose = (e["x"], e["y"], math.degrees(e["theta"]))
 
             def pose_of(a: Actor) -> Pose:
-                return a.pose_at_time(cutin_phase) if a.traj else a.start
+                # holder plans are rebased every replan tick (clock =
+                # cutin_phase); nominal actors still run their original
+                # script on the session clock T — same as the renderer
+                if a.cutin or a.block:
+                    return a.pose_at_time(cutin_phase) if a.traj else a.start
+                return a.pose_at_time(T % scenario.period)
 
-            # mid-chase the holder drifts toward the ego's lane, which tanks
-            # its *candidate* score — that is progress, not failure. Only
-            # recast once the holder is geometrically hopeless.
-            h_along, _h_lat = world_to_ego_offset(
-                ego_pose, pose_of(holder)[0], pose_of(holder)[1])
-            if -6.0 <= h_along <= 45.0:
+            # Recast only when the holder can no longer make the pin by the
+            # deadline (e.g. the ego braked hard and the pin fell hopelessly
+            # far behind the holder). Mid-chase the holder drifts toward the
+            # ego's lane, which tanks its *candidate* score — that is
+            # progress, not failure — so stickiness is on feasibility, not
+            # score.
+            spec = holder.cutin
+            if live_cutin_feasible(pose_of(holder), e["x"], e["y"],
+                                   e["theta"], e["v"], spec, T):
                 return False
+            feas = [a for a in cands
+                    if live_cutin_feasible(pose_of(a), e["x"], e["y"],
+                                           e["theta"], e["v"], spec, T)]
+            if not feas:
+                return False   # nobody can do it; holder abandons at deadline
+            scores = {a.id: co.score_cutin_candidate(pose_of(a), ego_pose, lw)
+                      for a in feas}
+            best = max(feas, key=lambda a: scores[a.id])
+            v_req, _ = live_cutin_required_speed(
+                pose_of(holder), e["x"], e["y"], e["theta"], e["v"], spec, T)
+            set_status(f"orchestrator: actor {holder.id} can't make the pin "
+                       f"(needs {v_req:.1f} m/s) — recast to {best.id}")
         else:
             ego_pose = ego.start
 
             def pose_of(a: Actor) -> Pose:
                 return a.start
-        lw = scenario.map.lane_width
-        scores = {a.id: co.score_cutin_candidate(pose_of(a), ego_pose, lw)
-                  for a in others}
-        best = max(others, key=lambda a: scores[a.id])
-        if best is holder or scores[best.id] <= 1.25 * scores[holder.id]:
-            return False
+
+            scores = {a.id: co.score_cutin_candidate(pose_of(a), ego_pose, lw)
+                      for a in cands + [holder]}
+            best = max(cands, key=lambda a: scores[a.id])
+            if scores[best.id] <= 1.25 * scores[holder.id]:
+                return False
+            set_status(f"orchestrator: cut-in recast {holder.id} -> {best.id} "
+                       f"(score {scores[best.id]:.2f} vs {scores[holder.id]:.2f})")
         # move the spec; the old holder goes back to nominal cruising
-        best.cutin, holder.cutin = holder.cutin, None
-        v = (holder.maneuvers[0].intercept
-             if holder.maneuvers and isinstance(holder.maneuvers[0], Maneuver)
-             else 12.0)
         if drive_mode:
-            p = pose_of(holder)
-            holder.start = (p[0], p[1], holder.start[2])
-            dur = 30.0
+            # capture current poses BEFORE the swap (pose_of branches on
+            # who owns the spec)
+            hp, bp = pose_of(holder), pose_of(best)
+        best.cutin, holder.cutin = holder.cutin, None
+        v = actor_cruise_speed(holder)
+        if drive_mode:
+            holder.start = (hp[0], hp[1], holder.start[2])
+            holder.maneuvers = cruise_plan(holder.start, v, duration=30.0)
+            # rebase the new holder to "now" so its first replan doesn't
+            # read a pose from its stale spawn-anchored script
+            best.start = bp
+            best.maneuvers = cruise_plan(bp, actor_cruise_speed(best),
+                                         duration=30.0)
+            scenario.simulate()
         else:
             dur = max(8.0, float(getattr(ego, "total", 0.0) or 8.0))
-        holder.maneuvers = cruise_plan(holder.start, v, duration=dur)
-        set_status(f"orchestrator: cut-in recast {holder.id} -> {best.id} "
-                   f"(score {scores[best.id]:.2f} vs {scores[holder.id]:.2f})")
+            holder.maneuvers = cruise_plan(holder.start, v, duration=dur)
         return True
+
+    def cast_block_roles() -> bool:
+        """Role casting for the block-cut-in: hand the `block` spec to the
+        fully-autonomous actor best placed to deny the ego's target-lane gap
+        (in the target lane, slightly behind the ego, so speeding up closes
+        the gap).  Same hysteresis / feasibility pattern as the cut-in."""
+        ego = ego_actor()
+        holder = block_holder()
+        others = [a for a in scenario.actors if a.id != "0"]
+        if ego is None or holder is None or len(others) < 2:
+            return False
+        if holder.autonomy == "self":
+            return False   # user-owned intent — the orchestrator hands off
+        cands = [a for a in others
+                 if a is not holder and a.autonomy != "self" and not a.cutin]
+        if not cands:
+            return False
+        spec = holder.block
+        if not derive_block_spec(ego, spec):
+            return False
+        lw = scenario.map.lane_width
+        target_lat = float(spec.get("lat", 0.0))
+        if drive_mode and live_ego is not None:
+            e = live_ego
+            ego_pose = (e["x"], e["y"], math.degrees(e["theta"]))
+
+            def pose_of(a: Actor) -> Pose:
+                if a.cutin or a.block:
+                    return a.pose_at_time(cutin_phase) if a.traj else a.start
+                return a.pose_at_time(T % scenario.period)
+
+            # sticky on feasibility: can the holder still reach / hold the
+            # station before the blocking window closes? (same chase math
+            # as the cut-in, deadline = end of window)
+            _, t_end = block_window(spec)
+            pseudo = {"t": t_end, "along": spec.get("along", 0.0),
+                      "lat": target_lat}
+            if live_cutin_feasible(pose_of(holder), e["x"], e["y"],
+                                   e["theta"], e["v"], pseudo, T):
+                return False
+            feas = [a for a in cands
+                    if live_cutin_feasible(pose_of(a), e["x"], e["y"],
+                                           e["theta"], e["v"], pseudo, T)]
+            if not feas:
+                return False   # nobody can block; holder releases at window end
+            scores = {a.id: co.score_block_candidate(pose_of(a), ego_pose,
+                                                     lw, target_lat)
+                      for a in feas}
+            best = max(feas, key=lambda a: scores[a.id])
+            set_status(f"orchestrator: actor {holder.id} can't hold the "
+                       f"block — recast to {best.id}")
+        else:
+            ego_pose = ego.start
+
+            def pose_of(a: Actor) -> Pose:
+                return a.start
+
+            scores = {a.id: co.score_block_candidate(pose_of(a), ego_pose,
+                                                     lw, target_lat)
+                      for a in cands + [holder]}
+            best = max(cands, key=lambda a: scores[a.id])
+            if scores[best.id] <= 1.25 * scores[holder.id]:
+                return False
+            set_status(f"orchestrator: block recast {holder.id} -> {best.id} "
+                       f"(score {scores[best.id]:.2f} vs "
+                       f"{scores[holder.id]:.2f})")
+        if drive_mode:
+            hp, bp = pose_of(holder), pose_of(best)
+        best.block, holder.block = holder.block, None
+        v = actor_cruise_speed(holder)
+        if drive_mode:
+            holder.start = (hp[0], hp[1], holder.start[2])
+            holder.maneuvers = cruise_plan(holder.start, v, duration=30.0)
+            best.start = bp
+            best.maneuvers = cruise_plan(bp, actor_cruise_speed(best),
+                                         duration=30.0)
+            scenario.simulate()
+        else:
+            dur = max(8.0, float(getattr(ego, "total", 0.0) or 8.0))
+            holder.maneuvers = cruise_plan(holder.start, v, duration=dur)
+        return True
+
+    def make_autonomy_cb(actor: Actor):
+        def cb(mode: str) -> None:
+            if actor.autonomy == mode:
+                return
+            actor.autonomy = mode
+            label = ("fully autonomous" if mode == "auto"
+                     else "fully self-governed")
+            set_status(f"actor {actor.id}: {label}")
+            if persistence:
+                persistence.log_structural("set_autonomy", actor.id, mode=mode)
+        return cb
 
     def remember_spawn(a: Actor) -> None:
         spawn_poses[a.id] = a.start
@@ -1342,7 +1717,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
 
     def enter_drive_mode() -> None:
         nonlocal drive_mode, playing, T, live_ego, cutin_committed, selected
-        nonlocal cutin_phase, cutin_outcome
+        nonlocal cutin_phase, cutin_outcome, drive_profile
+        nonlocal block_committed, block_outcome, live_rebase
         restore_spawns()
         ego = ego_actor()
         if ego is None:
@@ -1357,24 +1733,38 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
                     "theta": math.radians(ego.start[2]), "v": max(v0, 0.0)}
         cutin_committed = False
         cutin_outcome = None
+        block_committed = False
+        block_outcome = None
+        live_rebase = set()
         drive_mode = True
         playing = True
         selected = None
         resolve_cutins(scenario)   # seed plans; closed-loop takes over while driving
-        set_status("DRIVE ON — closed-loop cut-in; WASD/arrows; Drive to exit")
+        resolve_blocks(scenario)
+        # hands-off the live ego follows the scripted speed profile (so a
+        # scripted sudden slowdown plays out even in Drive); keys override
+        scenario.simulate()
+        drive_profile = list(ego.speeds) if ego.speeds else None
+        set_status("DRIVE ON — ego follows its script; WASD/arrows override")
 
     def exit_drive_mode() -> None:
         nonlocal drive_mode, playing, T, live_ego, cutin_committed, cutin_phase
-        nonlocal cutin_outcome
+        nonlocal cutin_outcome, drive_profile, block_committed, block_outcome
+        nonlocal live_rebase
         drive_mode = False
         live_ego = None
+        drive_profile = None
         cutin_committed = False
         cutin_outcome = None
+        block_committed = False
+        block_outcome = None
+        live_rebase = set()
         cutin_phase = 0.0
         playing = False
         T = 0.0
         restore_spawns()
         resolve_cutins(scenario)
+        resolve_blocks(scenario)
         set_status("DRIVE OFF — back to scripted playback")
 
     def toggle_drive_mode() -> None:
@@ -1400,58 +1790,203 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         e["y"] += e["v"] * math.sin(e["theta"]) * dt
 
     def live_resolve_cutins() -> None:
-        """Closed-loop cut-in: pin tracks the live ego; rebase + replan toward
-        the current pin until merge, or abandon once past deadline `t`."""
+        """Closed-loop orchestration while driving: the cut-in holder chases
+        its pin until merge / deadline, and the block holder speeds up to
+        hold a station in the ego's target lane until its window closes."""
         nonlocal cutin_committed, cutin_phase, man_index, cutin_outcome
-        if live_ego is None or cutin_committed:
+        nonlocal block_committed, block_outcome, live_rebase
+        if live_ego is None:
             return
         e = live_ego
-        changed = cast_cutin_roles()   # role may move while you drive
+        changed = False
+        replanned: set = set()
+        if not cutin_committed:
+            changed = cast_cutin_roles() or changed   # roles may move mid-drive
+        if not block_committed:
+            changed = cast_block_roles() or changed
         for a in scenario.actors:
-            spec = a.cutin
-            if not spec or a.id == "0":
+            if a.id == "0":
                 continue
-            if not a.traj:
-                scenario.simulate()
-            pose = a.pose_at_time(cutin_phase)
-            along = float(spec.get("along", 1.0))
-            lat = float(spec.get("lat", 0.0))
-            wx, wy = live_cutin_pin(e["x"], e["y"], e["theta"], along, lat)
-            start = (pose[0], pose[1], math.degrees(e["theta"]))
-            if cutin_is_merged(pose, wx, wy, e["theta"]):
+            if a.cutin and not cutin_committed:
+                spec = a.cutin
+                if not a.traj:
+                    scenario.simulate()
+                pose = a.pose_at_time(cutin_phase)
+                along = float(spec.get("along", 1.0))
+                lat = float(spec.get("lat", 0.0))
+                wx, wy = live_cutin_pin(e["x"], e["y"], e["theta"], along, lat)
+                # keep the actor's own plan-frame heading (lane-aligned):
+                # copying the ego's live heading would make the actor steer
+                # whenever the user steers.  a.start[2] is stable across
+                # replans (unlike pose[2], which carries the lane-change's
+                # temporary yaw mid-maneuver).
+                start = (pose[0], pose[1], a.start[2])
+                replanned.add(a.id)
+                if cutin_is_merged(pose, wx, wy, e["theta"]):
+                    a.start = start
+                    a.maneuvers = cruise_plan(start, e["v"])
+                    cutin_committed = True
+                    cutin_outcome = "merged"
+                    changed = True
+                    set_status("cut-in merged — actor matching ego")
+                    continue
+                t_rem = closed_loop_cutin_horizon(spec, T)
+                if t_rem <= 0.0:
+                    # deadline passed without a merge — drop the cut-in and
+                    # return to the actor's own cruise speed, straight ahead
+                    v_nom = actor_cruise_speed(a)
+                    a.start = start
+                    a.maneuvers = cruise_plan(start, v_nom)
+                    cutin_committed = True
+                    cutin_outcome = "abandoned"
+                    changed = True
+                    set_status(f"cut-in abandoned — past "
+                               f"t={float(spec['t']):.2f}s, "
+                               f"back to cruise {v_nom:.1f} m/s")
+                    continue
                 a.start = start
-                a.maneuvers = cruise_plan(start, e["v"])
-                cutin_committed = True
-                cutin_outcome = "merged"
-                cutin_phase = 0.0
+                a.maneuvers = solve_closed_loop_cutin(
+                    start, wx, wy, t_rem, e["v"],
+                    lc_duration=float(spec.get("lc_duration", 2.0)),
+                    tail=30.0)
                 changed = True
-                set_status("cut-in merged — actor matching ego")
-                continue
-            t_rem = closed_loop_cutin_horizon(spec, T)
-            if t_rem <= 0.0:
-                # deadline passed without a merge — drop the cut-in, cruise
+            elif a.block and not block_committed:
+                spec = a.block
+                if "t" not in spec or "lat" not in spec:
+                    continue   # underivable without an ego lane-change script
+                if not a.traj:
+                    scenario.simulate()
+                pose = a.pose_at_time(cutin_phase)
+                # blocker never steers: hold its own lane-aligned heading,
+                # never the ego's (see the cut-in branch note above)
+                start = (pose[0], pose[1], a.start[2])
+                t0, t_end = block_window(spec)
+                replanned.add(a.id)
+                gap = ego_lane_gap(start, e["x"], e["y"],
+                                   scenario.map.lane_width)
+                # live re-eval: ego in the target lane → BREACHED pin; if it
+                # lane-changes back before the window ends, flip to FEASIBLE
+                # and keep blocking (a temporary visit must not abort the role)
+                if gap is not None:
+                    if block_outcome != "breached":
+                        set_status(f"block BREACHED — ego in target lane "
+                                   f"(gap {gap:.1f} m); still holding until "
+                                   f"t={t_end:.1f}s")
+                    block_outcome = "breached"
+                else:
+                    if block_outcome == "breached":
+                        set_status("block FEASIBLE again — ego left the "
+                                   "target lane; still holding")
+                    block_outcome = None
+                if T > t_end:
+                    # finalize from the *current* occupancy: still in lane
+                    # → breached for good; otherwise the merge was denied
+                    v_nom = actor_cruise_speed(a)
+                    a.start = start
+                    a.maneuvers = cruise_plan(start, v_nom)
+                    block_committed = True
+                    if gap is not None:
+                        block_outcome = "breached"
+                        set_status(f"block FAILED — ego still in lane at "
+                                   f"t={t_end:.1f}s (gap {gap:.1f} m); "
+                                   f"back to cruise {v_nom:.1f} m/s")
+                    else:
+                        block_outcome = "blocked"
+                        set_status(f"block SUCCEEDED — merge denied through "
+                                   f"t={t_end:.1f}s; back to cruise "
+                                   f"{v_nom:.1f} m/s")
+                    changed = True
+                    continue
+                # chase / hold the station glued to the live ego: close the
+                # along-error by the window start, then track it tightly
+                wx, wy = live_cutin_pin(e["x"], e["y"], e["theta"],
+                                        float(spec.get("along", 0.0)),
+                                        float(spec.get("lat", 0.0)))
+                fx, fy = math.cos(e["theta"]), math.sin(e["theta"])
+                err = (wx - pose[0]) * fx + (wy - pose[1]) * fy
+                hz = max(t0 - T, 0.8)
+                v = clamp(e["v"] + err / hz, CUTIN_MIN_SPEED, CUTIN_MAX_SPEED)
                 a.start = start
-                a.maneuvers = cruise_plan(start, e["v"])
-                cutin_committed = True
-                cutin_outcome = "abandoned"
-                cutin_phase = 0.0
+                a.maneuvers = cruise_plan(start, v)
                 changed = True
-                set_status(f"cut-in abandoned — past t={float(spec['t']):.2f}s, cruising")
-                continue
-            plan = solve_closed_loop_cutin(
-                start, wx, wy, t_rem, e["v"],
-                lc_duration=float(spec.get("lc_duration", 2.0)),
-                tail=30.0)
-            a.start = start
-            a.maneuvers = plan
-            changed = True
         if changed:
+            # everyone rendered on the replan clock but NOT replanned this
+            # tick (e.g. a committed holder already cruising) must be rebased
+            # before the phase resets, or they would snap back in time
+            for a in scenario.actors:
+                if (a.id != "0" and (a.cutin or a.block or a.id in live_rebase)
+                        and a.id not in replanned):
+                    p = a.pose_at_time(cutin_phase)
+                    v = (a.maneuvers[0].intercept
+                         if a.maneuvers and isinstance(a.maneuvers[0], Maneuver)
+                         else actor_cruise_speed(a))
+                    a.start = p
+                    a.maneuvers = cruise_plan(p, v)
             cutin_phase = 0.0
             scenario.simulate()
             if selected is not None:
                 n = len(scenario.actors[selected].maneuvers)
                 if n:
                     man_index = min(man_index, n - 1)
+
+        # collision directive: predicted body overlap → lower-priority actor
+        # yields.  Owners (cut-in / block) outrank nominal traffic; among
+        # owners the panel score ("probability") of the held action decides.
+        # Example: cut-in owner blocked by a car in the target lane → that
+        # car is sped forward to open a safe gap.
+        def pose_at(a: Actor, t: float) -> Pose:
+            if a.cutin or a.block or a.id in live_rebase:
+                return a.pose_at_time(cutin_phase + t)
+            return a.pose_at_time((T + t) % scenario.period)
+
+        ego_a = ego_actor()
+        scores: Dict[str, Dict[str, float]] = {}
+        if ego_a is not None:
+            ego_pose = (e["x"], e["y"], math.degrees(e["theta"]))
+            lw = scenario.map.lane_width
+            bspec = next((a.block for a in scenario.actors if a.block), None)
+            target_lat = (float(bspec["lat"])
+                          if bspec and "lat" in bspec else None)
+            for a in scenario.actors:
+                if a.id == "0":
+                    continue
+                p = pose_at(a, 0.0)
+                d = {co.ROLE_CUTIN: co.score_cutin_candidate(p, ego_pose, lw)}
+                if target_lat is not None:
+                    d[co.ROLE_BLOCK] = co.score_block_candidate(
+                        p, ego_pose, lw, target_lat)
+                scores[a.id] = d
+        yields = co.resolve_actor_collisions(scenario.actors, pose_at, scores)
+        if yields:
+            # only the interferer is rewritten — the action owner keeps the
+            # plan just solved (lane-change / block hold).  After `changed`
+            # the phase is already 0 and starts are current; otherwise rebase
+            # the interferer from the pose it occupies *now*.
+            for inter, v, priv, t_hit in yields:
+                p = pose_at(inter, 0.0)
+                hd = inter.start[2] if len(inter.start) > 2 else p[2]
+                inter.start = (p[0], p[1], hd)
+                inter.maneuvers = cruise_plan(inter.start, v)
+                live_rebase.add(inter.id)
+            if not changed:
+                for a in scenario.actors:
+                    if a.id == "0" or a.id in {y[0].id for y in yields}:
+                        continue
+                    if a.cutin:
+                        continue   # never convert an in-progress cut-in to cruise
+                    if a.block or a.id in live_rebase:
+                        p = pose_at(a, 0.0)
+                        v = (a.maneuvers[0].intercept
+                             if a.maneuvers and isinstance(a.maneuvers[0], Maneuver)
+                             else actor_cruise_speed(a))
+                        a.start = (p[0], p[1], a.start[2] if len(a.start) > 2 else p[2])
+                        a.maneuvers = cruise_plan(a.start, v)
+                cutin_phase = 0.0
+            scenario.simulate()
+            set_status(
+                f"collision: actor {yields[0][0].id} yields to "
+                f"{yields[0][2].id} (hit in {yields[0][3]:.1f}s) → "
+                f"{yields[0][1]:.1f} m/s")
 
     # ---- dropdown widget (all multi-choice selection; nothing cycles) ----
     def open_dropdown(anchor: pygame.Rect, items: List[Tuple[str, object]], cb) -> None:
@@ -1524,9 +2059,9 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         i = len(scenario.actors)
         sx, sy, hd = spawn_pose_for(i)
         a = Actor(id=next_actor_id(), color=ADD_PALETTE[i % len(ADD_PALETTE)],
-                  length=4.5, width=2.0, start=(sx, sy, hd),
-                  maneuvers=[Maneuver(type="go_straight", duration=8.0,
-                                      intercept=12.0, slope=0.0)])
+                  length=4.5, width=2.0, start=(sx, sy, hd), cruise=12.0,
+                  maneuvers=cruise_plan((sx, sy, hd), 12.0,
+                                        duration=NOMINAL_CRUISE_T))
         scenario.actors.append(a)
         remember_spawn(a)
         scenario.simulate()
@@ -2145,15 +2680,34 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         lat = -dx * math.sin(h) + dy * math.cos(h)
         return abs(along) <= a.length / 2 + 0.5 and abs(lat) <= a.width / 2 + 0.5
 
-    def draw_actor(idx: int, a: Actor):
+    def displayed_pose(a: Actor) -> Pose:
+        """World pose an actor is drawn at this frame (also what the
+        experiment recorder samples, so records match the picture)."""
         if drive_mode and live_ego is not None and a.id == "0":
-            x, y = live_ego["x"], live_ego["y"]
-            hd = math.degrees(live_ego["theta"])
-        elif drive_mode and a.cutin:
-            x, y, hd = a.pose_at_time(cutin_phase)
-        else:
-            phase = T % scenario.period
-            x, y, hd = a.pose_at_time(phase)
+            return (live_ego["x"], live_ego["y"], math.degrees(live_ego["theta"]))
+        if drive_mode and (a.cutin or a.block or a.id in live_rebase):
+            return a.pose_at_time(cutin_phase)
+        return a.pose_at_time(T % scenario.period)
+
+    def build_frame_snapshot(dt: float) -> dict:
+        """State handed to the experiment `on_frame` hook each driving tick."""
+        e = live_ego or {"x": 0.0, "y": 0.0, "theta": 0.0, "v": 0.0}
+        ch, bh = cutin_holder(), block_holder()
+        return {
+            "T": T, "dt": dt, "period": scenario.period,
+            "ego": (e["x"], e["y"], math.degrees(e["theta"]), e["v"]),
+            "actors": {a.id: displayed_pose(a)
+                       for a in scenario.actors if a.id != "0"},
+            "cutin_holder": ch.id if ch else None,
+            "cutin_outcome": cutin_outcome,
+            "cutin_committed": cutin_committed,
+            "block_holder": bh.id if bh else None,
+            "block_outcome": block_outcome,
+            "block_committed": block_committed,
+        }
+
+    def draw_actor(idx: int, a: Actor):
+        x, y, hd = displayed_pose(a)
         pts = [w2s(*c) for c in actor_corners_world((x, y, hd), a)]
         pygame.draw.polygon(screen, a.color, pts)
         pygame.draw.polygon(screen, (20, 20, 20), pts, 1)
@@ -2220,6 +2774,57 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
                     f"cut-in @ t={t_c:.2f}s  "
                     f"+{along:.1f}m ahead / {lat:+.1f}m lat{note}",
                     True, col)
+                screen.blit(tag, (px + 14, py - 24))
+        # block-cut-in hold points ("no entry" marker in the ego's target lane)
+        for a in scenario.actors:
+            spec = a.block
+            if not spec or a.id == "0" or "t" not in spec or "lat" not in spec:
+                continue
+            t0, t_end = block_window(spec)
+            along = float(spec.get("along", 0.0))
+            lat = float(spec.get("lat", 0.0))
+            if drive_mode and live_ego is not None:
+                e = live_ego
+                ex, ey = e["x"], e["y"]
+                wx, wy = live_cutin_pin(ex, ey, e["theta"], along, lat)
+            else:
+                wx, wy = block_world_target(ego, spec)
+                ex, ey, _ = ego.pose_at_time(t0)
+            px, py = w2s(wx, wy)
+            if drive_mode and block_outcome == "blocked":
+                col = (90, 200, 120)
+                note = "  BLOCKED — merge denied"
+            elif drive_mode and block_outcome == "breached":
+                # live (window still open) or final (committed): same pin look
+                col = (140, 140, 150)
+                note = ("  BREACHED — ego in lane"
+                        if not block_committed
+                        else "  BREACHED — ego merged")
+            elif drive_mode and not block_committed:
+                col = (230, 95, 80)
+                note = "  FEASIBLE — holding"
+            else:
+                col = (230, 95, 80)
+                note = ""
+                if not drive_mode:
+                    # scripted grade: did the ego ever find a safe gap?
+                    res = scripted_block_result(ego, a, spec,
+                                                scenario.map.lane_width)
+                    if res is not None:
+                        denied, gap = res
+                        if denied:
+                            col = (90, 200, 120)
+                            note = f"  GAP DENIED — ego merges at {gap:.1f}m"
+                        else:
+                            note = f"  ineffective — ego finds {gap:.1f}m gap"
+            pygame.draw.line(screen, (col[0] // 2, col[1] // 2, col[2] // 2),
+                             w2s(ex, ey), (px, py), 1)
+            pygame.draw.circle(screen, col, (px, py), 9, 2)
+            pygame.draw.line(screen, col, (px - 6, py), (px + 6, py), 3)
+            if not playing or drive_mode:
+                tag = font_sm.render(
+                    f"block @ t={t0:.1f}s for {t_end - t0:.1f}s  "
+                    f"{lat:+.1f}m lat{note}", True, col)
                 screen.blit(tag, (px + 14, py - 24))
 
     def draw_button(rect, label, active=False, enabled=True):
@@ -2343,6 +2948,16 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
                 fname = persistence.save_version(scenario)
                 set_status(f"saved {fname} (parent v{persistence.versions[-1]['parent']})")
             return
+        # orchestrator-panel autonomy dropdowns (usable while driving too)
+        for aid, br in orch_buttons.items():
+            if br.collidepoint(mx, my):
+                actor = next((a for a in scenario.actors if a.id == aid), None)
+                if actor is not None:
+                    open_dropdown(br,
+                                  [("fully autonomous", "auto"),
+                                   ("fully self-governed", "self")],
+                                  make_autonomy_cb(actor))
+                return
         if drive_mode:
             return   # no scripted editing while driving
         if time_field.collidepoint(mx, my):
@@ -2517,13 +3132,46 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
 
     def draw_orch_panel():
         """Top-left role-casting card (only for orchestrated scenarios)."""
+        nonlocal orch_buttons
         others = [a for a in scenario.actors if a.id != "0"]
-        if not any(a.cutin for a in others):
+        if not any(a.cutin or a.block for a in others):
+            orch_buttons = {}
             return
-        roles = {a.id: (co.ROLE_CUTIN if a.cutin else co.ROLE_NOMINAL)
+        roles = {a.id: (co.ROLE_CUTIN if a.cutin
+                        else co.ROLE_BLOCK if a.block
+                        else co.ROLE_NOMINAL)
                  for a in others}
-        co.draw_role_panel(screen, font, font_sm, roles,
-                           origin=(36, TOPBAR_H + 36))
+        autonomy = {a.id: a.autonomy for a in others}
+        # per-cell candidate scores at the poses currently on screen
+        ego = ego_actor()
+        scores: Optional[Dict[str, Dict[str, float]]] = None
+        if ego is not None:
+            if drive_mode and live_ego is not None:
+                ego_pose = (live_ego["x"], live_ego["y"],
+                            math.degrees(live_ego["theta"]))
+            else:
+                ego_pose = ego.pose_at_time(T % scenario.period)
+            lw = scenario.map.lane_width
+            bspec = next((a.block for a in others if a.block), None)
+            target_lat = (float(bspec["lat"])
+                          if bspec and "lat" in bspec else None)
+
+            def pose_now(a: Actor) -> Pose:
+                if drive_mode and (a.cutin or a.block):
+                    return a.pose_at_time(cutin_phase)
+                return a.pose_at_time(T % scenario.period)
+
+            scores = {}
+            for a in others:
+                p = pose_now(a)
+                d = {co.ROLE_CUTIN: co.score_cutin_candidate(p, ego_pose, lw)}
+                if target_lat is not None:
+                    d[co.ROLE_BLOCK] = co.score_block_candidate(
+                        p, ego_pose, lw, target_lat)
+                scores[a.id] = d
+        orch_buttons = co.draw_role_panel(screen, font, font_sm, roles,
+                                          origin=(36, TOPBAR_H + 36),
+                                          autonomy=autonomy, scores=scores)
 
     def render_frame():
         draw_map()
@@ -2577,6 +3225,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         return
 
     # ---- interactive main loop ----
+    if auto_drive:
+        enter_drive_mode()          # experiment harness starts already driving
     running = True
     frame_i = 0
     while running:
@@ -2586,19 +3236,29 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             if drive_mode and live_ego is not None:
                 keys = pygame.key.get_pressed()
                 throttle = steer = 0.0
+                manual = False
                 if keys[pygame.K_UP] or keys[pygame.K_w]:
-                    throttle = 1.0
+                    throttle, manual = 1.0, True
                 elif keys[pygame.K_DOWN] or keys[pygame.K_s]:
-                    throttle = -1.0
+                    throttle, manual = -1.0, True
                 if keys[pygame.K_LEFT] or keys[pygame.K_a]:
                     steer = 1.0
                 elif keys[pygame.K_RIGHT] or keys[pygame.K_d]:
                     steer = -1.0
+                if not manual and drive_profile:
+                    # autopilot: track the scripted ego speed profile
+                    k = min(int(T / DT), len(drive_profile) - 1)
+                    err = drive_profile[k] - live_ego["v"]
+                    throttle = clamp(err / 1.5, -1.0, 1.0)
                 integrate_live_ego(throttle, steer, dt)
                 T += dt
                 cutin_phase += dt
                 if frame_i % 3 == 0:
                     live_resolve_cutins()
+                if on_frame is not None:
+                    # experiment recorder; may ask to end the run
+                    if on_frame(build_frame_snapshot(dt)) is False:
+                        running = False
             else:
                 T += dt
         mouse_pos = pygame.mouse.get_pos()

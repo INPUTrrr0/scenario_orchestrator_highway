@@ -204,11 +204,14 @@ class Drive:
         self.cutin_id: Optional[str] = None
         self.cutin_committed = False
         self.cutin_outcome: Optional[str] = None  # "merged" | "abandoned"
+        self.cutin_heading: Optional[float] = None  # actor's nominal lane heading
         if mode == "cutin":
             for a in self.asc.actors:
                 if getattr(a, "cutin", None):
                     self.cutin_spec = dict(a.cutin)
                     self.cutin_id = a.id
+                    self.cutin_heading = (a.start[2] if len(a.start) > 2
+                                          else 90.0)
                     break
         self.standing: Dict[str, tuple] = {}
         self.pursuer: Optional[str] = None      # the red-runner currently tracking the ego
@@ -366,7 +369,8 @@ class Drive:
         old_v = (a.maneuvers[0].intercept
                  if a.maneuvers and isinstance(a.maneuvers[0], se.Maneuver)
                  else 0.0)
-        status, msg = co.apply_closed_loop_cutin(a, self.ego, spec, self.clock_t)
+        status, msg = co.apply_closed_loop_cutin(a, self.ego, spec, self.clock_t,
+                                                 heading_deg=self.cutin_heading)
         self.asc = base
         self.atime = 0.0
         self.asc.simulate()

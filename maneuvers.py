@@ -84,7 +84,9 @@ def rebase_actor(a: se.Actor, tau: float) -> se.Actor:
         new_segs = tail + [copy.deepcopy(s) for s in segs[i + 1:]]
     return se.Actor(id=a.id, color=a.color, length=a.length, width=a.width,
                     start=pose, maneuvers=new_segs,
-                    cutin=copy.deepcopy(a.cutin) if a.cutin else None)
+                    cutin=copy.deepcopy(a.cutin) if a.cutin else None,
+                    block=copy.deepcopy(a.block) if a.block else None,
+                    cruise=a.cruise, autonomy=a.autonomy)
 
 
 def rebase_scenario(sc: se.Scenario, tau: float) -> se.Scenario:

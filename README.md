@@ -64,13 +64,130 @@ pin.
 
 ## Role casting (orchestrator panel)
 
-When a scenario has a `cutin` spec and several actors (see
-`scenario_cutin.yaml`), the editor shows an **orchestrator** card in the top
-left: one row per actor with a round dot — **green** = cast as the cut-in,
-**grey** = nominal (cruise straight). The orchestrator scores every non-ego
+When a scenario has a `cutin` or `block` spec and several actors (see
+`scenario_cutin.yaml`, `scenario_block_cutin.yaml`, or the combined
+`scenario_cutin_block.yaml`), the editor shows an **orchestrator** card in
+the top left: an *intention matrix* with one row per actor and one column
+per intention — **none | cut-in | block**. The cell of the actor's assigned
+intention gets a green light; unassigned cells stay hollow. Each cut-in /
+block cell also shows the actor's live candidate score as a percentage —
+how well placed it is to perform that intention *right now* (recomputed
+every frame against the on-screen poses, so you can watch the next-best
+candidate rise as the holder's score falls). The percentages are
+display-only; casting still uses the score + feasibility logic below.
+The orchestrator scores every non-ego
 actor (adjacent lane, ~14 m ahead of the ego is ideal) and hands the `cutin`
 spec to the best one; the previous holder goes back to cruising. Recasting
 happens when you edit spawns (with 1.25× hysteresis) and, while driving, when
 the current holder becomes geometrically hopeless (ego passed it or it fell
 far behind). The scoring lives in `cutin_orchestrator.py` and is shared with
 the standalone session.
+
+### Collision directive (yield / replan)
+
+While driving, the orchestrator also scans ~3 s of planned trajectories for
+**actor–actor body overlap** (oriented rectangles, with a small safety pad).
+On a predicted hit it replans the *lower-priority* actor and leaves the
+owner's plan alone:
+
+1. **Action owner first** — whoever currently holds `cutin` or `block`
+   outranks nominal traffic.
+2. **Then probability** — among owners (or among nominals), the panel
+   placement score of the held / best action breaks the tie.
+
+The yielder is sped *forward* if it is ahead of the owner (clear the merge
+slot and keep a ~2 m bumper gap) or slowed if it is behind.  Self-governed
+actors and an in-progress cut-in are never the ones rewritten.
+
+This is what unblocks `experiment.py --seed 4`: actor 2 owns the cut-in, actor
+1 sits in the target lane ahead, so actor 1 is pushed forward and actor 2
+keeps the lane change.
+
+### Block-cut-in (gap denial)
+
+The inverse action: the **ego** wants to change lanes, and the orchestrator
+casts one fully-autonomous actor as the *blocker* (orange dot / `block` tag)
+to make that merge dangerous.  A `block` spec on an actor —
+`{t, duration, along, lat}` — makes it speed up so that from `t` through
+`t+duration` it holds a station `along` m ahead / `lat` m lateral of the ego
+(`lat` = the ego's target lane).  `block: {}` auto-derives the window from
+the ego's first scripted `lane_change` (starts 1 s before it, `lat` = its
+lateral offset).  The blocker never steers; sitting alongside in the target
+lane is the block.  Casting prefers actors already in the target lane
+slightly behind the ego (see `score_block_candidate`); in Drive the role is
+recast if the holder can no longer reach the station before the window
+closes, and the blocker chases a live ego-glued station until the window ends.
+
+The outcome is graded on the block pin and in the status bar:
+
+* **Drive mode** — re-evaluated every replan tick while the window is open.
+  The pin flips to **BREACHED** (grey) whenever the ego's center is inside
+  the blocker's lane, and back to **FEASIBLE** (orange) if the ego
+  lane-changes out again before the window ends — a temporary visit does
+  not abort the block.  When the window closes the verdict is finalized:
+  **BLOCKED** (green) if the ego is outside the lane (merge denied), or
+  **BREACHED** if it is still inside; then the blocker falls back to cruise.
+* **Scripted playback** — the ego's script merges no matter what, so the
+  grade is whether it ever found a *safe* gap: **GAP DENIED** (green pin)
+  when the smallest clearance inside the lane during the window is under
+  8 m (`BLOCK_SAFE_GAP`), otherwise *ineffective* with the gap it found.
+
+Demo:
+
+```bash
+.venv/bin/python scenario_editor.py scenarios/scenario_block_cutin.yaml
+```
+
+### Mixed autonomy
+
+Each panel row has a governance dropdown next to the actor's name
+(clickable even while driving):
+
+- **fully autonomous** (`auto`, default) — the actor has no independent
+  plan; it follows whatever the orchestrator casts (cut-in or nominal
+  cruising).
+- **fully self-governed** (`self`) — the actor executes only user-issued
+  intents (edited segments, a dragged cut-in pin); the orchestrator never
+  conscripts it and never recasts a cut-in away from it.
+
+The mode persists in the YAML as `autonomy: self` on the actor (omitted
+when autonomous).
+
+## Experiment harness (recorded trials)
+
+`experiment.py` is a thin wrapper over the editor for collecting labelled
+driving trials — it does **not** modify the simulator (it only uses two new
+opt-in `run_gui` hooks, `auto_drive` and `on_frame`).  Each trial builds a
+*randomized* scenario from a single seed, drops you straight into Drive mode,
+and writes a JSON result.
+
+```bash
+# interactive: drive the ego (WASD / arrows); the trial auto-ends once the
+# cut-in and block resolve (or --max-time), and the result is saved
+.venv/bin/python experiment.py --seed 42
+# no window; the ego autopilots its scripted speed (handy for batch runs)
+.venv/bin/python experiment.py --seed 42 --headless --out experiments/run_42.json
+```
+
+Per trial, seeded from `--seed`:
+
+- a random **number of actors** (1–5, uniform) is spawned at random,
+  **non-overlapping** lane slots in a band around the ego (same-lane cars are
+  kept ≥ 7 m apart; different lanes never overlap);
+- one actor is cast as the **cut-in** and (traffic permitting) another as the
+  **block**, by the orchestrator's placement scores;
+- the orchestrator runs closed-loop while you drive.
+
+The layout (spawns + casting) is fully determined by the seed, so the same
+seed reproduces the same scene — the only variable is how you drive.  The
+output JSON records:
+
+- `seed`, `base_scenario`, `num_actors`, `spawns`, `cruise`, `cast`, `scores`;
+- `cutin` / `block`: `{performer, outcome, success, t_commit}` — success means
+  the cut-in **merged** / the block **denied the merge** (see the block grading
+  above);
+- `ego_trajectory` (`[t, x, y, heading_deg, v]`) and `actor_trajectories`
+  (`id -> [t, x, y, heading_deg]`), sampled at `--hz` (default 20 Hz).
+
+Results default to `experiments/run_<seed>.json`.  Flags: `--base`,
+`--hz`, `--max-time`, `--min-actors`, `--max-actors`, `--headless`.

@@ -1,0 +1,69 @@
+# Combined cut-in + block-cut-in on a straight 3-lane road.
+#
+# Two orchestrated intentions play out against the same ego (green):
+#   * actor 1 (red)  — CUT-IN: merges from the right lane to 6 m in front of
+#     the ego, completing at t=3s (green light in the "cut-in" column).
+#   * actor 3 (amber) — BLOCK: the ego wants to merge right at t=5s; the
+#     blocker speeds up to sit alongside in the target lane for the whole
+#     window, denying the gap (green light in the "block" column).
+# Everyone else is nominal ("none" column).
+#
+# Lanes (northbound, heading 90°): left x=-3.5, center x=0, right x=+3.5
+#
+# The `block` spec is auto-derived from the ego's scripted lane_change
+# (block: {}); the `cutin` spec is ego-relative at a fixed time.
+
+map:
+  kind: straight
+  num_lanes: 3
+  lane_width: 3.5
+  length: 120
+
+render:
+  pixels_per_meter: 6
+
+actors:
+  # Ego — center lane; cruises at 12, then wants to merge right at t=5s
+  - id: 0
+    color: [90, 190, 110]
+    length: 4.5
+    width: 2.0
+    start: {x: 0.0, y: -50.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 5.0, curve: {v0: 12.0, accel: 0.0}}
+      - {type: lane_change, duration: 2.0, lateral_offset: -3.5,
+         curve: {v0: 12.0, accel: 0.0}}
+      - {type: go_straight, duration: 3.0, curve: {v0: 12.0, accel: 0.0}}
+
+  # Cut-in — right lane ahead; merges in front of the ego by t=3s.
+  - id: 1
+    color: [210, 70, 60]
+    length: 4.5
+    width: 2.0
+    start: {x: 3.5, y: -38.0, heading: 90}
+    cruise: 12.0
+    cutin: {t: 3.0, along: 6.0, lat: 0.0, lc_duration: 2.0, tail: 4.0}
+
+  # Nominal traffic.
+  - id: 2
+    color: [80, 140, 220]
+    length: 4.5
+    width: 2.0
+    start: {x: -3.5, y: -34.0, heading: 90}
+    cruise: 12.0
+
+  # Blocker — right (target) lane, behind the ego; denies the ego's merge.
+  - id: 3
+    color: [240, 175, 65]
+    length: 4.5
+    width: 2.0
+    start: {x: 3.5, y: -58.0, heading: 90}
+    cruise: 11.5
+    block: {}
+
+  - id: 4
+    color: [170, 110, 220]
+    length: 4.5
+    width: 2.0
+    start: {x: -3.5, y: -62.0, heading: 90}
+    cruise: 12.0
