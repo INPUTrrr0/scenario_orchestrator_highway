@@ -14,10 +14,9 @@ Unified package merging former **v0–v4** features. **`v5/` is untouched** (pro
 | `orchestrator.py` | Headless closed-loop session runner |
 | `cutin_orchestrator.py` | Cut-in orchestrator: role casting + closed-loop cut-in (drive the ego, side panel shows cast roles) |
 | `drive.py` | Drive the ego (`--mode intersection` or `--mode cutin`) |
-| `scenarios/` | `scenario_v20.yaml`, `scenario_cutin.yaml`, `scenario_v1.yaml` |
+| `scenarios/` | `scenario_cutin.yaml`, `scenario_cutin_block.yaml`, `scenario_overtake.yaml`, `scenario_hard_brake.yaml`, `scenario_v20.yaml`, … |
 | `docs/` | Design notes from former versions |
 | `v5/` | Untouched proposal |
-| `archive/` | Former `v0`–`v4` trees; `session_line/` holds parked session UI / build_tree |
 
 ## Quick start
 
@@ -32,9 +31,11 @@ Unified package merging former **v0–v4** features. **`v5/` is untouched** (pro
 
 # cut-in orchestrator: random fleet, role casting, you drive the ego
 .venv/bin/python cutin_orchestrator.py --seed 1 --actors 4
-```
 
-Session editor UI / build_tree / render_demo live under `archive/session_line/` (parked).
+# ego-policy stress tests (you drive; scripts only set the stage)
+.venv/bin/python scenario_editor.py scenarios/scenario_overtake.yaml
+.venv/bin/python scenario_editor.py scenarios/scenario_hard_brake.yaml
+```
 
 ## Maneuver types
 
@@ -65,8 +66,8 @@ pin.
 ## Role casting (orchestrator panel)
 
 When a scenario has a `cutin` or `block` spec and several actors (see
-`scenario_cutin.yaml`, `scenario_block_cutin.yaml`, or the combined
-`scenario_cutin_block.yaml`), the editor shows an **orchestrator** card in
+`scenario_cutin.yaml` or the combined `scenario_cutin_block.yaml`), the
+editor shows an **orchestrator** card in
 the top left: an *intention matrix* with one row per actor and one column
 per intention — **none | cut-in | block**. The cell of the actor's assigned
 intention gets a green light; unassigned cells stay hollow. Each cut-in /
@@ -132,10 +133,11 @@ The outcome is graded on the block pin and in the status bar:
   when the smallest clearance inside the lane during the window is under
   8 m (`BLOCK_SAFE_GAP`), otherwise *ineffective* with the gap it found.
 
-Demo:
+Demo: the combined `scenario_cutin_block.yaml` casts both a cut-in and a
+blocker.
 
 ```bash
-.venv/bin/python scenario_editor.py scenarios/scenario_block_cutin.yaml
+.venv/bin/python scenario_editor.py scenarios/scenario_cutin_block.yaml
 ```
 
 ### Mixed autonomy
@@ -152,6 +154,30 @@ Each panel row has a governance dropdown next to the actor's name
 
 The mode persists in the YAML as `autonomy: self` on the actor (omitted
 when autonomous).
+
+## Ego-policy stress tests
+
+Two scenarios where the *actors* are fully scripted and the ego script is a
+plain constant-speed profile — it encodes **no policy**. Press **Drive / F**
+and drive the ego yourself (or hook up a policy under test); the scripts
+only set the stage, so nothing assumes what the ego will do.
+
+* **`scenario_overtake.yaml`** — the ego must go around a blocking object
+  using the opposite lane while dealing with oncoming traffic, without
+  colliding with either car. The blocker (red) drives ahead in the ego's
+  lane, brakes hard at t≈2.5 s and stays stopped; an oncoming car (blue)
+  runs southbound in the opposite lane and reaches the stopped car around
+  t≈8 s. Overtake early (tight gap in front of the oncoming car) or brake
+  and go around after it passes — both windows are deliberately tight.
+* **`scenario_hard_brake.yaml`** — the ego should lane-change to evade a
+  slow lead (red, 4 m/s, ~30 m ahead: ~3 s to contact at cruise speed)
+  while a normal-speed lead (amber, 10.5 m/s) in the adjacent lane squeezes
+  the merge gap. The ego must avoid hitting both cars while overtaking.
+
+```bash
+.venv/bin/python scenario_editor.py scenarios/scenario_overtake.yaml
+.venv/bin/python scenario_editor.py scenarios/scenario_hard_brake.yaml
+```
 
 ## Experiment harness (recorded trials)
 

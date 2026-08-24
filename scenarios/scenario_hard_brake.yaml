@@ -1,0 +1,55 @@
+# HARD_BRAKE — ego-policy stress test.
+#
+# The ego vehicle should perform a lane change to evade a leading vehicle
+# that is moving too slowly. Another leading vehicle in the adjacent lane
+# travels at normal speed. The ego must avoid hitting both cars while
+# overtaking.
+#
+#   * actor 1 (red)   — slow lead in the ego's lane (4 m/s): the ego closes
+#     at 8 m/s and must brake hard or change lanes within ~3 s.
+#   * actor 2 (amber) — normal-speed lead (10.5 m/s) in the adjacent lane,
+#     only ~12 m ahead of the ego: after the lane change the ego is still
+#     faster and keeps closing on it.
+#
+# The ego script is a plain constant-speed profile: it encodes NO policy.
+# Press Drive / F and drive the ego yourself (or hook up a policy).
+#
+# Lanes (heading 90° = north): left/adjacent x=-1.75, right/ego x=+1.75
+
+map:
+  kind: straight
+  num_lanes: 2
+  lane_width: 3.5
+  length: 160
+
+render:
+  pixels_per_meter: 6
+
+actors:
+  # Ego — right lane, constant 12 m/s profile (no scripted evasive action).
+  - id: 0
+    color: [90, 190, 110]
+    length: 4.5
+    width: 2.0
+    start: {x: 1.75, y: -60.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 12.0, accel: 0.0}}
+
+  # Slow lead — ego's lane, 30 m ahead, crawling at 4 m/s.
+  - id: 1
+    color: [210, 70, 60]
+    length: 4.5
+    width: 2.0
+    start: {x: 1.75, y: -30.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 4.0, accel: 0.0}}
+
+  # Normal-speed lead — adjacent lane, 12 m ahead, 10.5 m/s: squeezes the
+  # merge gap during the overtake.
+  - id: 2
+    color: [240, 175, 65]
+    length: 4.5
+    width: 2.0
+    start: {x: -1.75, y: -48.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 10.5, accel: 0.0}}

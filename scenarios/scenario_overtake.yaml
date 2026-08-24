@@ -1,0 +1,56 @@
+# OVERTAKE — ego-policy stress test.
+#
+# The ego vehicle must go around a blocking object using the OPPOSITE lane,
+# dealing with oncoming traffic, and avoid colliding with both cars.
+#
+#   * actor 1 (red)  — the blocking object: drives ahead of the ego in the
+#     same lane, then brakes hard and stays stopped for the rest of the run.
+#   * actor 2 (blue) — oncoming traffic in the opposite (left) lane,
+#     heading south (270°) straight at the overtake corridor.
+#
+# The ego script is a plain constant-speed profile: it encodes NO policy.
+# Press Drive / F and steer the ego yourself (or hook up a policy): swing
+# into the opposite lane before the oncoming car arrives, or wait for it to
+# pass and go around afterwards. Timing is tuned so both choices are tight.
+#
+# Lanes (heading 90° = north): left/opposite x=-1.75, right/ego x=+1.75
+
+map:
+  kind: straight
+  num_lanes: 2
+  lane_width: 3.5
+  length: 160
+
+render:
+  pixels_per_meter: 6
+
+actors:
+  # Ego — right lane, constant 12 m/s profile (no scripted evasive action).
+  - id: 0
+    color: [90, 190, 110]
+    length: 4.5
+    width: 2.0
+    start: {x: 1.75, y: -60.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 12.0, accel: 0.0}}
+
+  # Blocking object — cruises at 10, brakes hard to a stop (~y=-4), stays put.
+  - id: 1
+    color: [210, 70, 60]
+    length: 4.5
+    width: 2.0
+    start: {x: 1.75, y: -35.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 2.5, curve: {v0: 10.0, accel: 0.0}}
+      - {type: decelerate, duration: 1.25, curve: {v0: 10.0, accel: -8.0}}
+      - {type: stop, duration: 40.0}
+
+  # Oncoming traffic — opposite lane, southbound at 8 m/s, reaches the
+  # stopped car around t≈8s: overtake early or wait it out.
+  - id: 2
+    color: [80, 140, 220]
+    length: 4.5
+    width: 2.0
+    start: {x: -1.75, y: 60.0, heading: 270}
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 8.0, accel: 0.0}}
