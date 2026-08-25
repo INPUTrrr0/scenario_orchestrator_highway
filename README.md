@@ -1,14 +1,10 @@
-# Scenario Editor (flattened)
-
-Unified package merging former **v0–v4** features. **`v5/` is untouched** (proposal only).
-
-## What's here
+## Directory Structure
 
 | Module | Role |
 |--------|------|
 | `scenario_editor.py` | Sim + pygame editor (maneuvers, Functions, straight multi-lane map, `lane_change`) |
 | `maps.py` | Road layout (`MapConfig`) + pygame map drawing (straight / intersection) |
-| `directives.py` | Red-light family D1/D2/D3 (single-scene) |
+| `directives.py` | D1/D2/D3 (single-scene) |
 | `directives_script.py` | Script-grounded evaluate/repair for closed-loop |
 | `maneuvers.py` | Rebase / retime / reroute / perturbations |
 | `orchestrator.py` | Headless closed-loop session runner |
@@ -104,41 +100,6 @@ This is what unblocks `experiment.py --seed 4`: actor 2 owns the cut-in, actor
 1 sits in the target lane ahead, so actor 1 is pushed forward and actor 2
 keeps the lane change.
 
-### Block-cut-in (gap denial)
-
-The inverse action: the **ego** wants to change lanes, and the orchestrator
-casts one fully-autonomous actor as the *blocker* (orange dot / `block` tag)
-to make that merge dangerous.  A `block` spec on an actor —
-`{t, duration, along, lat}` — makes it speed up so that from `t` through
-`t+duration` it holds a station `along` m ahead / `lat` m lateral of the ego
-(`lat` = the ego's target lane).  `block: {}` auto-derives the window from
-the ego's first scripted `lane_change` (starts 1 s before it, `lat` = its
-lateral offset).  The blocker never steers; sitting alongside in the target
-lane is the block.  Casting prefers actors already in the target lane
-slightly behind the ego (see `score_block_candidate`); in Drive the role is
-recast if the holder can no longer reach the station before the window
-closes, and the blocker chases a live ego-glued station until the window ends.
-
-The outcome is graded on the block pin and in the status bar:
-
-* **Drive mode** — re-evaluated every replan tick while the window is open.
-  The pin flips to **BREACHED** (grey) whenever the ego's center is inside
-  the blocker's lane, and back to **FEASIBLE** (orange) if the ego
-  lane-changes out again before the window ends — a temporary visit does
-  not abort the block.  When the window closes the verdict is finalized:
-  **BLOCKED** (green) if the ego is outside the lane (merge denied), or
-  **BREACHED** if it is still inside; then the blocker falls back to cruise.
-* **Scripted playback** — the ego's script merges no matter what, so the
-  grade is whether it ever found a *safe* gap: **GAP DENIED** (green pin)
-  when the smallest clearance inside the lane during the window is under
-  8 m (`BLOCK_SAFE_GAP`), otherwise *ineffective* with the gap it found.
-
-Demo: the combined `scenario_cutin_block.yaml` casts both a cut-in and a
-blocker.
-
-```bash
-.venv/bin/python scenario_editor.py scenarios/scenario_cutin_block.yaml
-```
 
 ### Mixed autonomy
 
