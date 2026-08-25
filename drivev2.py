@@ -8,11 +8,34 @@ Same session as drive.py, but the ego is driven fully autonomously
 (Intelligent Driver Model) car-following policy: throttle/brake to keep a safe
 gap+headway behind whichever background actor is closest ahead and roughly in
 the ego's own lane, accelerating toward a desired cruise speed on an open road
-(Drive.idm_control). Lateral control is a pure-pursuit path-follower
-(Drive.path_steer) driving the ego along the route the scenario assumes for it
-— straight through the 4-way in "intersection" mode, hold-your-lane down the
-highway in "cutin" mode — the same geometry _world()'s ego-prediction uses, so
-the ego's real path and the orchestrator's predicted path agree.
+(Drive.idm_control). Lateral control is MOBIL (Minimizing Overall Braking
+Induced by Lane change), which decides *which lane* to be in
+(Drive.mobil_step). Both models score every option with the same IDM
+acceleration (Drive._idm_accel), which is what makes IDM+MOBIL a coherent pair
+rather than two bolted-together heuristics.
+
+MOBIL is a discrete model: its output is one bit — change lane or don't — and
+in the traffic simulations it comes from, a lane is an integer index and the
+change is instantaneous. There is no lateral position, heading or steering
+angle anywhere in it. Drive.begin_lane_change bridges that gap without a
+path-tracking controller: the decision starts a lateral displacement profile
+in time (the same smoothstep the repo's own `lane_change` maneuver uses), and
+Drive.lane_change_steer recovers the steering by *inverting the bicycle
+model* on that profile — the manoeuvre's own lateral acceleration gives the
+curvature, curvature gives the steering angle, plus a small proportional term
+for drift. So the overtake really is IDM for speed and MOBIL for everything
+lateral; there is no pure-pursuit follower, no reference polyline and no
+lookahead point.
+
+MOBIL refuses any lane carrying oncoming traffic (see scenario_overtake.yaml)
+— its algebra assumes same-direction lanes, so a true two-way overtake needs
+its own policy.
+
+On the intersection map MOBIL is inert (one lane per direction, nothing to
+change into) and the route is straight through the 4-way from an axis-aligned
+start, so the correct steering there is exactly zero. Restoring the left/right
+turn modes would need a real path-follower again — that is what the deleted
+pure-pursuit follower was for.
 
 Background actors stay open-loop maneuver scripts — they never sense the ego or
 each other directly. Every tick the orchestrator evaluates the red-light family
@@ -84,7 +107,7 @@ DELTA_MAX = math.radians(32)
 DRAG = 1.0                            # gentle coast deceleration
 
 # IDM (Intelligent Driver Model) — autonomous longitudinal ego control.
-# Steering is not an IDM concept; see Drive.idm_control / Drive.path_steer.
+# Steering is not an IDM concept; see Drive.idm_control / Drive.mobil_step.
 IDM_V0 = 12.0        # desired/free-flow cruise speed (m/s) — a comfortable
                      # target speed, distinct from V_MAX (the hard physical cap)
 IDM_V0_CUTIN = 13.0  # same, on the highway (matches the cut-in YAML's ego cruise,
@@ -96,6 +119,49 @@ IDM_T = 1.5          # desired time headway (s)
 IDM_DELTA = 4        # acceleration exponent (standard IDM value)
 IDM_LANE_TOL = 2.2   # lateral tolerance (m, in the ego's own heading frame)
                      # for "roughly in my lane" when looking for a leader
+
+# MOBIL (Minimizing Overall Braking Induced by Lane change) — autonomous
+# lateral *decisions* on the straight (highway) map: which lane to be in.
+# MOBIL picks a target lane; begin_lane_change/lane_change_steer turn that
+# decision into motion. Every acceleration it compares is an IDM acceleration
+# (_idm_accel), so the two models stay consistent — that pairing is the
+# standard IDM/MOBIL combination.
+MOBIL_P = 0.5            # politeness: how much a neighbour's accel change counts
+                         # against our own gain (0 = selfish, 1 = altruistic)
+MOBIL_A_THR = 0.15       # switching threshold (m/s^2) — the net gain a change
+                         # must beat, so we don't swap lanes over rounding noise
+MOBIL_B_SAFE = 4.0       # hard safety limit (m/s^2): never force the vehicle
+                         # behind us in the target lane to brake harder than this
+MOBIL_BIAS_RIGHT = 0.15  # keep-right bias (m/s^2): makes moving right cheaper
+                         # and moving left dearer, so the ego drifts back right
+                         # after a pass instead of camping in the fast lane
+MOBIL_MIN_INTERVAL = 2.0  # s of cooldown after a committed change (hysteresis)
+MOBIL_V_MIN = 3.0        # m/s: below this, hold the lane. MOBIL is a highway
+                         # model — swapping lanes at walking pace isn't a real
+                         # manoeuvre, and it's exactly where pure pursuit
+                         # saturates (short lookahead + a full lane of offset
+                         # demands more steering angle than DELTA_MAX)
+MOBIL_SETTLE_TOL = 0.35  # m: only re-decide once we're this close to the centre
+                         # of the lane we're already heading for
+
+# Lane-change trajectory — how MOBIL's yes/no decision becomes motion. MOBIL
+# itself has no lateral state (see Drive.begin_lane_change), so the manoeuvre
+# is a lateral displacement profile in time, and the steering that realises it
+# is recovered by inverting the bicycle model (Drive.lane_change_steer).
+LC_DISTANCE = 30.0       # m of road covered by one full lane change. The
+                         # profile advances with DISTANCE, not wall-clock time,
+                         # which is what makes it robust: IDM can brake to a
+                         # crawl mid-change (it does, behind a cut-in), and a
+                         # time-based profile would then demand the same
+                         # sideways motion with no forward speed left to do it
+                         # with — heading blows up and the steering saturates.
+                         # On distance, curvature works out to
+                         # d*S''(f)/LC_DISTANCE^2: entirely speed-independent,
+                         # and lateral motion simply stops when the car does.
+LC_LAT_KP = 0.35         # feedback gain (1/m) on residual lateral error, so
+                         # discretisation drift doesn't accumulate
+LC_YAW_MAX = math.radians(14.0)   # cap on the heading excursion we ask for
+EGO_LEN = 4.5            # the ego body length this file draws/collides with
 
 SIGNALS = {"N": "green", "S": "green", "E": "red", "W": "red"}
 ACTOR_COLORS = [(210, 90, 80), (240, 175, 65), (80, 140, 220), (170, 110, 220),
@@ -225,7 +291,18 @@ class Drive:
         # desired cruise speed + the route the ego intends to drive; both are
         # fixed for the session, so build the reference path once, up front
         self.idm_v0 = IDM_V0_CUTIN if mode == "cutin" else IDM_V0
-        self._ref_path = self._build_reference_path()   # for path_steer()
+        # MOBIL state — straight (highway) map only; an intersection arm has a
+        # single lane per direction, so there is nothing to change into
+        self._road_theta = self.ego.theta      # lane direction, fixed for the
+                                               # session (the ego's heading
+                                               # tilts mid-change; lanes don't)
+        self.lanes = self._lane_centers()      # world x of each lane centre
+        self.target_lane = (self._lane_index(self.ego.x) if self.lanes else None)
+        self.mobil_cooldown = 0.0
+        self.mobil_msg = ""
+        self.n_lane_changes = 0
+        # active lane-change manoeuvre (None when tracking a lane centre)
+        self.lc: Optional[dict] = None
         self.atime = 0.0                 # elapsed since the actors' last re-base
         self.clock_t = 0.0               # absolute session time (never rebased)
         # cut-in constraint (ego-relative at fixed t) — tracked here since
@@ -341,6 +418,24 @@ class Drive:
         (gap, v_lead) bumper-to-bumper — gap floored at 0.5m to keep the IDM
         formula's division well-behaved — or (None, None) if nothing
         qualifies (open road: IDM reduces to accelerating toward idm_v0)."""
+        if self.lanes:
+            # Highway: ask by lane, in the ROAD frame. Using the ego's own
+            # heading here would be wrong mid-change — a 14deg yaw excursion
+            # throws the lateral test by >4m at 20m ahead, i.e. more than a
+            # lane, so the ego would track a car in the wrong lane exactly
+            # when it can least afford to. During a change both the lane we
+            # are leaving and the one we are entering can block us, so take
+            # whichever leader is closer.
+            cands = {self.target_lane, self._lane_index(self.ego.x)}
+            best = None
+            for li in cands:
+                lead, _, _ = self._lane_neighbors(self.lanes[li])
+                if lead is None:
+                    continue
+                g = self._gap_to(lead)
+                if best is None or g < best[0]:
+                    best = (g, lead[1])
+            return best if best else (None, None)
         e = self.ego
         ch, sh = math.cos(e.theta), math.sin(e.theta)
         self.asc.simulate()
@@ -360,99 +455,336 @@ class Drive:
                 best_v = a.speeds[kk]
         return best_gap, best_v
 
+    def _idm_accel(self, v: float, gap: Optional[float] = None,
+                   v_lead: Optional[float] = None,
+                   v0: Optional[float] = None) -> float:
+        """The IDM acceleration (m/s^2) for a vehicle at speed `v` with a
+        leader `gap` metres ahead doing `v_lead` — or on an open road when
+        `gap` is None. Factored out of idm_control because MOBIL has to ask
+        the same question about *hypothetical* worlds ("what would that car
+        behind me in the left lane be doing if I merged in front of it?"),
+        and the comparison is only meaningful if both sides come from the
+        identical formula. `v0` defaults to the ego's desired speed."""
+        v0 = self.idm_v0 if v0 is None else max(v0, 1.0)
+        free = IDM_A * (1.0 - (max(v, 0.0) / v0) ** IDM_DELTA)
+        if gap is None or v_lead is None:
+            return free
+        dv_rel = v - v_lead
+        s_star = IDM_S0 + max(0.0, v * IDM_T
+                              + (v * dv_rel) / (2.0 * math.sqrt(IDM_A * IDM_B)))
+        return free - IDM_A * (s_star / max(gap, 0.5)) ** 2
+
     def idm_control(self) -> float:
         """Autonomous longitudinal control via the Intelligent Driver Model:
         accelerate toward self.idm_v0, braking as needed for a safe
         gap+headway behind the leader from _idm_leader (or freely toward
         idm_v0 if there is none). IDM is a *longitudinal* car-following model
-        only — it has no notion of steering; see path_steer for that.
+        only — it has no notion of steering; see mobil_step for that.
         Returns a throttle in [-1, 1] (negative = brake): the IDM
         acceleration mapped through this car's A_THROTTLE / A_BRAKE."""
-        v = self.ego.v
         gap, v_lead = self._idm_leader()
-        if gap is None:
-            accel = IDM_A * (1.0 - (v / self.idm_v0) ** IDM_DELTA)
-        else:
-            dv_rel = v - v_lead
-            s_star = IDM_S0 + max(0.0, v * IDM_T
-                                  + (v * dv_rel) / (2.0 * math.sqrt(IDM_A * IDM_B)))
-            accel = IDM_A * (1.0 - (v / self.idm_v0) ** IDM_DELTA
-                             - (s_star / gap) ** 2)
+        accel = self._idm_accel(self.ego.v, gap, v_lead)
         if accel >= 0:
             return max(0.0, min(1.0, accel / A_THROTTLE))
         return max(-1.0, min(0.0, accel / A_BRAKE))
 
-    # ---- path-following steering (straight through the 4-way in
-    # intersection mode; hold the spawn lane in cutin mode) ---- #
-    LOOKAHEAD_MIN = 3.0
-    LOOKAHEAD_MAX = 12.0
-    LOOKAHEAD_GAIN = 0.6   # lookahead = clip(GAIN*v + MIN, MIN, MAX)
+    # ---- MOBIL lane-change decisions (straight/highway map only) ---- #
+    def _lane_centers(self) -> List[float]:
+        """World x of every lane centre, or [] on a map without lanes to
+        change between (the intersection arms are one lane per direction)."""
+        m = self.asc.map
+        if getattr(m, "kind", "intersection") != "straight":
+            return []
+        return [m.lane_center_x(i) for i in range(max(1, m.num_lanes))]
 
-    def _build_reference_path(self, step: float = 0.25) -> List[Tuple[float, float]]:
-        """Dense (x,y) waypoints for the ego's intended route this session,
-        built once at spawn time from the ego's start pose.
+    def _lane_index(self, x: float) -> int:
+        """Index of the lane whose centre is nearest world-x `x`."""
+        return min(range(len(self.lanes)), key=lambda i: abs(self.lanes[i] - x))
 
-        On a straight map (cutin) the intended route is just "keep going" —
-        build_route_maneuvers is intersection geometry and doesn't apply — so
-        the path is a ray along the start heading, run out past the end of the
-        road. On the intersection map it reuses the exact same route geometry
-        (mv.build_route_maneuvers, straight through) that _world()'s
-        ego-prediction assumes, so the path the ego actually drives and the
-        path the orchestrator predicts for it agree with each other. The
-        path's SHAPE is speed-invariant (only timing scales with speed), so
-        building it with speed=1.0 makes elapsed maneuver-time equal
-        arc-length traveled — a convenient way to sample evenly without
-        needing the real drive speed."""
+    def _lane_actors(self, lane_x: float):
+        """Every background actor currently in the lane centred on `lane_x`,
+        as (fwd, v, length, opposing) — `fwd` is the signed along-road offset
+        of its centre from the ego's (+ = ahead), and `opposing` flags a car
+        pointing back at us.
+
+        Membership is by BODY OVERLAP, not by which lane centre the car is
+        nearest, so a car mid-merge belongs to *both* lanes it is straddling.
+        A centre-point test instead teleports a merging car from one lane to
+        the other the instant it crosses the lane line, and that single-frame
+        flip is enough to fool MOBIL badly: the lane the merger is vacating
+        reads as empty while its body is still sitting in it, and the ego
+        dives into occupied space. Overlap keeps the merger in both lanes
+        until it has genuinely cleared one. Well-centred cars are unaffected
+        — on a 3.5m grid the adjacent centre is 3.5m away, past the
+        1.75+width/2 threshold."""
         e = self.ego
-        if getattr(self.asc.map, "kind", "intersection") == "straight":
-            span = self.asc.map.length + 40.0
-            ch, sh = math.cos(e.theta), math.sin(e.theta)
-            n = max(2, int(span / step))
-            return [(e.x + ch * step * i, e.y + sh * step * i) for i in range(n + 1)]
-        lw, arm = self.asc.map.lane_width, self.asc.map.arm_length
-        man = mv.build_route_maneuvers(e.x, e.y, 90.0, 1.0, "straight", lw, arm)
-        pts: List[Tuple[float, float]] = []
-        pose = (e.x, e.y, 90.0)
-        for m in man:
-            n = max(2, int(m.duration / step))
-            for k in range(n + 1):
-                x, y, _ = m.pose_at(pose, m.duration * k / n)
-                pts.append((x, y))
-            pose = m.end_pose(pose)
-        return pts
+        ch, sh = math.cos(self._road_theta), math.sin(self._road_theta)
+        half_lane = self.asc.map.lane_width / 2.0
+        self.asc.simulate()
+        k = int(round(self.atime / se.DT))
+        out = []
+        for a in self.asc.actors:
+            kk = max(0, min(k, len(a.traj) - 1))
+            ax, ay, ahd = a.traj[kk]
+            dx, dy = ax - e.x, ay - e.y
+            # lateral coord on a +y road is world x
+            if abs(ax - lane_x) > half_lane + a.width / 2.0:
+                continue
+            fwd = dx * ch + dy * sh
+            opposing = math.cos(math.radians(ahd) - self._road_theta) < 0.0
+            out.append((fwd, a.speeds[kk], a.length, opposing))
+        return out
 
-    def path_steer(self) -> float:
-        """Pure-pursuit steering toward a lookahead point on the reference
-        path (_build_reference_path): find the closest path point to the
-        ego's current position, walk forward along the path by a
-        speed-scaled lookahead distance, and steer toward that target.
-        Standard, simple, and robust for this speed range."""
-        path, e = self._ref_path, self.ego
-        best_i, best_d2 = 0, float("inf")
-        for i, (px, py) in enumerate(path):
-            d2 = (px - e.x) ** 2 + (py - e.y) ** 2
-            if d2 < best_d2:
-                best_d2, best_i = d2, i
-        lookahead = max(self.LOOKAHEAD_MIN,
-                        min(self.LOOKAHEAD_MAX,
-                            self.LOOKAHEAD_GAIN * e.v + self.LOOKAHEAD_MIN))
-        tgt = path[-1]
-        acc = 0.0
-        for i in range(best_i, len(path) - 1):
-            acc += math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
-            if acc >= lookahead:
-                tgt = path[i + 1]
-                break
-        alpha = math.atan2(tgt[1] - e.y, tgt[0] - e.x) - e.theta
-        delta = math.atan2(2.0 * WHEELBASE * math.sin(alpha), lookahead)
+    def _lane_neighbors(self, lane_x: float):
+        """(leader, follower, oncoming) for the lane centred on `lane_x`.
+        Leader/follower are the nearest actor ahead of / behind the ego in
+        that lane as (fwd, v, length), or None. `oncoming` is True if any car
+        in the lane points back at us — that makes the lane a contraflow lane
+        (see scenario_overtake.yaml) and MOBIL refuses it outright, because
+        its whole incentive/safety algebra assumes same-direction traffic."""
+        lead = fol = None
+        oncoming = False
+        for fwd, v, ln, opp in self._lane_actors(lane_x):
+            if opp:
+                oncoming = True
+            if fwd > 0 and (lead is None or fwd < lead[0]):
+                lead = (fwd, v, ln)
+            elif fwd <= 0 and (fol is None or fwd > fol[0]):
+                fol = (fwd, v, ln)
+        return lead, fol, oncoming
+
+    @staticmethod
+    def _gap_between(rear, front) -> Optional[float]:
+        """Bumper-to-bumper gap between two (fwd, v, length) records, rear
+        behind front. None when there is no vehicle in front."""
+        if front is None:
+            return None
+        if rear is None:
+            return None
+        return max(front[0] - rear[0] - front[2] / 2.0 - rear[2] / 2.0, 0.5)
+
+    def _gap_to(self, lead) -> Optional[float]:
+        """Ego's bumper-to-bumper gap to a (fwd, v, length) leader."""
+        if lead is None:
+            return None
+        return max(lead[0] - lead[2] / 2.0 - EGO_LEN / 2.0, 0.5)
+
+    def _gap_from(self, fol) -> Optional[float]:
+        """A (fwd, v, length) follower's bumper-to-bumper gap to the ego."""
+        if fol is None:
+            return None
+        return max(-fol[0] - fol[2] / 2.0 - EGO_LEN / 2.0, 0.5)
+
+    def _mobil_evaluate(self, cur_x: float, tgt_x: float, to_right: bool):
+        """MOBIL's two tests for moving from the lane at `cur_x` to the one at
+        `tgt_x`. Returns (ok, gain, reason).
+
+        Safety:    the new follower, once we are in front of it, must not be
+                   forced to brake harder than MOBIL_B_SAFE.
+        Incentive: our own acceleration gain, plus MOBIL_P times the gain we
+                   inflict on the two followers, must beat the switching
+                   threshold (raised/lowered by the keep-right bias).
+
+        Background actors here are open-loop constant-speed scripts, so a
+        neighbour's "desired speed" is simply the speed it is holding — that
+        makes an unobstructed follower's IDM acceleration 0, which is exactly
+        what its script does. They also never actually react to us; the
+        politeness term therefore models courtesy the traffic won't
+        reciprocate, while the safety term is what genuinely protects them."""
+        v_e = self.ego.v
+        lead_c, fol_c, _ = self._lane_neighbors(cur_x)
+        lead_t, fol_t, oncoming = self._lane_neighbors(tgt_x)
+        if oncoming:
+            return False, 0.0, "oncoming traffic"
+
+        # --- us: before (staying) vs after (merged) ---
+        a_e_cur = self._idm_accel(v_e, self._gap_to(lead_c),
+                                  lead_c[1] if lead_c else None)
+        a_e_new = self._idm_accel(v_e, self._gap_to(lead_t),
+                                  lead_t[1] if lead_t else None)
+
+        # --- new follower: before (following lead_t) vs after (following us) ---
+        if fol_t is None:
+            a_nf_cur = a_nf_new = 0.0
+        else:
+            a_nf_cur = self._idm_accel(fol_t[1], self._gap_between(fol_t, lead_t),
+                                       lead_t[1] if lead_t else None, v0=fol_t[1])
+            a_nf_new = self._idm_accel(fol_t[1], self._gap_from(fol_t), v_e,
+                                       v0=fol_t[1])
+            if a_nf_new < -MOBIL_B_SAFE:
+                return False, 0.0, "unsafe for follower (%.1f m/s^2)" % a_nf_new
+
+        # --- old follower: before (following us) vs after (following lead_c) ---
+        if fol_c is None:
+            a_of_cur = a_of_new = 0.0
+        else:
+            a_of_cur = self._idm_accel(fol_c[1], self._gap_from(fol_c), v_e,
+                                       v0=fol_c[1])
+            a_of_new = self._idm_accel(fol_c[1], self._gap_between(fol_c, lead_c),
+                                       lead_c[1] if lead_c else None, v0=fol_c[1])
+
+        gain = ((a_e_new - a_e_cur)
+                + MOBIL_P * ((a_nf_new - a_nf_cur) + (a_of_new - a_of_cur)))
+        thr = MOBIL_A_THR + (-MOBIL_BIAS_RIGHT if to_right else MOBIL_BIAS_RIGHT)
+        if gain <= thr:
+            return False, gain, "gain %.2f <= threshold %.2f" % (gain, thr)
+        return True, gain, "gain %.2f > threshold %.2f" % (gain, thr)
+
+    def mobil_step(self) -> None:
+        """Pick this tick's target lane. Only re-decides once the previous
+        change has settled (the ego is within MOBIL_SETTLE_TOL of its target
+        lane centre) and the cooldown has expired, so the ego commits to a
+        manoeuvre instead of dithering on the lane line. Committing hands
+        off to begin_lane_change, which starts the lateral profile that
+        lane_change_steer then turns into steering."""
+        if not self.lanes or len(self.lanes) < 2:
+            return
+        self.mobil_cooldown = max(0.0, self.mobil_cooldown - DT)
+        tgt_x = self.lanes[self.target_lane]
+        if (self.mobil_cooldown > 0.0
+                or self.ego.v < MOBIL_V_MIN
+                or abs(self.ego.x - tgt_x) > MOBIL_SETTLE_TOL):
+            return                      # crawling, or mid-change: let it finish
+        cur = self.target_lane
+        best = None
+        for cand in (cur - 1, cur + 1):
+            if not 0 <= cand < len(self.lanes):
+                continue
+            to_right = cand > cur       # +x is the ego's right on a +y road
+            ok, gain, why = self._mobil_evaluate(self.lanes[cur],
+                                                 self.lanes[cand], to_right)
+            if ok and (best is None or gain > best[1]):
+                best = (cand, gain, why)
+        if best is None:
+            return
+        cand, gain, why = best
+        side = "right" if cand > cur else "left"
+        self.begin_lane_change(cand)
+        self.mobil_cooldown = MOBIL_MIN_INTERVAL
+        self.n_lane_changes += 1
+        self.flash = 10
+        self.mobil_msg = "MOBIL: lane %d -> %d (%s, %s)" % (cur, cand, side, why)
+
+    # ---- lane-change trajectory + the steering that realises it ---- #
+    def begin_lane_change(self, lane: int) -> None:
+        """Turn MOBIL's decision into a manoeuvre. MOBIL is a *discrete*
+        model — its output is one bit, "change or not", and in the traffic
+        simulations it was written for a lane is an integer index and the
+        change is instantaneous. It has no lateral position, no heading and
+        no steering angle anywhere in it, so something has to bridge the gap
+        between that bit and a car with a steering wheel. That bridge is
+        this: a lateral displacement profile in time, from the lane we're in
+        to the lane MOBIL picked.
+
+        The profile is the same smoothstep the repo's own `lane_change`
+        maneuver uses (se.Maneuver.pose_at), so the ego's lane change has the
+        identical shape as a scripted actor's. Duration scales mildly with
+        speed: a change is a roughly fixed *distance* manoeuvre, so at low
+        speed it needs longer."""
+        # `s` is distance travelled into the manoeuvre, not elapsed time — see
+        # LC_DISTANCE. No speed scaling is needed anywhere as a result.
+        self.lc = {"x0": self.ego.x, "x1": self.lanes[lane], "s": 0.0}
+        self.target_lane = lane
+
+    @staticmethod
+    def _smoothstep(f: float) -> Tuple[float, float, float]:
+        """S(f), S'(f), S''(f) for the quintic 10f^3-15f^4+6f^5 — the lateral
+        shape, its slope and its curvature.
+
+        The repo's own `lane_change` maneuver uses the cubic 3f^2-2f^3
+        instead, and for a scripted actor that is fine: its heading is
+        decorative, so nobody differentiates the profile twice. Here the
+        second derivative IS the steering command, and the cubic has
+        S''(0)=6, S''(1)=-6 — it would demand a step onto full lock at the
+        start of every lane change and another step off at the end. The
+        quintic is the minimum-jerk profile with S'=S''=0 at both ends, so
+        the steering rises from zero and returns to zero."""
+        f = max(0.0, min(1.0, f))
+        return (f ** 3 * (10.0 - 15.0 * f + 6.0 * f * f),
+                30.0 * f * f * (1.0 - f) ** 2,
+                60.0 * f * (1.0 - f) * (1.0 - 2.0 * f))
+
+    def lane_target_lateral(self) -> Tuple[float, float, float]:
+        """Desired (x, dx/dt, d2x/dt2) this instant: the lane-change profile
+        while one is running, otherwise just hold the target lane centre.
+
+        The profile is parameterised by distance (f = s / LC_DISTANCE), so
+        converting its shape derivatives into time derivatives brings in the
+        current speed by the chain rule: dx/dt = d*S'(f)*v/L and
+        d2x/dt2 = d*S''(f)*(v/L)^2. The v^2 is exactly what cancels when
+        lane_change_steer divides by v^2 to get curvature."""
+        if self.lc is None:
+            return (self.lanes[self.target_lane], 0.0, 0.0) if self.lanes \
+                else (self.ego.x, 0.0, 0.0)
+        lc = self.lc
+        d, L = lc["x1"] - lc["x0"], LC_DISTANCE
+        v = self.ego.v
+        s, ds, dds = self._smoothstep(lc["s"] / L)
+        return (lc["x0"] + d * s, d * ds * v / L, d * dds * (v / L) ** 2)
+
+    def lane_change_steer(self) -> float:
+        """Steering for the highway, with no path-tracker involved: invert
+        the kinematic bicycle model on the lane-change profile.
+
+        The profile gives lateral velocity and acceleration directly, so for
+        a car moving along the road at v: the heading it needs is
+        psi = atan(n_dot / v), and the path curvature is kappa = n_ddot / v^2
+        (small-angle). The bicycle model says a steering angle delta produces
+        curvature tan(delta)/L, so delta = atan(L * kappa). That term is pure
+        feedforward — it is the steering the manoeuvre *implies*. A small
+        proportional term on the residual lateral and heading error absorbs
+        integration drift. No lookahead point, no reference polyline, no
+        closest-point search: the manoeuvre defines the steering.
+
+        Everything below is in the ego's LEFT-positive lateral frame, because
+        that is the frame the bicycle model steers in: a positive steering
+        angle raises theta, which turns the car left. The lanes are laid out
+        along world x (maps.py builds the strip along +y), and for a
+        northbound road left is -x — so world-x quantities flip sign on the
+        way in. `sgn` is that flip, written so a southbound road works too."""
+        e = self.ego
+        v = max(e.v, 1.0)
+        x_des, xd_des, xdd_des = self.lane_target_lateral()
+        sgn = -math.sin(self._road_theta)     # d(left) / d(world x)
+        n_err = sgn * (e.x - x_des)           # + => we are LEFT of the target
+        nd_des, ndd_des = sgn * xd_des, sgn * xdd_des
+        delta_ff = math.atan(WHEELBASE * ndd_des / (v * v))
+        # desired heading: road direction tilted by the lateral velocity
+        psi_des = self._road_theta + max(-LC_YAW_MAX,
+                                         min(LC_YAW_MAX, math.atan2(nd_des, v)))
+        psi_err = math.atan2(math.sin(psi_des - e.theta),
+                             math.cos(psi_des - e.theta))
+        psi_err -= LC_LAT_KP * n_err          # left of target => steer right
+        delta = delta_ff + math.atan(WHEELBASE * psi_err / v)
         return max(-1.0, min(1.0, delta / DELTA_MAX))
 
+    def advance_lane_change(self) -> None:
+        """Advance the active manoeuvre by the distance just travelled, and
+        retire it once the profile completes. A stopped ego makes no
+        progress — which is the correct behaviour, not a stall."""
+        if self.lc is None:
+            return
+        self.lc["s"] += self.ego.v * DT
+        if self.lc["s"] >= LC_DISTANCE:
+            self.lc = None
+
     def autonomous_control(self) -> Tuple[float, float]:
-        """(throttle, steer) for the fully autonomous ego: IDM for
-        longitudinal (idm_control), pure-pursuit path-following for lateral
-        (path_steer) — holding the ego on the same route the orchestrator's
-        own ego-prediction assumes."""
-        return self.idm_control(), self.path_steer()
+        """(throttle, steer) for the fully autonomous ego.
+
+        Highway: IDM sets speed, MOBIL decides the lane, and the lane-change
+        profile it starts supplies the steering (lane_change_steer). No
+        path-tracking controller is involved.
+
+        Intersection: the route is straight through the 4-way from an
+        axis-aligned start, so the correct steering is exactly zero and there
+        is nothing to track. (Turns would need a real path-follower again —
+        see the note in the module docstring.)"""
+        if not self.lanes:
+            return self.idm_control(), 0.0
+        self.mobil_step()
+        steer = self.lane_change_steer()
+        self.advance_lane_change()
+        return self.idm_control(), steer
 
     # ---- directive world: ego prediction + scripted actors ---- #
     def _world(self) -> se.Scenario:
@@ -643,6 +975,14 @@ class Drive:
             r = pygame.Rect(360, 8, 200, 22)
             pygame.draw.rect(s, col, r, border_radius=4)
             s.blit(self.font_sm.render(status, True, (10, 10, 10)), (r.x + 8, r.y + 4))
+            if self.lanes:
+                changing = self.lc is not None
+                lane_txt = "lane %d/%d%s  changes %d" % (
+                    self.target_lane, len(self.lanes) - 1,
+                    " (changing)" if changing else "", self.n_lane_changes)
+                s.blit(self.font_sm.render(lane_txt, True,
+                                           (255, 205, 40) if changing else MUTED),
+                       (580, 12))
         else:
             v = self.verdict
             if v is not None:
@@ -660,13 +1000,14 @@ class Drive:
         pygame.draw.rect(s, BAR, (0, H - BOT, W, BOT))
         col = (56, 178, 198) if self.flash > 0 else MUTED
         if self.mode == "cutin":
-            msg = self.interv_msg or "cut-in: IDM ego holds lane, actor merges ahead"
+            msg = self.mobil_msg or self.interv_msg or \
+                "highway: IDM speed + MOBIL lane choice"
         else:
             msg = ("orchestrator: " + self.interv_msg) if self.interv_msg else \
                   "orchestrator: monitoring…"
         s.blit(self.font_sm.render(msg[:110], True, col), (10, H - BOT + 6))
         s.blit(self.font_sm.render("R record   Esc quit   "
-                                   "(ego is IDM + pure-pursuit autonomous)",
+                                   "(ego: IDM speed + MOBIL lane change)",
                                    True, MUTED), (10, H - BOT + 26))
 
     # ---- loops ---- #
@@ -754,3 +1095,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# town10hd
