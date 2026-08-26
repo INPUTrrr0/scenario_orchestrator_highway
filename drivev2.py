@@ -545,7 +545,7 @@ class Drive:
         lead = fol = None
         oncoming = False
         for fwd, v, ln, opp in self._lane_actors(lane_x):
-            if opp:
+            if opp:     
                 oncoming = True
             if fwd > 0 and (lead is None or fwd < lead[0]):
                 lead = (fwd, v, ln)
@@ -1095,5 +1095,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# town10hd
