@@ -27,9 +27,20 @@ for drift. So the overtake really is IDM for speed and MOBIL for everything
 lateral; there is no pure-pursuit follower, no reference polyline and no
 lookahead point.
 
-MOBIL refuses any lane carrying oncoming traffic (see scenario_overtake.yaml)
-— its algebra assumes same-direction lanes, so a true two-way overtake needs
-its own policy.
+Contraflow lanes (see scenario_overtake.yaml) need no special case. Actor
+velocities are projected onto the road axis in Drive._lane_actors and so are
+signed, which means an oncoming car ahead is simply a leader with a negative
+velocity and IDM's dv term reads the true closing speed. The ego may enter an
+opposing lane to overtake; whether it does is decided by the resulting
+acceleration — distance-sensitive, and reassessed every tick — not by any
+blanket rule about where the oncoming car is.
+
+What this does NOT give you is commitment. MOBIL is memoryless: it asks "is
+that lane better right now", not "can I finish a pull-out, pass and tuck-back
+before that car arrives". An overtake begun against a distant oncoming car
+can therefore turn bad mid-manoeuvre, and there is no abort path once the
+LC_DISTANCE profile is running. A real two-way overtake wants gap acceptance
+on top of this.
 
 On the intersection map MOBIL is inert (one lane per direction, nothing to
 change into) and the route is straight through the 4-way from an axis-aligned
@@ -429,7 +440,7 @@ class Drive:
             cands = {self.target_lane, self._lane_index(self.ego.x)}
             best = None
             for li in cands:
-                lead, _, _ = self._lane_neighbors(self.lanes[li])
+                lead, _ = self._lane_neighbors(self.lanes[li])
                 if lead is None:
                     continue
                 g = self._gap_to(lead)
@@ -507,6 +518,19 @@ class Drive:
         of its centre from the ego's (+ = ahead), and `opposing` flags a car
         pointing back at us.
 
+        `v` is the actor's velocity PROJECTED ONTO THE ROAD AXIS, and so is
+        signed: a car coming the other way reports a negative value. This is
+        the whole reason IDM can reason about contraflow traffic. Actor
+        speeds out of the simulator (se.Maneuver.velocity_at) are unsigned
+        magnitudes along each actor's *own* heading, so an oncoming car and a
+        car driving away from us both read "+8" until they are projected.
+        Feeding the raw magnitude to IDM makes dv = v_ego - v_lead read +4
+        for a head-on pair closing at 20 m/s, and the ego cheerfully
+        accelerates at a car coming straight at it. With the projection, dv
+        is the true closing speed and the s* term does the rest — no special
+        case for oncoming traffic is needed anywhere. Same-direction traffic
+        is unaffected: cos(0) = +1, so the projection is a no-op there.
+
         Membership is by BODY OVERLAP, not by which lane centre the car is
         nearest, so a car mid-merge belongs to *both* lanes it is straddling.
         A centre-point test instead teleports a merging car from one lane to
@@ -531,27 +555,33 @@ class Drive:
             if abs(ax - lane_x) > half_lane + a.width / 2.0:
                 continue
             fwd = dx * ch + dy * sh
-            opposing = math.cos(math.radians(ahd) - self._road_theta) < 0.0
-            out.append((fwd, a.speeds[kk], a.length, opposing))
+            align = math.cos(math.radians(ahd) - self._road_theta)
+            out.append((fwd, a.speeds[kk] * align, a.length, align < 0.0))
         return out
 
     def _lane_neighbors(self, lane_x: float):
-        """(leader, follower, oncoming) for the lane centred on `lane_x`.
-        Leader/follower are the nearest actor ahead of / behind the ego in
-        that lane as (fwd, v, length), or None. `oncoming` is True if any car
-        in the lane points back at us — that makes the lane a contraflow lane
-        (see scenario_overtake.yaml) and MOBIL refuses it outright, because
-        its whole incentive/safety algebra assumes same-direction traffic."""
+        """(leader, follower) for the lane centred on `lane_x` — the nearest
+        actor ahead of / behind the ego there, as (fwd, v, length), or None.
+
+        A contraflow lane needs no special handling: an oncoming car ahead is
+        just a leader with a negative v, and IDM's dv term then reads the true
+        closing speed. There is deliberately no veto on entering such a lane —
+        whether the ego may overtake into it is decided by the resulting
+        acceleration, which is distance-sensitive, rather than by a blanket
+        rule that ignores where the oncoming car actually is.
+
+        The one asymmetry: a car BEHIND us pointing the other way is receding,
+        not following. It cannot be inconvenienced by our merge, and feeding
+        its negative v into the follower's own IDM (where v is its speed, not
+        a closing rate) would be meaningless. So the follower slot takes
+        same-direction traffic only; the leader slot takes everything."""
         lead = fol = None
-        oncoming = False
         for fwd, v, ln, opp in self._lane_actors(lane_x):
-            if opp:     
-                oncoming = True
             if fwd > 0 and (lead is None or fwd < lead[0]):
                 lead = (fwd, v, ln)
-            elif fwd <= 0 and (fol is None or fwd > fol[0]):
+            elif fwd <= 0 and not opp and (fol is None or fwd > fol[0]):
                 fol = (fwd, v, ln)
-        return lead, fol, oncoming
+        return lead, fol
 
     @staticmethod
     def _gap_between(rear, front) -> Optional[float]:
@@ -592,10 +622,8 @@ class Drive:
         politeness term therefore models courtesy the traffic won't
         reciprocate, while the safety term is what genuinely protects them."""
         v_e = self.ego.v
-        lead_c, fol_c, _ = self._lane_neighbors(cur_x)
-        lead_t, fol_t, oncoming = self._lane_neighbors(tgt_x)
-        if oncoming:
-            return False, 0.0, "oncoming traffic"
+        lead_c, fol_c = self._lane_neighbors(cur_x)
+        lead_t, fol_t = self._lane_neighbors(tgt_x)
 
         # --- us: before (staying) vs after (merged) ---
         a_e_cur = self._idm_accel(v_e, self._gap_to(lead_c),
