@@ -42,34 +42,35 @@ can therefore turn bad mid-manoeuvre, and there is no abort path once the
 LC_DISTANCE profile is running. A real two-way overtake wants gap acceptance
 on top of this.
 
-On the intersection map MOBIL is inert (one lane per direction, nothing to
-change into) and the route is straight through the 4-way from an axis-aligned
-start, so the correct steering there is exactly zero. Restoring the left/right
-turn modes would need a real path-follower again — that is what the deleted
-pure-pursuit follower was for.
+HIGHWAY ONLY. drivev2 runs the straight/multi-lane map and refuses anything
+else — an intersection YAML, or mode="intersection", raises rather than runs.
+That is a statement about the policy, not a missing feature: MOBIL needs
+parallel same-direction lanes to choose between, and an intersection arm has
+one per direction, so it is inert there; IDM reasons only about a leader in
+its own lane and has nothing to say about crossing traffic, so it will drive
+the ego straight into a red-runner. Such a run looks like a policy failure but
+is really a category error. Use drive.py for the intersection scenarios.
 
-Background actors stay open-loop maneuver scripts — they never sense the ego or
-each other directly. Every tick the orchestrator evaluates the red-light family
-(D1/D2/D3, script-grounded, against a forward prediction of the ego) and applies
-the minimal causal intervention to the *other* actors when needed — it never
-steers the ego. The whole session is one rollout and can be recorded to an mp4
-under outputs/.
+Background actors stay open-loop maneuver scripts — they never sense the ego
+or each other directly; the closed-loop cut-in orchestrator is the one thing
+that reacts to the ego, re-solving its merge onto the live ego every tick.
+The whole session is one rollout and can be recorded to an mp4 under outputs/.
 
-Note the ego is a closed-loop IDM driver in "cutin" mode too: it no longer
-replays the YAML ego script (the hand-authored 13->4 m/s brake), it brakes when
-and only when the merging actor actually enters its lane.
+Note the ego is a closed-loop IDM driver now: it no longer replays the YAML
+ego script (the hand-authored 13->4 m/s brake), it brakes when and only when
+the merging actor actually enters its lane. Because it is free to change lanes
+as well, it may evade a cut-in rather than yield to it — a valid escape, but
+it means "avoided a collision" and "the cut-in intention completed" are two
+different questions about the same run.
 
 Controls (session control only — the ego drives itself)
   R        start/stop recording        Esc / Q   quit
 
-Modes
-  intersection (default) — random actors at a 4-way; red-light orchestrator
-  cutin                  — straight 3-lane highway; closed-loop cut-in actor
-
 Usage
-  python3 drivev2.py [--seed N] [--record]
-  python3 drivev2.py --mode cutin [--scenario path] [--record]
-  python3 drivev2.py --mode cutin --headless --duration 8 --seed 1
+  python3 drivev2.py [--scenario path] [--record]
+  python3 drivev2.py --scenario scenarios/scenario_hard_brake.yaml
+  python3 drivev2.py --headless --duration 8 --seed 1
+Defaults to scenarios/scenario_cutin.yaml.
 Requires pygame; recording requires ffmpeg.
 """
 from __future__ import annotations
@@ -252,7 +253,10 @@ def spawn_cutin(path: str):
     """Load a straight-road cut-in YAML: ego from actor 0, others stay scripted."""
     sc = se.load_scenario(path)
     if sc.map.kind != "straight":
-        raise ValueError(f"cut-in scenario must have map.kind=straight, got {sc.map.kind!r}")
+        raise ValueError(
+            f"drivev2 needs a straight/highway map, got map.kind={sc.map.kind!r} "
+            f"in {path!r}. The ego's IDM+MOBIL policy has no model of an "
+            "intersection; use drive.py to run intersection scenarios.")
     by_id = {a.id: a for a in sc.actors}
     if "0" not in by_id:
         raise ValueError("cut-in scenario needs actor id 0 (ego template)")
@@ -287,7 +291,21 @@ def _cap_scenario(sc: se.Scenario) -> None:
 # --------------------------------------------------------------------------- #
 class Drive:
     def __init__(self, seed: int, record: bool, headless: bool,
-                 mode: str = "intersection", scenario: Optional[str] = None):
+                 mode: str = "cutin", scenario: Optional[str] = None):
+        # drivev2 is a highway tool. The ego's policy is IDM + MOBIL, and
+        # neither model describes an intersection: MOBIL needs parallel
+        # same-direction lanes to choose between (an arm has one per
+        # direction, so it is inert), and IDM is a car-following model that
+        # reasons only about a leader in its own lane — it has nothing to say
+        # about crossing traffic and will drive straight into a red-runner.
+        # Refuse rather than produce a run that looks like a policy failure
+        # but is really a category error. Use drive.py for intersections.
+        if mode != "cutin":
+            raise ValueError(
+                f"drivev2 supports the straight/highway map only, got mode={mode!r}. "
+                "IDM+MOBIL does not model intersections (MOBIL has no lanes to "
+                "choose between, IDM ignores crossing traffic). Use drive.py for "
+                "the intersection scenarios.")
         self.mode = mode
         self.seed = seed
         self.scenario_path = scenario
@@ -1094,11 +1112,13 @@ def _rect(x, y, hd, L, Wd):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--mode", choices=("intersection", "cutin"),
-                    default="intersection",
-                    help="intersection (default) or cutin (3-lane highway)")
+    ap.add_argument("--mode", choices=("cutin",), default="cutin",
+                    help="straight/highway map (the only mode drivev2 supports; "
+                         "IDM+MOBIL does not model intersections — use drive.py "
+                         "for those)")
     ap.add_argument("--scenario", default=None,
-                    help="YAML for --mode cutin (default: scenarios/scenario_cutin.yaml)")
+                    help="straight-map YAML (default: scenarios/scenario_cutin.yaml). "
+                         "An intersection YAML is rejected.")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--record", action="store_true")
     ap.add_argument("--headless", action="store_true",
