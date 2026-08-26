@@ -17,34 +17,49 @@
 ## Quick start
 
 ```bash
+# to run different scenarios, you drive the ego, define actor quantity:
 .venv/bin/python scenario_editor.py scenarios/scenario_cutin.yaml
-.venv/bin/python scenario_editor.py scenarios/scenario_cutin.yaml --validate
-
-.venv/bin/python drive.py --mode cutin
-.venv/bin/python drive.py --mode cutin --headless --duration 8
-
-.venv/bin/python orchestrator.py --nominal --session smoke
-
-# cut-in orchestrator: random fleet, role casting, you drive the ego
-.venv/bin/python cutin_orchestrator.py --seed 1 --actors 4
-
-# ego-policy stress tests (you drive; scripts only set the stage)
 .venv/bin/python scenario_editor.py scenarios/scenario_overtake.yaml
 .venv/bin/python scenario_editor.py scenarios/scenario_hard_brake.yaml
+
+# cut-in orchestrator, your drive the ego, use seed to define actor quantity: 
+.venv/bin/python cutin_orchestrator.py --seed 1 --actors 4
+
+# smoke test nominal driving behavior of actor
+.venv/bin/python orchestrator.py --nominal --session smoke
 ```
+
+
+## Scenarios definition and configuration 
+
+* **`scenario_cutin.yaml`** — The actor must cut-in the ego at a specific target. The window is deliberately tight. The goal is to test whether the ego can react in time (either speed up/lane change to evade the cut-in, or brake to yield to the cut-in vehicle)
+   * **Cut-in target pin**
+
+   An actor can carry a `cutin` spec:
+   
+   ```yaml
+   cutin: {t: 3.0, along: 6.0, lat: 0.0, lc_duration: 2.0, tail: 4.0}
+   ```
+
+* **`scenario_overtake.yaml`** — the ego must go around a blocking object
+  using the opposite lane while dealing with oncoming traffic, without
+  colliding with either car. The blocker (red) drives ahead in the ego's
+  lane, brakes hard at t≈2.5 s and stays stopped; an oncoming car (blue)
+  runs southbound in the opposite lane and reaches the stopped car around
+  t≈8 s. Overtake early (tight gap in front of the oncoming car) or brake
+  and go around after it passes — both windows are deliberately tight.
+* **`scenario_hard_brake.yaml`** — the ego should lane-change to evade a
+  slow lead (red, 4 m/s, ~30 m ahead: ~3 s to contact at cruise speed)
+  while a normal-speed lead (amber, 10.5 m/s) in the adjacent lane squeezes
+  the merge gap. The ego must avoid hitting both cars while overtaking.
+
+
 
 ## Maneuver types
 
 `go_straight`, `lane_change` (+left / −right via `lateral_offset`), `turn_left`, `turn_right`,
-`accelerate`, `decelerate`, `stop`, and `function` (node graphs). The editor type control is a **dropdown**.
+`accelerate`, `decelerate`, `stop`. The editor type control is a **dropdown**.
 
-## Cut-in target pin
-
-An actor can carry a `cutin` spec instead of hand-written maneuvers:
-
-```yaml
-cutin: {t: 3.0, along: 6.0, lat: 0.0, lc_duration: 2.0, tail: 4.0}
-```
 
 **Scripted Play:** at time `t`, complete the lane change `along` metres ahead
 of the ego (and `lat` to its left). Offsets are ego-relative — change the
@@ -115,30 +130,6 @@ Each panel row has a governance dropdown next to the actor's name
 
 The mode persists in the YAML as `autonomy: self` on the actor (omitted
 when autonomous).
-
-## Ego-policy stress tests
-
-Two scenarios where the *actors* are fully scripted and the ego script is a
-plain constant-speed profile — it encodes **no policy**. Press **Drive / F**
-and drive the ego yourself (or hook up a policy under test); the scripts
-only set the stage, so nothing assumes what the ego will do.
-
-* **`scenario_overtake.yaml`** — the ego must go around a blocking object
-  using the opposite lane while dealing with oncoming traffic, without
-  colliding with either car. The blocker (red) drives ahead in the ego's
-  lane, brakes hard at t≈2.5 s and stays stopped; an oncoming car (blue)
-  runs southbound in the opposite lane and reaches the stopped car around
-  t≈8 s. Overtake early (tight gap in front of the oncoming car) or brake
-  and go around after it passes — both windows are deliberately tight.
-* **`scenario_hard_brake.yaml`** — the ego should lane-change to evade a
-  slow lead (red, 4 m/s, ~30 m ahead: ~3 s to contact at cruise speed)
-  while a normal-speed lead (amber, 10.5 m/s) in the adjacent lane squeezes
-  the merge gap. The ego must avoid hitting both cars while overtaking.
-
-```bash
-.venv/bin/python scenario_editor.py scenarios/scenario_overtake.yaml
-.venv/bin/python scenario_editor.py scenarios/scenario_hard_brake.yaml
-```
 
 ## Experiment harness (recorded trials)
 
