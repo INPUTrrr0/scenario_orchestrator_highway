@@ -74,7 +74,22 @@ DOT_OFF = (90, 94, 105)
 ROLE_CUTIN = "cutin"
 ROLE_BLOCK = "block"
 ROLE_NOMINAL = "nominal"
+# scripted stress-test intentions (YAML `role:` on an actor)
+ROLE_BLOCKER = "blocker"       # overtake: stopped / hard-braking object
+ROLE_ONCOMING = "oncoming"     # overtake: opposite-direction traffic
+ROLE_SLOW = "slow"             # hard_brake: slow lead in ego's lane
+ROLE_ADJACENT = "adjacent"     # hard_brake: normal-speed lead in next lane
 DOT_BLOCK = (235, 150, 60)
+
+ROLE_LABELS: Dict[str, str] = {
+    ROLE_NOMINAL: "none",
+    ROLE_CUTIN: "cut-in",
+    ROLE_BLOCK: "block",
+    ROLE_BLOCKER: "blocker",
+    ROLE_ONCOMING: "oncoming",
+    ROLE_SLOW: "slow",
+    ROLE_ADJACENT: "adjacent",
+}
 
 DEFAULT_CUTIN_SPEC = {
     "t": 4.0, "along": 6.0, "lat": 0.0, "lc_duration": 2.0, "tail": 4.0,
@@ -199,6 +214,81 @@ def score_block_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
     else:
         along_score = 1.0 / (1.0 + abs(along + 8.0) / 10.0)
     return lat_score * along_score
+
+
+def score_blocker_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
+                            lane_width: float) -> float:
+    """Overtake: same-lane lead that the ego must go around (ideally ahead)."""
+    along, lat = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
+    if abs(lat) > 0.6 * lane_width:
+        lat_score = 0.1
+    else:
+        lat_score = 1.0
+    if along < 2.0 or along > 60.0:
+        along_score = 0.05
+    else:
+        along_score = 1.0 / (1.0 + abs(along - 20.0) / 15.0)
+    return lat_score * along_score
+
+
+def score_oncoming_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
+                             lane_width: float) -> float:
+    """Overtake: opposite-heading traffic in the adjacent / opposite lane."""
+    along, lat = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
+    # heading delta ≈ 180° → oncoming
+    dh = abs((actor_pose[2] - ego_pose[2] + 180.0) % 360.0 - 180.0)
+    head_score = 1.0 if dh > 120.0 else 0.05
+    # prefer the opposite-side lane
+    if 0.4 * lane_width < abs(lat) < 1.6 * lane_width:
+        lat_score = 1.0
+    else:
+        lat_score = 0.2
+    # approaching from ahead in the ego frame (positive along for northbound
+    # ego vs southbound traffic that is still north of the ego)
+    if along < -10.0 or along > 80.0:
+        along_score = 0.1
+    else:
+        along_score = 1.0 / (1.0 + abs(along - 40.0) / 25.0)
+    return head_score * lat_score * along_score
+
+
+def score_slow_lead_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
+                              lane_width: float) -> float:
+    """Hard-brake: same-lane lead the ego is closing on."""
+    along, lat = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
+    lat_score = 1.0 if abs(lat) < 0.6 * lane_width else 0.1
+    if along < 2.0 or along > 50.0:
+        along_score = 0.05
+    else:
+        along_score = 1.0 / (1.0 + abs(along - 25.0) / 12.0)
+    return lat_score * along_score
+
+
+def score_adjacent_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
+                             lane_width: float) -> float:
+    """Hard-brake: co-directional lead in the adjacent lane."""
+    along, lat = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
+    dh = abs((actor_pose[2] - ego_pose[2] + 180.0) % 360.0 - 180.0)
+    if dh > 60.0:
+        return 0.05                           # not co-directional
+    if 0.4 * lane_width < abs(lat) < 1.6 * lane_width:
+        lat_score = 1.0
+    else:
+        lat_score = 0.15
+    if along < -5.0 or along > 50.0:
+        along_score = 0.1
+    else:
+        along_score = 1.0 / (1.0 + abs(along - 12.0) / 12.0)
+    return lat_score * along_score
+
+
+# role_key -> scorer used by the editor panel for stress-test % display
+STRESS_SCORE_FN = {
+    ROLE_BLOCKER: score_blocker_candidate,
+    ROLE_ONCOMING: score_oncoming_candidate,
+    ROLE_SLOW: score_slow_lead_candidate,
+    ROLE_ADJACENT: score_adjacent_candidate,
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -541,7 +631,7 @@ class CutinOrchestrator:
 # --------------------------------------------------------------------------- #
 # Role-casting panel (reused by scenario_editor's window)
 # --------------------------------------------------------------------------- #
-# intention columns of the role matrix, in display order
+# default intention columns (cut-in / block scenarios)
 ROLE_COLUMNS: List[Tuple[str, str]] = [
     (ROLE_NOMINAL, "none"),
     (ROLE_CUTIN, "cut-in"),
@@ -549,17 +639,44 @@ ROLE_COLUMNS: List[Tuple[str, str]] = [
 ]
 
 
+def panel_columns_for(roles: Dict[str, str],
+                      has_cutin_block: bool = False
+                      ) -> List[Tuple[str, str]]:
+    """Pick intention columns for the panel.
+
+    Cut-in / block scenarios keep the classic three columns. Stress-test
+    scenarios (overtake, hard_brake, …) use `none` plus every distinct
+    scripted `role` that appears on an actor.
+    """
+    if has_cutin_block:
+        return list(ROLE_COLUMNS)
+    keys: List[str] = []
+    for r in roles.values():
+        if r and r != ROLE_NOMINAL and r not in keys:
+            keys.append(r)
+    if not keys:
+        return list(ROLE_COLUMNS)
+    return ([(ROLE_NOMINAL, ROLE_LABELS[ROLE_NOMINAL])]
+            + [(k, ROLE_LABELS.get(k, k)) for k in keys])
+
+
+def panel_width_for(n_cols: int) -> int:
+    """Widen the card when there are more than the default 3 columns."""
+    return max(PANEL_W, 142 + n_cols * 72 + 16)
+
+
 def draw_role_panel(surface: pygame.Surface,
                     font: pygame.font.Font, font_sm: pygame.font.Font,
                     roles: Dict[str, str],
                     origin: Tuple[int, int] = (36, TOP + 36),
-                    width: int = PANEL_W,
+                    width: Optional[int] = None,
                     autonomy: Optional[Dict[str, str]] = None,
-                    scores: Optional[Dict[str, Dict[str, float]]] = None
+                    scores: Optional[Dict[str, Dict[str, float]]] = None,
+                    columns: Optional[List[Tuple[str, str]]] = None,
                     ) -> Dict[str, pygame.Rect]:
     """Card with an 'orchestrator' banner and an intention matrix: one row per
-    actor, one column per intention (none | cut-in | block).  The cell of the
-    actor's assigned intention gets a green light; other cells stay hollow.
+    actor, one column per intention.  The cell of the actor's assigned
+    intention gets a green light; other cells stay hollow.
 
     When `autonomy` is given ({actor_id: "auto"|"self"}), each row also gets
     a small dropdown button showing the actor's governance; the returned dict
@@ -568,14 +685,20 @@ def draw_role_panel(surface: pygame.Surface,
     When `scores` is given ({actor_id: {role_key: 0..1}}), each cell shows the
     candidate score as a percentage next to its light — how well placed the
     actor is to perform that intention right now.
+
+    `columns` overrides the default none|cut-in|block headers (used by
+    overtake / hard_brake stress-test scenarios).
     """
+    cols = columns if columns is not None else ROLE_COLUMNS
+    if width is None:
+        width = panel_width_for(len(cols))
     x, y = origin
     row_h = 26
     header_h = 28
     colhdr_h = 20
     pad = 8
     col_x0 = x + 142          # left edge of the intention columns
-    col_w = (width - (col_x0 - x) - 8) // len(ROLE_COLUMNS)
+    col_w = max(48, (width - (col_x0 - x) - 8) // max(1, len(cols)))
     h = header_h + colhdr_h + max(1, len(roles)) * row_h + pad
     rect = pygame.Rect(x, y, width, h)
     buttons: Dict[str, pygame.Rect] = {}
@@ -589,12 +712,12 @@ def draw_role_panel(surface: pygame.Surface,
 
     # column headers
     hdr_y = y + header_h + 3
-    for i, (_, lbl) in enumerate(ROLE_COLUMNS):
+    for i, (_, lbl) in enumerate(cols):
         cx = col_x0 + i * col_w + col_w // 2
         t = font_sm.render(lbl, True, MUTED)
         surface.blit(t, (cx - t.get_width() // 2, hdr_y))
     # faint column separators
-    for i in range(len(ROLE_COLUMNS) + 1):
+    for i in range(len(cols) + 1):
         sx = col_x0 + i * col_w
         pygame.draw.line(surface, (42, 46, 56),
                          (sx, y + header_h + colhdr_h - 2),
@@ -616,7 +739,7 @@ def draw_role_panel(surface: pygame.Surface,
             pygame.draw.polygon(surface, gc,
                                 [(tx - 4, ty - 2), (tx + 4, ty - 2), (tx, ty + 3)])
             buttons[aid] = br
-        for i, (rkey, _) in enumerate(ROLE_COLUMNS):
+        for i, (rkey, _) in enumerate(cols):
             val = scores.get(aid, {}).get(rkey) if scores else None
             cx = col_x0 + i * col_w + (16 if val is not None else col_w // 2)
             cy = yy + row_h // 2

@@ -40,6 +40,8 @@ actors:
     length: 4.5
     width: 2.0
     start: {x: 1.75, y: -35.0, heading: 90}
+    role: blocker
+    autonomy: self
     maneuvers:
       - {type: go_straight, duration: 2.5, curve: {v0: 10.0, accel: 0.0}}
       - {type: decelerate, duration: 1.25, curve: {v0: 10.0, accel: -8.0}}
@@ -52,5 +54,7 @@ actors:
     length: 4.5
     width: 2.0
     start: {x: -1.75, y: 60.0, heading: 270}
+    role: oncoming
+    autonomy: self
     maneuvers:
       - {type: go_straight, duration: 40.0, curve: {v0: 8.0, accel: 0.0}}

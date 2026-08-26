@@ -41,6 +41,8 @@ actors:
     length: 4.5
     width: 2.0
     start: {x: 1.75, y: -30.0, heading: 90}
+    role: slow
+    autonomy: self
     maneuvers:
       - {type: go_straight, duration: 40.0, curve: {v0: 4.0, accel: 0.0}}
 
@@ -51,5 +53,7 @@ actors:
     length: 4.5
     width: 2.0
     start: {x: -1.75, y: -48.0, heading: 90}
+    role: adjacent
+    autonomy: self
     maneuvers:
       - {type: go_straight, duration: 40.0, curve: {v0: 10.5, accel: 0.0}}

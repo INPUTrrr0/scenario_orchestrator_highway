@@ -48,10 +48,13 @@
   runs southbound in the opposite lane and reaches the stopped car around
   t≈8 s. Overtake early (tight gap in front of the oncoming car) or brake
   and go around after it passes — both windows are deliberately tight.
+  The orchestrator panel shows **none | blocker | oncoming** with green
+  lights on the scripted roles (actors are `autonomy: self`).
 * **`scenario_hard_brake.yaml`** — the ego should lane-change to evade a
   slow lead (red, 4 m/s, ~30 m ahead: ~3 s to contact at cruise speed)
   while a normal-speed lead (amber, 10.5 m/s) in the adjacent lane squeezes
   the merge gap. The ego must avoid hitting both cars while overtaking.
+  The orchestrator panel shows **none | slow | adjacent**.
 
 
 
@@ -80,7 +83,9 @@ When a scenario has a `cutin` or `block` spec and several actors (see
 `scenario_cutin.yaml` or the combined `scenario_cutin_block.yaml`), the
 editor shows an **orchestrator** card in
 the top left: an *intention matrix* with one row per actor and one column
-per intention — **none | cut-in | block**. The cell of the actor's assigned
+per intention — **none | cut-in | block**. Stress-test scenarios use the
+same card with scripted `role:` tags (overtake: **none | blocker |
+oncoming**; hard_brake: **none | slow | adjacent**). The cell of the actor's assigned
 intention gets a green light; unassigned cells stay hollow. Each cut-in /
 block cell also shows the actor's live candidate score as a percentage —
 how well placed it is to perform that intention *right now* (recomputed

@@ -548,6 +548,10 @@ class Actor:
     #           (speed up, brake, cut-in pin, edited segments); the
     #           orchestrator neither casts it nor touches its plan
     autonomy: str = "auto"
+    # scripted stress-test intention label (e.g. "blocker", "oncoming",
+    # "slow", "adjacent"). Shown as a green light in the orchestrator
+    # panel; independent of cut-in / block role casting.
+    role: Optional[str] = None
     # filled by Scenario.simulate():
     cum: List[float] = field(default_factory=list)
     total: float = 0.0
@@ -590,6 +594,8 @@ class Actor:
             d["block"] = {k: round(float(v), 4) for k, v in self.block.items()}
         if self.autonomy != "auto":
             d["autonomy"] = self.autonomy
+        if self.role:
+            d["role"] = self.role
         return d
 
 
@@ -757,6 +763,7 @@ def load_scenario(path: str) -> Scenario:
             cruise=float(cr) if cr is not None else None,
             autonomy=("self" if str(ad.get("autonomy", "auto")).lower()
                       == "self" else "auto"),
+            role=(str(ad["role"]).strip() or None) if ad.get("role") else None,
         )
         if not a.maneuvers and a.cruise is not None:
             a.maneuvers = cruise_plan(a.start, a.cruise,
@@ -3131,16 +3138,26 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         edit_buffer = ""
 
     def draw_orch_panel():
-        """Top-left role-casting card (only for orchestrated scenarios)."""
+        """Top-left role-casting card (cut-in / block / stress-test roles)."""
         nonlocal orch_buttons
         others = [a for a in scenario.actors if a.id != "0"]
-        if not any(a.cutin or a.block for a in others):
+        has_cutin_block = any(a.cutin or a.block for a in others)
+        has_scripted = any(a.role for a in others)
+        if not has_cutin_block and not has_scripted:
             orch_buttons = {}
             return
-        roles = {a.id: (co.ROLE_CUTIN if a.cutin
-                        else co.ROLE_BLOCK if a.block
-                        else co.ROLE_NOMINAL)
-                 for a in others}
+
+        def assigned_role(a: Actor) -> str:
+            if a.cutin:
+                return co.ROLE_CUTIN
+            if a.block:
+                return co.ROLE_BLOCK
+            if a.role:
+                return a.role
+            return co.ROLE_NOMINAL
+
+        roles = {a.id: assigned_role(a) for a in others}
+        columns = co.panel_columns_for(roles, has_cutin_block=has_cutin_block)
         autonomy = {a.id: a.autonomy for a in others}
         # per-cell candidate scores at the poses currently on screen
         ego = ego_actor()
@@ -3155,6 +3172,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             bspec = next((a.block for a in others if a.block), None)
             target_lat = (float(bspec["lat"])
                           if bspec and "lat" in bspec else None)
+            stress_keys = [k for k, _ in columns
+                           if k in co.STRESS_SCORE_FN]
 
             def pose_now(a: Actor) -> Pose:
                 if drive_mode and (a.cutin or a.block):
@@ -3164,14 +3183,20 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             scores = {}
             for a in others:
                 p = pose_now(a)
-                d = {co.ROLE_CUTIN: co.score_cutin_candidate(p, ego_pose, lw)}
-                if target_lat is not None:
-                    d[co.ROLE_BLOCK] = co.score_block_candidate(
-                        p, ego_pose, lw, target_lat)
+                d: Dict[str, float] = {}
+                if has_cutin_block:
+                    d[co.ROLE_CUTIN] = co.score_cutin_candidate(
+                        p, ego_pose, lw)
+                    if target_lat is not None:
+                        d[co.ROLE_BLOCK] = co.score_block_candidate(
+                            p, ego_pose, lw, target_lat)
+                for rk in stress_keys:
+                    d[rk] = co.STRESS_SCORE_FN[rk](p, ego_pose, lw)
                 scores[a.id] = d
-        orch_buttons = co.draw_role_panel(screen, font, font_sm, roles,
-                                          origin=(36, TOPBAR_H + 36),
-                                          autonomy=autonomy, scores=scores)
+        orch_buttons = co.draw_role_panel(
+            screen, font, font_sm, roles,
+            origin=(36, TOPBAR_H + 36),
+            autonomy=autonomy, scores=scores, columns=columns)
 
     def render_frame():
         draw_map()
