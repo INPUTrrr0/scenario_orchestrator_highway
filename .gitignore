@@ -11,3 +11,5 @@ carla_highway/reports/
 carla_port/sessions/
 run_output/
 *.mp4
+# CARLA writes generated worlds back into its own OpenDrive dir
+OpenDriveMap.xodr

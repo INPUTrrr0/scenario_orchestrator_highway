@@ -78,23 +78,27 @@ class ModeSpec:
     #: simulated seconds the scenario needs to resolve
     duration: float
     blurb: str
+    #: the generated straight highway this mode is meant to be recorded on
+    #: (`carla_highway/make_maps.py`), used by `--xodr auto`. Every mode runs
+    #: on the stock towns too; this is the road that makes it legible.
+    xodr: str = ""
 
 
 SPECS: Dict[str, ModeSpec] = {
     CUTIN: ModeSpec(
         name=CUTIN, yaml="scenario_cutin.yaml", lanes=3, two_way=False,
         min_length=120.0, casting=True, ego_lane_changes=False,
-        duration=12.0,
+        duration=12.0, xodr="highway_3lane",
         blurb="3-lane one-way; orchestrator casts a cut-in against the live ego"),
     HARD_BRAKE: ModeSpec(
         name=HARD_BRAKE, yaml="scenario_hard_brake.yaml", lanes=2, two_way=False,
         min_length=160.0, casting=False, ego_lane_changes=True,
-        duration=14.0,
+        duration=14.0, xodr="highway_2lane",
         blurb="2-lane one-way; slow lead in the ego lane, squeezed merge gap"),
     OVERTAKE: ModeSpec(
         name=OVERTAKE, yaml="scenario_overtake.yaml", lanes=2, two_way=True,
         min_length=160.0, casting=False, ego_lane_changes=True,
-        duration=20.0,
+        duration=20.0, xodr="highway_2lane_twoway",
         blurb="2-lane two-way; stopped blocker, oncoming car in the only way past"),
 }
 

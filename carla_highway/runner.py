@@ -112,6 +112,14 @@ class RunConfig:
     timeout: float = 20.0
     load_timeout: float = 120.0
     town: Optional[str] = "Town04"
+    #: path to an OpenDRIVE file to build the world from instead of loading a
+    #: named town. `make_maps.py` writes the ones this port ships.
+    xodr: Optional[str] = None
+    xodr_vertex_distance: float = 2.0
+    xodr_max_road_length: float = 100.0
+    #: the generated world walls the road edge; 0.5 m is enough to stop a car
+    #: leaving it without walling the cameras in.
+    xodr_wall_height: float = 0.5
     duration: Optional[float] = None
     linger: float = 1.0
     fixed_delta: float = DT
@@ -273,7 +281,44 @@ class HighwayRun:
         self.client = carla.Client(cfg.host, cfg.port)
         self.client.set_timeout(cfg.timeout)
         self.world = self.client.get_world()
-        if cfg.town and not self._already_on(cfg.town):
+        xodr_path = cfg.xodr
+        if xodr_path == "auto":
+            # the straight highway this scenario is meant to be recorded on
+            from .make_maps import DEFAULT_MAP_DIR
+            name = sc_mod.spec(cfg.scenario).xodr
+            if not name:
+                raise ValueError(f"--xodr auto: no map is registered for "
+                                 f"--scenario {cfg.scenario}")
+            xodr_path = os.path.join(DEFAULT_MAP_DIR, name + ".xodr")
+            if not os.path.isfile(xodr_path):
+                raise FileNotFoundError(
+                    f"{xodr_path} is missing — run "
+                    f"`python3 -m carla_highway.make_maps` to write it")
+        if xodr_path:
+            # A generated world: the road mesh is built from the OpenDRIVE and
+            # nothing else is placed. No buildings, no parked cars, no cross
+            # traffic — which is the whole reason to prefer one for a recording
+            # (see `carla_highway/make_maps.py` and `docs/HIGHWAY_MAPS.md`).
+            # Always rebuilt rather than reused: unlike a named town there is
+            # no reliable way to tell whether the server is already on THIS
+            # OpenDRIVE, and the maps are cheap to generate.
+            with open(xodr_path, "r") as fh:
+                xodr = fh.read()
+            self.client.set_timeout(max(cfg.timeout, cfg.load_timeout))
+            self._log(f"generating world from {xodr_path} "
+                      f"(timeout {cfg.load_timeout:.0f}s)")
+            self.world = self.client.generate_opendrive_world(
+                xodr, carla.OpendriveGenerationParameters(
+                    vertex_distance=cfg.xodr_vertex_distance,
+                    max_road_length=cfg.xodr_max_road_length,
+                    wall_height=cfg.xodr_wall_height,
+                    additional_width=0.6,
+                    smooth_junctions=True,
+                    enable_mesh_visibility=True))
+            self.client.set_timeout(cfg.timeout)
+            self.notes.append(
+                f"generated world from {os.path.basename(xodr_path)}")
+        elif cfg.town and not self._already_on(cfg.town):
             # Loading a town streams a lot of assets and routinely takes far
             # longer than a normal RPC; the working timeout is restored after.
             self.client.set_timeout(max(cfg.timeout, cfg.load_timeout))
@@ -1096,6 +1141,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--timeout", type=float, default=20.0)
     p.add_argument("--load-timeout", type=float, default=120.0,
                    help="separate, longer timeout for load_world")
+    p.add_argument("--xodr", default=None,
+                   help="build the world from this OpenDRIVE file instead of "
+                        "loading a town — a clean straight highway with no "
+                        "buildings or cross traffic. `auto` picks the map "
+                        "registered for this scenario. See "
+                        "`python3 -m carla_highway.make_maps`")
+    p.add_argument("--xodr-wall-height", type=float, default=0.5,
+                   help="boundary wall height for a generated world (m)")
     p.add_argument("--town", default="Town04",
                    help="CARLA town to load; Town04 has both the multi-lane "
                         "highway and a two-way road (default: Town04)")
@@ -1200,7 +1253,8 @@ def config_from_args(args) -> RunConfig:
     return RunConfig(
         scenario=args.scenario, host=args.host, port=args.port,
         timeout=args.timeout, load_timeout=args.load_timeout,
-        town=args.town, duration=args.duration,
+        town=args.town, xodr=args.xodr,
+        xodr_wall_height=args.xodr_wall_height, duration=args.duration,
         linger=args.linger, fixed_delta=args.fixed_delta,
         no_rendering=args.no_rendering, road_id=args.road_id,
         min_length=args.min_length, base=args.base, sync_mode=args.sync_mode,

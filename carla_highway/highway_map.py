@@ -312,13 +312,20 @@ class HighwayFrame:
 # Discovery helpers
 # --------------------------------------------------------------------------- #
 def _candidate_sections(cmap, seed_step: float, road_id: Optional[int]) -> List:
-    """One representative waypoint per (road, section, lane) group.
+    """One representative waypoint per (road, section) group.
 
     `generate_waypoints` hands back a dense grid; collapsing it to one seed per
     road section keeps the fit O(sections) instead of O(waypoints).
+
+    The representative is the one nearest the section's MIDDLE, not the first
+    one seen. `_fit_section` measures the run forwards and backwards from its
+    seed and keeps `2 * min(fwd, bwd)`, so a seed sitting at either end of a
+    section scores zero however long the road is. On the stock towns that
+    merely truncated some fits; on a generated single-road map
+    (`make_maps.py`) it is the difference between finding a 400 m highway and
+    reporting that the map has no straight in it at all.
     """
-    seen = set()
-    out = []
+    groups: Dict[tuple, List] = {}
     for wp in cmap.generate_waypoints(seed_step):
         if wp.is_junction:
             continue
@@ -327,11 +334,11 @@ def _candidate_sections(cmap, seed_step: float, road_id: Optional[int]) -> List:
             continue
         if road_id is not None and wp.road_id != road_id:
             continue
-        key = (wp.road_id, wp.section_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(wp)
+        groups.setdefault((wp.road_id, wp.section_id), []).append(wp)
+    out = []
+    for _, wps in sorted(groups.items()):
+        wps.sort(key=lambda w: float(getattr(w, "s", 0.0)))
+        out.append(wps[len(wps) // 2])
     return out
 
 
