@@ -4,3 +4,10 @@ __pycache__/
 outputs/
 sessions/
 .DS_Store
+
+# CARLA port
+carla_highway/outputs/
+carla_highway/reports/
+carla_port/sessions/
+run_output/
+*.mp4
