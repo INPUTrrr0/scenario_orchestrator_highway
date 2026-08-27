@@ -33,7 +33,8 @@ from carla_port.actuation import CarlaEgoActuator, LongitudinalPID
 from carla_port.carla_adapter import carla_actor_to_script_state, spawn_bindings
 from carla_port.carla_api import carla, use_fake
 from carla_port.carla_collision import CollisionMonitor
-from carla_port.carla_sync import (KINEMATIC, PHYSICS, StateSynchronizer,
+from carla_port.carla_sync import (HEADING_MODES, HEADING_MOTION, KINEMATIC,
+                                   PHYSICS, StateSynchronizer,
                                    sample_script_state, world_states)
 
 from . import scenarios as sc_mod
@@ -123,6 +124,11 @@ class RunConfig:
     sync_mode: str = PHYSICS
     z_offset: float = 0.10
     reground_every: int = 0
+    #: where a background actor's rendered yaw comes from. `motion` (the
+    #: direction it is travelling) rather than `plan` (the script's heading
+    #: field), because a closed-loop orchestrator reframes that field every
+    #: 0.10 s and the cut-in actor visibly shakes. See `carla_sync.heading_of`.
+    actor_heading: str = HEADING_MOTION
     adopt_carla_extents: bool = True
     #: CARLA blueprint for the background actors. A compact hatch/coupe keeps
     #: the fleet legible in the video AND close to the 4.5 m body the scenario
@@ -238,6 +244,10 @@ class HighwayRun:
         self._actor_traj: Dict[str, List[List[float]]] = {}
         self._spawns: Dict[str, List[float]] = {}
         self._cruise: Dict[str, float] = {}
+        #: `role:` as the scenario YAML authored it — `blocker`/`oncoming` for
+        #: overtake, `slow`/`adjacent` for hard_brake. The names the upstream
+        #: verifiers look up, straight from the source.
+        self._authored_roles: Dict[str, str] = {}
         self._next_traj_t = 0.0
 
     def _log(self, msg: str) -> None:
@@ -307,7 +317,19 @@ class HighwayRun:
 
         # ---- CARLA bodies ---- #
         models = {"*": cfg.actor_model} if cfg.actor_model else {}
-        colors = {"*": cfg.actor_color} if cfg.actor_color else {}
+        if str(cfg.actor_color).lower() == "script":
+            # Each actor in its authored colour. `overtake` is the mode that
+            # needs it: the blocker and the oncoming car play opposite parts
+            # and the YAML paints them apart (red / blue) precisely so a viewer
+            # can tell which is which. One fleet colour makes that video
+            # unreadable.
+            colors = {str(a.id): "{},{},{}".format(*[int(c) for c in a.color])
+                      for a in self.scenario.actors
+                      if getattr(a, "color", None)}
+        elif cfg.actor_color:
+            colors = {"*": cfg.actor_color}
+        else:
+            colors = {}
         if cfg.ego_model:
             models[str(cfg.ego)] = cfg.ego_model
         if cfg.ego_color:
@@ -371,6 +393,9 @@ class HighwayRun:
             cr = getattr(a, "cruise", None)
             if cr is not None:
                 self._cruise[aid] = float(cr)
+            role = getattr(a, "role", None)
+            if role:
+                self._authored_roles[aid] = str(role)
         ex, ey, eh = ego_actor.start[0], ego_actor.start[1], ego_actor.start[2]
         self._spawns[str(cfg.ego)] = [round(float(ex), 3), round(float(ey), 3),
                                       round(float(eh), 3),
@@ -379,7 +404,8 @@ class HighwayRun:
 
         self.sync = StateSynchronizer(self.frame, self.bindings,
                                       mode=cfg.sync_mode, z_offset=cfg.z_offset,
-                                      reground_every=cfg.reground_every)
+                                      reground_every=cfg.reground_every,
+                                      heading=cfg.actor_heading)
         if cfg.spectator:
             self._place_spectator()
         if not cfg.no_video:
@@ -583,7 +609,7 @@ class HighwayRun:
                 # orchestration decision made so far.
                 states[str(self.cfg.ego)] = sample_script_state(self.ego_actor,
                                                                 t_next)
-            self.sync.apply(states)
+            self.sync.apply(states, dt)
             # E. actuate the ego
             self._drive_ego(dt)
             # F. advance CARLA
@@ -708,6 +734,59 @@ class HighwayRun:
             self._ego_traj.append([t, round(ex, 3), round(ey, 3),
                                    round(hd % 360.0, 3), round(ev, 3)])
 
+    def _derive_roles(self) -> Dict[str, str]:
+        """Role labels for the modes the orchestrator does not cast.
+
+        `overtake` and `hard_brake` have fully scripted actors — `ModeSpec`
+        turns casting off on purpose, because cast roles or yields would change
+        the very timings those scenarios are tuned around. So nothing ever
+        writes a `roles` dict, and the upstream verifiers, which look one up
+        (`_role_id(data, "blocker")`), refuse both runs with `missing blocker
+        or oncoming role` before checking anything.
+
+        The roles are not arbitrary though — they are what the scenario's
+        geometry already says, so they can be read off it rather than
+        hardcoded:
+
+          overtake     `oncoming` faces the other way; `blocker` is the
+                       same-direction actor sharing the ego's lane.
+          hard_brake   `slow` shares the ego's lane; `adjacent` does not.
+
+        The scenarios do in fact author a `role:` on each actor and
+        `se.Actor.role` parses it, so that is used when it is there; the
+        geometric derivation is the fallback for a scenario that omits it.
+        Derived from the SPAWN poses, which is the moment both verifiers
+        describe their setup criteria at.
+        """
+        mode = self.cfg.scenario
+        if mode not in (sc_mod.OVERTAKE, sc_mod.HARD_BRAKE):
+            return {}
+        want = ({"blocker", "oncoming"} if mode == sc_mod.OVERTAKE
+                else {"slow", "adjacent"})
+        if want <= set(self._authored_roles.values()):
+            return dict(self._authored_roles)
+        ego_spawn = self._spawns.get(str(self.cfg.ego))
+        if not ego_spawn:
+            return {}
+        ego_x = float(ego_spawn[0])
+        half = self.frame.lane_width / 2.0
+        same_lane, other = [], []
+        roles: Dict[str, str] = {}
+        for aid, sp in self._spawns.items():
+            if aid == str(self.cfg.ego):
+                continue
+            if mode == sc_mod.OVERTAKE and not sc_mod._is_forward(float(sp[2])):
+                roles[aid] = "oncoming"
+                continue
+            (same_lane if abs(float(sp[0]) - ego_x) <= half else other).append(aid)
+        lead = "blocker" if mode == sc_mod.OVERTAKE else "slow"
+        near = "oncoming" if mode == sc_mod.OVERTAKE else "adjacent"
+        for aid in same_lane:
+            roles.setdefault(aid, lead)
+        for aid in other:
+            roles.setdefault(aid, near)
+        return roles
+
     def verify_report(self) -> dict:
         """The run in the schema `scripts/scenario_verify.py` reads.
 
@@ -739,7 +818,7 @@ class HighwayRun:
             "ego_trajectory": self._ego_traj,
             "actor_trajectories": self._actor_traj,
         }
-        roles = self.loop.roles or {}
+        roles = self.loop.roles or self._derive_roles()
         if roles:
             out["actor_roles"] = {str(k): str(v) for k, v in roles.items()}
         if mode == sc_mod.CUTIN:
@@ -1083,12 +1162,21 @@ def build_parser() -> argparse.ArgumentParser:
                    help="headless CARLA; implies --no-video")
     p.add_argument("--weather", default="clear", choices=["clear", "keep"])
     p.add_argument("--no-spectator", action="store_true")
+    p.add_argument("--actor-heading", default=HEADING_MOTION,
+                   choices=list(HEADING_MODES),
+                   help="where a background actor's rendered yaw comes from: "
+                        "'motion' (the direction it is travelling, smoothed) "
+                        "or 'plan' (the script's heading field verbatim, which "
+                        "a closed-loop replan resets every 0.10 s)")
     p.add_argument("--actor-model", default="vehicle.audi.tt",
                    help="CARLA blueprint for the background actors "
                         "(default vehicle.audi.tt); falls back to the closest "
                         "body-size match if this build has no such blueprint")
     p.add_argument("--actor-color", default="200,30,30",
-                   help="R,G,B paint for the background actors (default red)")
+                   help="R,G,B paint for the background actors (default red), "
+                        "or 'script' to give each actor the colour its YAML "
+                        "authored — which is what makes overtake's blocker and "
+                        "oncoming car tellable apart")
     p.add_argument("--ego-model", default=None,
                    help="CARLA blueprint for the ego (default: closest match "
                         "to its declared body)")
@@ -1131,6 +1219,7 @@ def config_from_args(args) -> RunConfig:
         video_size=(int(w), int(h or 540)), video_fps=args.video_fps,
         video_top_span=args.video_top_span, hud=not args.no_hud,
         no_video=args.no_video or args.no_rendering, weather=args.weather,
+        actor_heading=args.actor_heading,
         actor_model=args.actor_model, actor_color=args.actor_color,
         ego_model=args.ego_model, ego_color=args.ego_color,
         spectator=not args.no_spectator, report=args.report,

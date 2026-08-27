@@ -420,6 +420,16 @@ ego's lane changes and whether it used the oncoming lane, per-actor minimum gap
 and pass/no-pass, every orchestration event with its timestamp, and all realized
 CARLA collisions.
 
+### Role labels for the modes that do not cast
+
+`overtake` and `hard_brake` turn casting off on purpose, so nothing writes a
+`roles` dict — and both upstream verifiers look one up before checking
+anything, refusing the run with `missing blocker or oncoming role`. The
+scenarios do author a `role:` per actor and `se.Actor.role` parses it, so
+`runner._derive_roles` passes those through, falling back to reading them off
+the spawn geometry (who faces the other way; who shares the ego's lane) for a
+scenario that omits them. The validation suite checks the two agree.
+
 ### Grading with the upstream verifier instead
 
 That grade is asked in CARLA's terms — did the collision sensor fire, did the
@@ -513,11 +523,34 @@ are what distinguish them.
 
 ### The stress scenarios
 
-| run | verdict | what happened |
-|---|---|---|
-| `hard_brake` | **PASS** | MOBIL pulls left at t≈4.4 s (`lane 1 -> 0, gain 0.30 > threshold 0.30`), passes the 4 m/s lead with 1.48 m to spare and returns to lane 1; 152.8 m, ends at 11.8 m/s |
-| `overtake` | **PASS** | waits out the oncoming car, creeps past the blocker, returns to lane |
-| `hard_brake --no-lane-change` | **FAIL** | "stuck behind the slow lead" — 85.3 m, ends at 4.11 m/s |
+| run | verdict | upstream verifier | what happened |
+|---|---|---|---|
+| `hard_brake` | **PASS** | fail (setup) | MOBIL pulls left at t≈4.4 s (`lane 1 -> 0, gain 0.30 > threshold 0.30`), passes the 4 m/s lead with 1.48 m to spare and returns to lane 1; 154.8 m, ends at 11.8 m/s |
+| `overtake` | **PASS** | **OK 7/7** | stands off the blocker, waits out the oncoming car, edges into the contraflow lane, passes with 0.36 m and comes home; 147.7 m |
+| `hard_brake --no-lane-change` | **FAIL** | — | "stuck behind the slow lead" — 85.3 m, ends at 4.11 m/s |
+
+`overtake` verifying end to end is the useful row: setup *and* outcome, all
+seven checks, on a run CARLA actually simulated.
+
+`hard_brake`'s verifier failure is not the ego. It is
+`1_brake_when_close`, and the reason is that the scenario and the document
+describe different things. `docs/SCENARIOS_AND_VALIDATION.md` asks for an actor
+that *starts braking* once the ego is within `HARD_BRAKE_TRIGGER_GAP_M`, showing
+`HARD_BRAKE_MIN_DECEL` and not crawling beforehand
+(`HARD_BRAKE_PRETRIGGER_MIN_MPS`, 8 m/s). `scenarios/scenario_hard_brake.yaml`
+authors a lead that never brakes at all:
+
+```yaml
+  - id: 1
+    role: slow
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 4.0, accel: 0.0}}
+```
+
+A constant 4 m/s for forty seconds. The verifier reports exactly that —
+`braking actor already slow (4.0 m/s) before gap ≤ 6 m` — and it is right. The
+scenario is a *slow lead*, not a *hard brake*; one of the two needs changing,
+and which one is a question about intent rather than about this port.
 
 **`hard_brake --no-lane-change` failing is the evidence for §4.**
 
@@ -526,6 +559,37 @@ lane-keeping IDM — drivev2's original behaviour — the ego closes on the 4 m/
 matches its speed and sits there for the whole run. The scenario is not
 solvable without a lateral decision, so a port that only inherited drivev2's
 policy would have reported the harness failing rather than the policy.
+
+### The rendered yaw is the direction of travel, not the plan's heading field
+
+The cut-in actor visibly *shook* through its merge. Its yaw was a **±5° sawtooth
+at 10 Hz** — the orchestration cadence exactly. `CutinOrchestrator` records each
+actor's nominal lane heading at first sight and restarts every replan from it,
+deliberately, so a manoeuvre's temporary yaw cannot compound into the next plan
+frame; within each 0.10 s tick the fresh lane-change maneuver swings it back
+out. In pygame this is invisible, and PR #1 says why in as many words: a
+scripted actor's "heading is decorative". This port feeds it to
+`set_transform` sixty times a second on a 3D vehicle body, and a decorative
+number becomes the car's attitude.
+
+`carla_sync.heading_of` renders the direction the actor is actually travelling
+instead, low-passed (`HEADING_TAU`) and rate-capped (`HEADING_RATE_MAX`). It
+cannot feed back into any decision — the orchestrator reasons about
+`Actor.traj`, never about what CARLA was told. Yaw acceleration through the
+merge, the quantity that reads as shake, drops **3×** (mean 2.24 → 0.77
+deg/step², worst 15.9 → 4.8).
+
+One catch worth stating, because it is the more interesting half. Direction of
+travel is a vehicle's yaw only while the plan is drivable, and a cut-in
+replanned every 0.10 s is not: each replan demands the whole remaining lateral
+correction in the remaining time, so the actor's commanded speed collapses
+(12 → 2.9 m/s across one merge) while its lateral rate holds near 4.6 m/s. Its
+true direction of travel is then **50° off the road**, and rendering that
+honestly gives a car crabbing sideways down the highway — smooth, and worse.
+So the direction of travel supplies the lean and the plan's heading supplies
+what it leans from, bounded by `HEADING_MAX_SLIP` (20°, past the 14° the
+repository's own ego policy allows itself). `--actor-heading plan` restores the
+verbatim field.
 
 ### The merged actor must hold its own cruise, not the ego's
 

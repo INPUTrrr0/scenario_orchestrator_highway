@@ -327,6 +327,104 @@ def check_ego_policy(ck: Checks, cmap) -> None:
              pol_p.lc is not None and pol_p.lc["s"] == before,
              "distance-parameterised, so braking to a crawl stops the merge")
 
+    # --- the speed floor must not deadlock an ego stopped behind a blocker --- #
+    # MOBIL_V_MIN stops the ego twitching between lanes at walking pace; on
+    # `overtake` the ego ends up stopped nose-to-tail with a stopped blocker,
+    # and there refusing to decide is permanent. The two cases differ by WHY
+    # the ego is slow, not by how slow it is.
+    from .highway_ego import BLOCKED_GAP_M, MOBIL_V_MIN
+    ego_b = Ego(x=x, y=y, theta=math.radians(h), v=0.4)
+    pol_b = HighwayEgoPolicy(frame, ego_b, bg, atime=0.0)
+    lane_x = frame.lane_center_x(pol_b.target_lane)
+
+    def _lead(speed: float, along: float) -> Neighbour:
+        return Neighbour(actor_id="L", lane=pol_b.target_lane, lat=lane_x,
+                         along=along, gap=max(along - 4.5, 0.5), speed=speed,
+                         oncoming=False, length=4.5, width=2.0)
+
+    ck.check("ego/MOBIL: a stopped blocker lifts the low-speed hold",
+             pol_b._blocked([_lead(0.0, 7.0)]),
+             f"stopped {7.0 - 4.5:.1f} m ahead, ego at 0.4 m/s "
+             f"(floor {MOBIL_V_MIN} m/s)")
+    ck.check("ego/MOBIL: moving traffic does not lift it",
+             not pol_b._blocked([_lead(6.0, 7.0)]),
+             "a lead still doing 6 m/s is not a deadlock")
+    ck.check("ego/MOBIL: a distant stopped car does not lift it",
+             not pol_b._blocked([_lead(0.0, BLOCKED_GAP_M + 20.0)]),
+             f"stopped but {BLOCKED_GAP_M + 20.0:.0f} m off is not blocking us")
+
+    # ...and having lifted it, the ego must have room to actually get out.
+    from .highway_ego import BLOCKED_STANDOFF_M, LC_DISTANCE_SLOW, IDM_S0
+    blocked = [_lead(0.0, 9.0)]
+    a_stand = pol_b._idm_accel(pol_b._gap_to(blocked[0]), 0.0,
+                               s0=BLOCKED_STANDOFF_M)
+    a_jam = pol_b._idm_accel(pol_b._gap_to(blocked[0]), 0.0, s0=IDM_S0)
+    ck.check("ego/MOBIL: stands off further from a blocker it may go round",
+             a_stand < a_jam,
+             f"4.5 m gap: {a_stand:+.2f} vs {a_jam:+.2f} m/s^2 — IDM's own "
+             f"{IDM_S0} m jam distance parks it nose-to-tail, with no room "
+             "left to swing out")
+    pol_b.ego.v = 0.0
+    pol_b.lc = None
+    pol_b._commit(1 if pol_b.target_lane == 0 else 0, now=100.0)
+    ck.check("ego/MOBIL: a change from a standstill uses the short profile",
+             pol_b.lc is not None
+             and pol_b.lc["L"] == LC_DISTANCE_SLOW
+             and LC_DISTANCE_SLOW <= BLOCKED_STANDOFF_M + 2.0,
+             f"L={pol_b.lc['L']} m, inside the {BLOCKED_STANDOFF_M} m standoff; "
+             f"a {LC_DISTANCE:.0f} m highway profile cannot clear a car that close")
+    pol_b.ego.v = 12.0
+    pol_b.lc = None
+    pol_b._last_change = -1e9
+    pol_b._commit(pol_b.target_lane ^ 1, now=200.0)
+    ck.check("ego/MOBIL: a change at speed still uses the highway profile",
+             pol_b.lc is not None and pol_b.lc["L"] == LC_DISTANCE,
+             f"L={pol_b.lc['L']} m at 12 m/s")
+
+    # MOBIL must evaluate the blocker at the SAME standoff idm_control holds,
+    # or the ego parks at arm's length and never decides to go round.
+    ego_s = Ego(x=x, y=y, theta=math.radians(h), v=0.0)
+    pol_s = HighwayEgoPolicy(frame, ego_s, bg, atime=0.0)
+    stopped = [_lead(0.0, BLOCKED_STANDOFF_M + 4.5)]     # 8 m bumper to bumper
+    ck.check("ego/MOBIL: idm_control and MOBIL agree on the standoff",
+             pol_s._ego_s0(stopped) == BLOCKED_STANDOFF_M,
+             "one question, asked once, used by both")
+    other = 1 if pol_s.target_lane == 0 else 0
+    ok_go, gain_go, why_go = pol_s._mobil_evaluate(pol_s.target_lane, other,
+                                                   stopped)
+    a_jam2 = pol_s._idm_accel(BLOCKED_STANDOFF_M, 0.0, s0=IDM_S0)
+    ck.check("ego/MOBIL: a stopped blocker at the standoff is worth going round",
+             ok_go,
+             f"{why_go}; at IDM's jam distance the same car scores "
+             f"{a_jam2:+.2f} m/s^2 and the change is refused")
+
+    # Contraflow must be dear to enter and cheap to leave. Once past the
+    # blocker both lanes are free, the incentive is a dead tie, and a tie loses
+    # — so without the second half the ego stays on the wrong side of the road.
+    try:
+        frame_o, ego_ao, bg_o, _ = sc_mod.build(world, sc_mod.OVERTAKE)
+    except RuntimeError:
+        frame_o = None
+    if frame_o is not None and frame_o.oncoming_lanes():
+        onc = frame_o.lane_index_for_direction(False)
+        home = frame_o.lane_index_for_direction(True)
+        xo, yo, ho = ego_ao.start
+        pol_o = HighwayEgoPolicy(frame_o,
+                                 Ego(x=frame_o.lane_center_x(onc), y=yo,
+                                     theta=math.radians(ho), v=12.0),
+                                 bg_o, atime=0.0)
+        pol_o.home_lane = home
+        pol_o.target_lane = onc
+        _, _, why_out = pol_o._mobil_evaluate(home, onc, [])
+        _, _, why_back = pol_o._mobil_evaluate(onc, home, [])
+        thr_out = float(why_out.rsplit(" ", 1)[-1])
+        thr_back = float(why_back.rsplit(" ", 1)[-1])
+        ck.check("ego/MOBIL: leaving the oncoming lane is cheaper than entering",
+                 thr_back < 0.0 < thr_out,
+                 f"threshold out {thr_out:+.2f} vs back {thr_back:+.2f} — "
+                 "coming home must not have to win a tie")
+
+
     # --- signed speeds: an oncoming car must not read as a fast leader --- #
     ego_s = Ego(x=x, y=y, theta=math.radians(h), v=12.0)
     pol_s = HighwayEgoPolicy(frame, ego_s, bg, atime=0.0)
@@ -388,6 +486,110 @@ def check_ego_policy(ck: Checks, cmap) -> None:
     ck.check("ego: a car merging between lanes is still a leader",
              gap is not None,
              "1.6 m off the ego's line is inside IDM_LANE_TOL")
+
+
+def check_heading_smoothing(ck: Checks, cmap) -> None:
+    """The rendered yaw must not carry the orchestrator's replan sawtooth."""
+    from carla_port.carla_adapter import ScriptState
+    from carla_port.carla_sync import (DT, HEADING_MOTION, HEADING_PLAN,
+                                       HEADING_RATE_MAX, StateSynchronizer)
+
+    class _Frame:                       # heading_of touches nothing else
+        pass
+
+    # A car driving straight up +y at 12 m/s whose PLAN heading is reset to the
+    # nominal lane heading every 0.10 s and swung out again in between — the
+    # measured shape of the cut-in actor's yaw during its merge.
+    def _states(n: int):
+        for k in range(n):
+            phase = k % 6
+            plan_h = 90.0 - 9.0 * (phase / 5.0)      # 90 -> 81, then snap back
+            yield ScriptState("4", -3.5 + 0.02 * k, 12.0 * DT * k, plan_h, 12.0)
+
+    def _yaws(mode: str):
+        sync = StateSynchronizer.__new__(StateSynchronizer)
+        sync.heading = mode
+        sync._last_xy, sync._yaw = {}, {}
+        return [sync.heading_of(st, DT) for st in _states(120)][10:]
+
+    plan = _yaws(HEADING_PLAN)
+    motion = _yaws(HEADING_MOTION)
+    swing_plan = max(plan) - min(plan)
+    swing_motion = max(motion) - min(motion)
+    ck.check("sync: heading from motion removes the replan sawtooth",
+             swing_motion < swing_plan / 5.0,
+             f"peak-to-peak yaw {swing_motion:.2f} deg vs {swing_plan:.2f} deg "
+             "written verbatim from the plan")
+
+    rate = max(abs((b - a + 180.0) % 360.0 - 180.0) / DT
+               for a, b in zip(motion, motion[1:]))
+    ck.check("sync: the rendered yaw stays inside a vehicle's turn rate",
+             rate <= HEADING_RATE_MAX + 1e-6,
+             f"worst {rate:.1f} deg/s, cap {HEADING_RATE_MAX} deg/s")
+
+    # ...and the lean must stay inside a plausible vehicle attitude even when
+    # the plan itself is not drivable (a replanned cut-in slides sideways
+    # faster than it drives forward).
+    from carla_port.carla_sync import HEADING_MAX_SLIP
+    sync = StateSynchronizer.__new__(StateSynchronizer)
+    sync.heading = HEADING_MOTION
+    sync._last_xy, sync._yaw = {}, {}
+    crab = []
+    for k in range(120):
+        # 3 m/s forward, 4.5 m/s sideways: a true direction of travel ~56 deg
+        # off the road, which is what the merge actually commands
+        crab.append(sync.heading_of(
+            ScriptState("4", 0.0 + 4.5 * DT * k, 3.0 * DT * k, 90.0, 3.0), DT))
+    worst = max(abs((h - 90.0 + 180.0) % 360.0 - 180.0) for h in crab)
+    ck.check("sync: an undrivable plan is not rendered as a drift",
+             worst <= HEADING_MAX_SLIP + 1e-6,
+             f"worst lean {worst:.1f} deg, capped at {HEADING_MAX_SLIP} deg; "
+             "the raw direction of travel here is ~56 deg off the road")
+
+    # A stopped actor has no direction of travel and must not spin.
+    sync = StateSynchronizer.__new__(StateSynchronizer)
+    sync.heading = HEADING_MOTION
+    sync._last_xy, sync._yaw = {}, {}
+    still = [sync.heading_of(ScriptState("1", 5.0, 5.0, 90.0, 0.0), DT)
+             for _ in range(40)]
+    ck.check("sync: a stopped actor holds its heading",
+             max(still) - min(still) < 1e-9,
+             "no direction of travel to read, so the last good one is held")
+
+
+def check_verify_roles(ck: Checks, cmap) -> None:
+    """The role labels the upstream overtake / hard_brake verifiers look up."""
+    from . import scenarios as sc_mod
+    from .runner import HighwayRun, RunConfig
+    world = _World(cmap)
+    for mode, want in ((sc_mod.OVERTAKE, {"blocker", "oncoming"}),
+                       (sc_mod.HARD_BRAKE, {"slow", "adjacent"})):
+        try:
+            frame, ego_a, bg, _ = sc_mod.build(world, mode)
+        except RuntimeError as exc:
+            ck.add(_SKIP, f"verify roles: {mode}", str(exc))
+            continue
+        run = HighwayRun.__new__(HighwayRun)
+        run.cfg = RunConfig(scenario=mode)
+        run.frame = frame
+        run._spawns = {sc_mod.EGO_ID: [ego_a.start[0], ego_a.start[1],
+                                       ego_a.start[2], 4.5, 2.0]}
+        run._authored_roles = {}
+        for a in bg.actors:
+            run._spawns[str(a.id)] = [a.start[0], a.start[1], a.start[2],
+                                      a.length, a.width]
+            if getattr(a, "role", None):
+                run._authored_roles[str(a.id)] = str(a.role)
+        roles = run._derive_roles()
+        ck.check(f"verify roles: {mode} labels both parts",
+                 set(roles.values()) == want and len(roles) == len(bg.actors),
+                 f"{roles} — without these the upstream verifier refuses the "
+                 "run with 'missing ... role' before checking anything")
+        # and the geometric fallback must agree with what the YAML authored
+        run._authored_roles = {}
+        ck.check(f"verify roles: {mode} derivation agrees with the YAML",
+                 run._derive_roles() == roles,
+                 "the fallback reads the same roles off the spawn geometry")
 
 
 def check_closed_loop(ck: Checks, cmap) -> None:
@@ -529,6 +731,10 @@ def main(argv=None) -> int:
     if first is not None:
         print("== ego policy ==")
         check_ego_policy(ck, first)
+        print("== sync ==")
+        check_heading_smoothing(ck, first)
+        print("== verify roles ==")
+        check_verify_roles(ck, first)
         print("== closed loop ==")
         check_closed_loop(ck, first)
     else:

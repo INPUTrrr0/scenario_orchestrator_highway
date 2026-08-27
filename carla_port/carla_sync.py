@@ -51,6 +51,39 @@ PHYSICS = "physics"      # physics on: set_transform + set_target_velocity.
 KINEMATIC = "kinematic"  # physics off: set_transform only. Perfectly rigid
                          # playback, but UE generates far fewer hit events.
 
+# where a background actor's YAW comes from
+HEADING_PLAN = "plan"      # the script's own heading field, written verbatim
+HEADING_MOTION = "motion"  # the direction the actor is actually travelling
+HEADING_MODES = (HEADING_PLAN, HEADING_MOTION)
+
+#: Below this much movement in one step the direction of travel is numerical
+#: noise, so the last good heading is held rather than recomputed.
+HEADING_MIN_STEP = 0.02      # m
+#: Low-pass on the raw direction of travel. The commanded positions are
+#: themselves slightly uneven across a replan, and differentiating them
+#: amplifies that; this is short enough to track a real lane change (~2 s) and
+#: long enough to reject a one-step wobble.
+HEADING_TAU = 0.12           # s
+#: Hard cap on how fast the rendered yaw may turn. A road vehicle at speed does
+#: not exceed this, and it bounds anything the filter has not already removed.
+HEADING_RATE_MAX = 90.0      # deg/s
+#: How far the rendered yaw may sit from the plan's own heading.
+#:
+#: Direction of travel is a vehicle's yaw only while the plan is something a
+#: vehicle could drive. A closed-loop cut-in replanned every 0.10 s is not: each
+#: replan demands the whole remaining lateral correction inside the remaining
+#: time, so the merging actor's commanded speed collapses (12 -> 2.9 m/s across
+#: one merge) while its lateral rate stays near 4.6 m/s. Its true direction of
+#: travel is then 50 deg off the road, and rendering that honestly gives a car
+#: crabbing sideways down the highway.
+#:
+#: So the direction of travel supplies the LEAN and the plan's heading supplies
+#: the reference it leans from. 20 deg is a hard swerve and comfortably past
+#: the 14 deg the repository's own ego policy allows itself (`LC_YAW_MAX` in
+#: drivev2), so a real manoeuvre is never clipped and a physically impossible
+#: one is.
+HEADING_MAX_SLIP = 20.0      # deg
+
 
 # --------------------------------------------------------------------------- #
 # Sampling the script
@@ -95,18 +128,25 @@ class StateSynchronizer:
 
     def __init__(self, frame: IntersectionFrame, bindings: BindingSet,
                  mode: str = PHYSICS, z_offset: float = 0.05,
-                 sync_velocity: bool = True, reground_every: int = 0):
+                 sync_velocity: bool = True, reground_every: int = 0,
+                 heading: str = HEADING_MOTION):
         if mode not in (PHYSICS, KINEMATIC):
             raise ValueError(f"unknown sync mode {mode!r}")
+        if heading not in HEADING_MODES:
+            raise ValueError(f"unknown heading mode {heading!r}; expected one "
+                             f"of {', '.join(HEADING_MODES)}")
         self.frame = frame
         self.bindings = bindings
         self.mode = mode
         self.z_offset = z_offset
         self.sync_velocity = sync_velocity
         self.reground_every = reground_every       # 0 = never re-query ground z
+        self.heading = heading
         self._n = 0
+        self._last_xy: Dict[str, tuple] = {}
+        self._yaw: Dict[str, float] = {}
 
-    def apply(self, states: Dict[str, ScriptState]) -> int:
+    def apply(self, states: Dict[str, ScriptState], dt: float = DT) -> int:
         """Synchronize every bound actor to its planned state. Returns the
         number of actors actually written."""
         written = 0
@@ -114,16 +154,66 @@ class StateSynchronizer:
             st = states.get(binding.script_actor_id)
             if st is None:
                 continue
-            self.apply_one(binding, st)
+            self.apply_one(binding, st, dt)
             written += 1
         self._n += 1
         return written
 
-    def apply_one(self, binding, st: ScriptState) -> None:
+    def heading_of(self, st: ScriptState, dt: float) -> float:
+        """The yaw to render this actor with.
+
+        `HEADING_PLAN` writes the script's heading field verbatim. That field
+        is not a vehicle attitude — it is an artifact of how the current plan
+        was framed, and a closed-loop orchestrator reframes it constantly. On
+        `scenario_cutin` the cut-in actor is replanned every 0.10 s from its
+        NOMINAL LANE heading (`CutinOrchestrator.headings`, recorded at first
+        sight), deliberately, so the manoeuvre's temporary yaw cannot compound
+        into the next plan frame. Within each tick the fresh lane-change
+        maneuver then swings the heading back out. The result is a sawtooth:
+        the merging actor's yaw oscillated +/-5 deg at 10 Hz through the whole
+        merge.
+
+        In pygame that is invisible — a scripted actor's heading is decorative,
+        drawn as a small rectangle and never differentiated. Here it is fed to
+        `set_transform` sixty times a second on a 3D vehicle body, and the car
+        visibly shakes.
+
+        `HEADING_MOTION` renders the direction the actor is actually
+        travelling, low-passed and rate-capped. On a smooth path that IS a
+        vehicle's yaw, it is continuous by construction, and it cannot feed
+        back into any decision: the orchestrator reasons about `Actor.traj`,
+        never about what CARLA was told.
+        """
+        aid = st.actor_id
+        prev = self._last_xy.get(aid)
+        self._last_xy[aid] = (st.x, st.y)
+        if self.heading == HEADING_PLAN or prev is None:
+            self._yaw[aid] = st.heading
+            return st.heading
+        cur = self._yaw.get(aid, st.heading)
+        dx, dy = st.x - prev[0], st.y - prev[1]
+        if math.hypot(dx, dy) < HEADING_MIN_STEP:
+            return cur                      # stopped: hold, do not spin
+        raw = math.degrees(math.atan2(dy, dx))
+        # keep the lean inside what a vehicle can actually hold — see
+        # HEADING_MAX_SLIP
+        slip = (raw - st.heading + 180.0) % 360.0 - 180.0
+        raw = st.heading + max(-HEADING_MAX_SLIP, min(HEADING_MAX_SLIP, slip))
+        err = (raw - cur + 180.0) % 360.0 - 180.0
+        alpha = (1.0 - math.exp(-dt / HEADING_TAU)) if dt > 0.0 else 1.0
+        cap = HEADING_RATE_MAX * max(dt, 1e-6)
+        step = max(-cap, min(cap, err * alpha))
+        cur = (cur + step) % 360.0
+        self._yaw[aid] = cur
+        return cur
+
+    def apply_one(self, binding, st: ScriptState, dt: float = DT) -> None:
         z = binding.ground_z
         if self.reground_every and self._n % self.reground_every == 0:
             z = self._ground_z(st, z)
             binding.ground_z = z
+        heading = self.heading_of(st, dt)
+        st = ScriptState(st.actor_id, st.x, st.y, heading, st.speed)
         tf = script_state_to_carla_transform(st, self.frame, z + self.z_offset)
         actor = binding.carla_actor
         actor.set_transform(tf)

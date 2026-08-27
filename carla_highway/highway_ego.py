@@ -112,7 +112,31 @@ MOBIL_B_SAFE = 4.0       # hard safety limit (m/s^2): never force the vehicle
 MOBIL_MIN_INTERVAL = 2.0  # s of cooldown after a committed change (hysteresis)
 MOBIL_V_MIN = 3.0        # m/s below which we hold the lane; MOBIL is a highway
                          # model and swapping lanes at walking pace is not a
-                         # real manoeuvre
+                         # real manoeuvre. See BLOCKED_* for the one exception.
+#: `MOBIL_V_MIN` exists to stop the ego twitching between lanes at walking pace.
+#: But `overtake` ends with the ego stopped behind a stopped blocker, and there
+#: a low-speed lane change is not a twitch — it is the entire manoeuvre, and
+#: refusing to decide is a permanent deadlock rather than a moment of patience.
+#: Upstream never meets this: its own justification for the floor is that pure
+#: pursuit saturates at low speed, and none of its scenarios stop the ego. The
+#: profile that replaced pure pursuit here does not saturate (it advances on
+#: distance, so it simply makes no progress while stopped), so the floor is
+#: lifted exactly when the ego is stopped because something ahead of it is.
+BLOCKED_LEAD_MPS = 1.0   # a leader at or below this is stopped, not merely slow
+BLOCKED_GAP_M = 12.0     # ...and this close is blocking us, not merely ahead
+#: How far back to stop behind a stopped blocker while going round it is still
+#: on the table. IDM's own jam distance (`IDM_S0`, 2 m) parks the ego
+#: nose-to-tail, and from there NO smooth path clears the blocker: swinging a
+#: full lane wide needs longitudinal room, and 2 m of it is not enough at any
+#: profile length. The ego drove into the blocker's rear doing 0.16 m/s. Real
+#: drivers leave themselves room to pull out; this is that room.
+BLOCKED_STANDOFF_M = 8.0
+#: Profile length for a change committed from a standstill. `LC_DISTANCE` is a
+#: highway lane change — 30 m of road at cruise. Edging around a stopped car is
+#: a different manoeuvre and has to finish inside the standoff above; the floor
+#: is set by the steering, since curvature goes as 1/L^2 and much below this
+#: the feedforward term asks for more than DELTA_MAX.
+LC_DISTANCE_SLOW = 10.0
 MOBIL_SETTLE_TOL = 0.35  # m: only re-decide once this close to the centre of
                          # the lane already being headed for
 #: Keep-home bias (m/s^2), the asymmetric threshold that stops the ego camping
@@ -129,6 +153,8 @@ MOBIL_BIAS_HOME = 0.15
 #: cleaner argument. It is kept here because `_oncoming_clear` below is a
 #: time-to-arrival veto rather than an acceleration test, and the two want to
 #: agree about reluctance; `overtake` is the only mode with a contraflow lane.
+#: Applied symmetrically — added when entering a contraflow lane, subtracted
+#: when leaving one, so coming home after a pass does not have to win a tie.
 MOBIL_BIAS_ONCOMING = 0.5
 
 # ---- lane-change trajectory: drivev2.py, PR #1 ---- #
@@ -359,7 +385,8 @@ class HighwayEgoPolicy:
 
     def _idm_accel(self, gap: Optional[float], v_lead: Optional[float],
                    v: Optional[float] = None,
-                   v0: Optional[float] = None) -> float:
+                   v0: Optional[float] = None,
+                   s0: float = IDM_S0) -> float:
         """The IDM acceleration (m/s^2) for a vehicle at speed `v` with a leader
         `gap` metres ahead doing `v_lead` — or on an open road when `gap` is
         None. drivev2's `idm_control`, before the throttle normalization.
@@ -375,8 +402,8 @@ class HighwayEgoPolicy:
         if gap is None or v_lead is None:
             return free
         dv = v - v_lead
-        s_star = IDM_S0 + max(0.0, v * IDM_T
-                              + (v * dv) / (2.0 * math.sqrt(IDM_A * IDM_B)))
+        s_star = s0 + max(0.0, v * IDM_T
+                          + (v * dv) / (2.0 * math.sqrt(IDM_A * IDM_B)))
         return free - IDM_A * (s_star / max(gap, 0.5)) ** 2
 
     # ------------------------------------------------------------------ #
@@ -424,6 +451,46 @@ class HighwayEgoPolicy:
                 return False
         return True
 
+    def _ego_s0(self, nbrs: List[Neighbour]) -> float:
+        """The jam distance the ego is holding this tick.
+
+        `BLOCKED_STANDOFF_M` while a stopped blocker it may still go round is
+        ahead of it, `IDM_S0` otherwise. It has to be asked ONCE and used by
+        both the longitudinal law and MOBIL, because MOBIL's incentive is a
+        difference of IDM accelerations and that comparison only means anything
+        if both sides come out of the identical formula — the reason
+        `_idm_accel` is parameterised at all.
+
+        Giving the standoff to `idm_control` alone deadlocks the ego in the one
+        scenario it exists for. Held 8 m back but evaluated at the 2 m jam
+        distance, a stopped blocker scores `a_e_cur = +2.8 m/s^2` — the ego
+        believes it is free to accelerate — so the gain from moving over is
+        0.19 against a threshold of 0.80, and it sits at arm's length from the
+        obstacle for the rest of the run, having neither passed it nor hit it.
+        At the standoff the same car scores 0.0 and the gain is the full 3.0.
+        """
+        return (BLOCKED_STANDOFF_M
+                if (self.allow_lane_change and self.lc is None
+                    and self._blocked(nbrs))
+                else IDM_S0)
+
+    def _blocked(self, nbrs: List[Neighbour]) -> bool:
+        """Is the ego stopped *because* something in its lane is stopped?
+
+        The distinction `MOBIL_V_MIN` cannot make on speed alone: an ego doing
+        0.4 m/s in stop-start traffic should hold its lane, and an ego doing
+        0.4 m/s nose-to-tail with a parked blocker should be looking for a way
+        round. Only the second is a deadlock, and only the second gets to
+        decide below the floor.
+        """
+        lead, _ = self._lane_neighbours(
+            self.frame.lane_center_x(self.frame.lane_index_of(self.ego.x)), nbrs)
+        if lead is None or lead.oncoming:
+            return False
+        gap = self._gap_to(lead)
+        return (abs(lead.speed) <= BLOCKED_LEAD_MPS
+                and gap is not None and gap <= BLOCKED_GAP_M)
+
     def _mobil_evaluate(self, cur: int, cand: int, nbrs: List[Neighbour]
                         ) -> Tuple[bool, float, str]:
         """MOBIL's two tests for moving from lane `cur` to lane `cand`.
@@ -446,12 +513,13 @@ class HighwayEgoPolicy:
         v_e = self.ego.v
         lead_c, fol_c = self._lane_neighbours(cur_x, nbrs)
         lead_t, fol_t = self._lane_neighbours(tgt_x, nbrs)
+        s0 = self._ego_s0(nbrs)         # the SAME standoff idm_control is using
 
         # --- us: before (staying) vs after (merged) ---
         a_e_cur = self._idm_accel(self._gap_to(lead_c),
-                                  lead_c.speed if lead_c else None)
+                                  lead_c.speed if lead_c else None, s0=s0)
         a_e_new = self._idm_accel(self._gap_to(lead_t),
-                                  lead_t.speed if lead_t else None)
+                                  lead_t.speed if lead_t else None, s0=s0)
 
         # --- new follower: before (following lead_t) vs after (following us) ---
         if fol_t is None:
@@ -480,8 +548,16 @@ class HighwayEgoPolicy:
         thr = MOBIL_A_THR
         toward_home = abs(cand - self.home_lane) < abs(cur - self.home_lane)
         thr += -MOBIL_BIAS_HOME if toward_home else MOBIL_BIAS_HOME
+        # Contraflow is dear to enter and cheap to leave. The second half
+        # matters as much as the first: once the ego is past the blocker both
+        # lanes are free-flowing, so the incentive term is a dead tie — and a
+        # tie loses, leaving the ego driving down the wrong side of the road
+        # for the rest of the run. Being on the wrong side is an ongoing cost,
+        # not a one-off toll, so it belongs on both sides of the threshold.
         if not self.frame.lanes[cand].same_direction:
             thr += MOBIL_BIAS_ONCOMING
+        if not self.frame.lanes[cur].same_direction:
+            thr -= MOBIL_BIAS_ONCOMING
         if gain <= thr:
             return False, gain, "gain %.2f <= threshold %.2f" % (gain, thr)
         return True, gain, "gain %.2f > threshold %.2f" % (gain, thr)
@@ -499,9 +575,10 @@ class HighwayEgoPolicy:
             return cur
         tgt_x = self.frame.lane_center_x(cur)
         if (now - self._last_change < MOBIL_MIN_INTERVAL
-                or self.ego.v < MOBIL_V_MIN
                 or abs(self.ego.x - tgt_x) > MOBIL_SETTLE_TOL):
-            return cur                  # crawling, or mid-change: let it finish
+            return cur                  # cooling down, or mid-change: finish it
+        if self.ego.v < MOBIL_V_MIN and not self._blocked(nbrs):
+            return cur                  # crawling for no reason: hold the lane
 
         best = None
         for cand in (cur - 1, cur + 1):
@@ -549,7 +626,12 @@ class HighwayEgoPolicy:
             if not self.frame.lanes[lane].same_direction:
                 self.used_oncoming = True
             self.lc = {"x0": self.ego.x,
-                       "x1": self.frame.lane_center_x(lane), "s": 0.0}
+                       "x1": self.frame.lane_center_x(lane), "s": 0.0,
+                       # A change committed from a standstill is an edge round
+                       # a stopped car, not a highway lane change, and has to
+                       # finish inside BLOCKED_STANDOFF_M rather than 30 m.
+                       "L": (LC_DISTANCE_SLOW if self.ego.v < MOBIL_V_MIN
+                             else LC_DISTANCE)}
             self.target_lane = lane
         return lane
 
@@ -589,7 +671,7 @@ class HighwayEgoPolicy:
         if self.lc is None:
             return (self.frame.lane_center_x(self.target_lane), 0.0, 0.0)
         lc = self.lc
-        d, L = lc["x1"] - lc["x0"], LC_DISTANCE
+        d, L = lc["x1"] - lc["x0"], lc.get("L", LC_DISTANCE)
         v = self.ego.v
         f, df, ddf = self._smoothstep(lc["s"] / L)
         return (lc["x0"] + d * f, d * df * v / L, d * ddf * (v / L) ** 2)
@@ -639,7 +721,7 @@ class HighwayEgoPolicy:
         if self.lc is None:
             return
         self.lc["s"] += max(0.0, ds)
-        if self.lc["s"] >= LC_DISTANCE:
+        if self.lc["s"] >= self.lc.get("L", LC_DISTANCE):
             self.lc = None
 
     def idm_control(self, nbrs: Optional[List[Neighbour]] = None) -> float:
@@ -663,13 +745,18 @@ class HighwayEgoPolicy:
         #                 relies on exactly this.
         #   target lane   during a change the ego straddles both, and either
         #                 can block it.
+        # A stopped blocker we may still want to go round is held at arm's
+        # length rather than at IDM's jam distance — see BLOCKED_STANDOFF_M and
+        # `_ego_s0`, which MOBIL asks the same question of.
+        s0 = self._ego_s0(nbrs)
         gap, vl = self._leader_near(self.ego.x, nbrs)       # anyone on top of me
-        a = self._idm_accel(gap, vl)
+        a = self._idm_accel(gap, vl, s0=s0)
         here = self.frame.lane_index_of(self.ego.x)
         for lane in {here, self.target_lane}:
             lead, _ = self._lane_neighbours(self.frame.lane_center_x(lane), nbrs)
             if lead is not None:
-                a = min(a, self._idm_accel(self._gap_to(lead), lead.speed))
+                a = min(a, self._idm_accel(self._gap_to(lead), lead.speed,
+                                           s0=s0))
         tgt_x = self.frame.lane_center_x(self.target_lane)
         changing = abs(self.ego.x - tgt_x) > LC_DONE_TOL
         if changing:
