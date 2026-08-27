@@ -91,6 +91,13 @@ ROLE_LABELS: Dict[str, str] = {
     ROLE_ADJACENT: "adjacent",
 }
 
+# Verifier-aligned cut-in geometry (see scripts/summarize_experiments.py)
+CUTIN_MAX_AHEAD_M = 10.0     # owner must finish ≤ this far ahead of ego
+CUTIN_MIN_AHEAD_M = 0.5      # must be strictly ahead
+CUTIN_ADJ_MIN_FRAC = 0.4     # adjacent-lane band (× lane_width)
+CUTIN_ADJ_MAX_FRAC = 1.6
+CUTIN_SCORE_TARGET_ALONG = 6.0   # preferred station ahead of ego
+
 DEFAULT_CUTIN_SPEC = {
     "t": 4.0, "along": 6.0, "lat": 0.0, "lc_duration": 2.0, "tail": 4.0,
 }
@@ -125,7 +132,12 @@ def spawn_fleet(seed: int, n_actors: int = 4,
                 num_lanes: int = 3, lane_width: float = 3.5,
                 length: float = 120.0, cruise: float = CRUISE_SPEED
                 ) -> Tuple[Ego, se.Scenario]:
-    """Random northbound fleet. Ego in center lane; others in random lanes."""
+    """Random northbound fleet. Ego in center lane; others in random lanes.
+
+    Guarantees at least one actor is ahead of the ego (required for a proper
+    cut-in).  Prefers to seed the first actor in an adjacent lane ahead so
+    casting has an eligible candidate immediately.
+    """
     rng = random.Random(seed)
     m = se.MapConfig(lane_width=lane_width, kind="straight",
                      num_lanes=num_lanes, length=length)
@@ -133,20 +145,14 @@ def spawn_fleet(seed: int, n_actors: int = 4,
     ego_x = m.lane_center_x(ego_lane)
     ego_y = -length / 2.0 + 18.0
     ego = Ego(x=ego_x, y=ego_y, theta=math.radians(90), v=cruise)
+    ego_pose = (ego_x, ego_y, 90.0)
 
     actors: List[se.Actor] = []
     used: List[Tuple[int, float]] = []
-    for i in range(max(1, n_actors)):
-        for _try in range(40):
-            lane = rng.randrange(num_lanes)
-            y = ego_y + rng.uniform(6.0, 45.0)
-            if all(lane != ul or abs(y - uy) > 8.0 for ul, uy in used):
-                used.append((lane, y))
-                break
-        else:
-            lane = i % num_lanes
-            y = ego_y + 10.0 + 9.0 * i
-            used.append((lane, y))
+    adj_lanes = [i for i in range(num_lanes) if i != ego_lane] or [ego_lane]
+
+    def _place(lane: int, y: float, i: int) -> None:
+        used.append((lane, y))
         x = m.lane_center_x(lane)
         speed = cruise + rng.uniform(-1.5, 1.5)
         start = (x, y, 90.0)
@@ -156,6 +162,29 @@ def spawn_fleet(seed: int, n_actors: int = 4,
             length=4.5, width=2.0, start=start, cruise=speed,
             maneuvers=se.cruise_plan(start, speed),
         ))
+
+    # seed actor 0: adjacent lane, ahead of ego (cut-in eligible)
+    _place(adj_lanes[rng.randrange(len(adj_lanes))],
+           ego_y + rng.uniform(8.0, 22.0), 0)
+
+    for i in range(1, max(1, n_actors)):
+        for _try in range(40):
+            lane = rng.randrange(num_lanes)
+            y = ego_y + rng.uniform(6.0, 45.0)
+            if all(lane != ul or abs(y - uy) > 8.0 for ul, uy in used):
+                _place(lane, y, i)
+                break
+        else:
+            lane = i % num_lanes
+            y = ego_y + 10.0 + 9.0 * i
+            _place(lane, y, i)
+
+    # safety: if somehow nobody is ahead, nudge the first actor forward
+    if not any(cutin_ahead(a.start, ego_pose) for a in actors):
+        a0 = actors[0]
+        a0.start = (a0.start[0], ego_y + 12.0, a0.start[2])
+        a0.maneuvers = se.cruise_plan(a0.start, float(a0.cruise or cruise))
+
     asc = se.Scenario(map=m, actors=actors, pixels_per_meter=6.0)
     asc.simulate()
     return ego, asc
@@ -164,30 +193,62 @@ def spawn_fleet(seed: int, n_actors: int = 4,
 # --------------------------------------------------------------------------- #
 # Role casting
 # --------------------------------------------------------------------------- #
+def cutin_ahead(actor_pose: se.Pose, ego_pose: se.Pose,
+                min_ahead: float = CUTIN_MIN_AHEAD_M) -> bool:
+    """True when the actor is strictly ahead of the ego along-track."""
+    along, _ = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
+    return along > min_ahead
+
+
+def cutin_adjacent(actor_pose: se.Pose, ego_pose: se.Pose,
+                   lane_width: float) -> bool:
+    """True when the actor is in an adjacent lane (verifier rule 2)."""
+    _, lat = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
+    a = abs(lat)
+    return CUTIN_ADJ_MIN_FRAC * lane_width <= a <= CUTIN_ADJ_MAX_FRAC * lane_width
+
+
+def cutin_eligible(actor_pose: se.Pose, ego_pose: se.Pose,
+                   lane_width: float) -> bool:
+    """Eligible cut-in candidate: adjacent lane AND ahead of the ego.
+
+    Matches the verifier's start-of-cut-in rules so casting never hands the
+    role to a same-lane or behind-ego car.
+    """
+    return (cutin_adjacent(actor_pose, ego_pose, lane_width)
+            and cutin_ahead(actor_pose, ego_pose))
+
+
 def score_cutin_candidate(actor_pose: se.Pose, ego_pose: se.Pose,
                           lane_width: float) -> float:
-    """Higher = better cut-in candidate.
+    """Higher = better cut-in candidate (aligned with the 4 verifier rules).
 
-    Prefers an adjacent lane and a station roughly `along` metres ahead of the
-    ego. Same-lane cars score near zero (no cut-in to perform).
-    `ego_pose` is (x, y, heading_deg).
+    1/3. Prefer a station just ahead of the ego (peak ~6 m, hard zero if
+         behind or farther than ``CUTIN_MAX_AHEAD_M`` at *spawn* scoring —
+         the merge pin itself stays ≤ 10 m).
+    2.   Require an adjacent lane (same lane / two-over → ~0).
+    4.   (post-merge nominal speed is handled by the closed-loop merge plan,
+         not by this score.)
     """
     along, lat = se.world_to_ego_offset(ego_pose, actor_pose[0], actor_pose[1])
-    # lateral: adjacent lane ~ lane_width; same lane ~ 0
     abs_lat = abs(lat)
-    if abs_lat < 0.4 * lane_width:
-        lat_score = 0.05                      # already in ego lane
-    elif abs_lat < 1.6 * lane_width:
+    if abs_lat < CUTIN_ADJ_MIN_FRAC * lane_width:
+        return 0.0                            # same lane — not a cut-in
+    if abs_lat <= CUTIN_ADJ_MAX_FRAC * lane_width:
         lat_score = 1.0                       # adjacent
     else:
-        lat_score = 0.35                      # two lanes over — still possible
-    # longitudinal: prefer ~8–20 m ahead; penalize far ahead / behind
-    if along < -8.0:
+        lat_score = 0.05                      # two+ lanes over — almost never
+    # longitudinal: must be ahead; prefer ~CUTIN_SCORE_TARGET_ALONG; collapse
+    # past the verifier's 10 m merge window so we don't cast hopeless cars
+    if along <= CUTIN_MIN_AHEAD_M:
+        return 0.0                            # behind / alongside — ineligible
+    if along > 40.0:
         along_score = 0.05
-    elif along > 50.0:
-        along_score = 0.1
     else:
-        along_score = 1.0 / (1.0 + abs(along - 14.0) / 12.0)
+        # soft peak at 6 m; still score out to ~25 m (can close during chase)
+        along_score = 1.0 / (1.0 + abs(along - CUTIN_SCORE_TARGET_ALONG) / 8.0)
+        if along > CUTIN_MAX_AHEAD_M:
+            along_score *= 0.55               # farther than merge window
     return lat_score * along_score
 
 
@@ -440,15 +501,21 @@ def apply_collision_yields(actors: List[se.Actor], pose_at,
 def cast_roles(actors: List[se.Actor], ego_pose: se.Pose, lane_width: float,
                lock_id: Optional[str] = None) -> List[Casting]:
     """Pick one cut-in actor (or keep `lock_id`); everyone else drives nominal.
-    Self-governed actors are never conscripted."""
+
+    Only *eligible* actors (adjacent lane + ahead of ego) can be cast.  Self-
+    governed actors are never conscripted.
+    """
     scored: List[Tuple[float, str]] = []
     for a in actors:
         if getattr(a, "autonomy", "auto") == "self":
             continue
         pose = a.start
+        if not cutin_eligible(pose, ego_pose, lane_width):
+            scored.append((0.0, a.id))
+            continue
         scored.append((score_cutin_candidate(pose, ego_pose, lane_width), a.id))
     scored.sort(reverse=True)
-    if lock_id and any(aid == lock_id for _, aid in scored):
+    if lock_id and any(aid == lock_id and s > 0.0 for s, aid in scored):
         chosen = lock_id
     elif scored and scored[0][0] > 0.08:
         chosen = scored[0][1]
@@ -473,11 +540,13 @@ def apply_closed_loop_cutin(actor: se.Actor, ego: Ego, spec: dict,
 
     Returns (status, message) where status is one of:
       'chasing' | 'merged' | 'abandoned'
-    Mutates actor.start / actor.maneuvers in place.  A merged actor matches
-    the ego's speed (it sits right in front of it); an unsuccessful cut-in
-    returns to the actor's own cruise speed and keeps driving straight.
+    Mutates actor.start / actor.maneuvers in place.  A merged actor returns to
+    its own nominal cruise speed (verifier rule 4); an unsuccessful cut-in
+    does the same and keeps driving straight.
     """
     along = float(spec.get("along", 1.0))
+    # keep the merge station inside the verifier's 10 m ahead window
+    along = se.clamp(along, se.CUTIN_MIN_AHEAD_M, se.CUTIN_MAX_AHEAD_M)
     lat = float(spec.get("lat", 0.0))
     wx, wy = se.live_cutin_pin(ego.x, ego.y, ego.theta, along, lat)
     # default to the actor's own plan-frame heading — copying the ego's live
@@ -485,10 +554,13 @@ def apply_closed_loop_cutin(actor: se.Actor, ego: Ego, spec: dict,
     hd = heading_deg if heading_deg is not None else actor.start[2]
     start = (actor.start[0], actor.start[1], hd)
 
-    if se.cutin_is_merged(actor.start, wx, wy, ego.theta):
+    if se.cutin_is_merged(actor.start, wx, wy, ego.theta,
+                          ego_x=ego.x, ego_y=ego.y):
+        v_nom = se.actor_cruise_speed(actor)
         actor.start = start
-        actor.maneuvers = se.cruise_plan(start, ego.v)
-        return "merged", "cut-in merged — actor matching ego"
+        actor.maneuvers = se.cruise_plan(start, v_nom)
+        return ("merged",
+                f"cut-in merged — back to cruise {v_nom:.1f} m/s")
 
     t_rem = se.closed_loop_cutin_horizon(spec, clock_t)
     if t_rem <= 0.0:

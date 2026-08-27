@@ -138,6 +138,9 @@ when autonomous).
 
 ## Experiment harness (recorded trials)
 
+See **`docs/SCENARIOS_AND_VALIDATION.md`** for scenario descriptions and
+trajectory validation metrics (cut-in, overtake, hard_brake).
+
 `experiment.py` is a thin wrapper over the editor for collecting labelled
 driving trials — it does **not** modify the simulator (it only uses two new
 opt-in `run_gui` hooks, `auto_drive` and `on_frame`).  Each trial builds a

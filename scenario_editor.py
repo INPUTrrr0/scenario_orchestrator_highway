@@ -787,6 +787,9 @@ def load_scenario(path: str) -> Scenario:
 # --------------------------------------------------------------------------- #
 CUTIN_MIN_SPEED = 0.5
 CUTIN_MAX_SPEED = 40.0
+# Verifier-aligned merge station (scripts/summarize_experiments.py)
+CUTIN_MAX_AHEAD_M = 10.0
+CUTIN_MIN_AHEAD_M = 0.5
 
 
 def _heading_axes(hd_deg: float) -> Tuple[float, float, float, float]:
@@ -815,12 +818,25 @@ def live_cutin_pin(ego_x: float, ego_y: float, ego_theta_rad: float,
 
 def cutin_is_merged(actor_pose: Pose, pin_x: float, pin_y: float,
                     ego_theta_rad: float, lat_tol: float = 0.5,
-                    along_tol: float = 4.0) -> bool:
-    """True when the actor is near the pin in the ego's frame (merge done)."""
+                    along_tol: float = 3.0,
+                    ego_x: Optional[float] = None,
+                    ego_y: Optional[float] = None) -> bool:
+    """True when the actor has merged at a verifier-valid station.
+
+    Near the ego-relative pin laterally/longitudinally, and — when ego pose is
+    given — strictly ahead of the ego and within ``CUTIN_MAX_AHEAD_M`` (10 m).
+    """
     fx, fy = math.cos(ego_theta_rad), math.sin(ego_theta_rad)
     nx, ny = -fy, fx
     dx, dy = actor_pose[0] - pin_x, actor_pose[1] - pin_y
-    return abs(dx * nx + dy * ny) < lat_tol and abs(dx * fx + dy * fy) < along_tol
+    if abs(dx * nx + dy * ny) >= lat_tol or abs(dx * fx + dy * fy) >= along_tol:
+        return False
+    if ego_x is None or ego_y is None:
+        return True
+    ax = actor_pose[0] - ego_x
+    ay = actor_pose[1] - ego_y
+    along = ax * fx + ay * fy
+    return CUTIN_MIN_AHEAD_M < along <= CUTIN_MAX_AHEAD_M
 
 
 def world_to_ego_offset(ego_pose: Pose, wx: float, wy: float
@@ -1546,7 +1562,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             return False
         if holder.autonomy == "self":
             return False   # user-owned intent — the orchestrator hands off
-        # only fully-autonomous actors without another role can be conscripted
+        # only fully-autonomous actors without another role can be conscripted;
+        # prefer verifier-eligible poses (adjacent + ahead) when scoring
         cands = [a for a in others
                  if a is not holder and a.autonomy != "self" and not a.block]
         if not cands:
@@ -1577,11 +1594,15 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             feas = [a for a in cands
                     if live_cutin_feasible(pose_of(a), e["x"], e["y"],
                                            e["theta"], e["v"], spec, T)]
-            if not feas:
+            # when multiple are feasible, prefer ones still adjacent+ahead
+            elig = [a for a in feas
+                    if co.cutin_eligible(pose_of(a), ego_pose, lw)]
+            pool = elig or feas
+            if not pool:
                 return False   # nobody can do it; holder abandons at deadline
             scores = {a.id: co.score_cutin_candidate(pose_of(a), ego_pose, lw)
-                      for a in feas}
-            best = max(feas, key=lambda a: scores[a.id])
+                      for a in pool}
+            best = max(pool, key=lambda a: scores[a.id])
             v_req, _ = live_cutin_required_speed(
                 pose_of(holder), e["x"], e["y"], e["theta"], e["v"], spec, T)
             set_status(f"orchestrator: actor {holder.id} can't make the pin "
@@ -1592,13 +1613,19 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             def pose_of(a: Actor) -> Pose:
                 return a.start
 
+            pool = [a for a in cands
+                    if co.cutin_eligible(pose_of(a), ego_pose, lw)]
+            if not pool:
+                return False
             scores = {a.id: co.score_cutin_candidate(pose_of(a), ego_pose, lw)
-                      for a in cands + [holder]}
-            best = max(cands, key=lambda a: scores[a.id])
-            if scores[best.id] <= 1.25 * scores[holder.id]:
+                      for a in pool + ([holder] if co.cutin_eligible(
+                          pose_of(holder), ego_pose, lw) else [])}
+            best = max(pool, key=lambda a: scores[a.id])
+            h_score = scores.get(holder.id, 0.0)
+            if scores[best.id] <= 1.25 * h_score:
                 return False
             set_status(f"orchestrator: cut-in recast {holder.id} -> {best.id} "
-                       f"(score {scores[best.id]:.2f} vs {scores[holder.id]:.2f})")
+                       f"(score {scores[best.id]:.2f} vs {h_score:.2f})")
         # move the spec; the old holder goes back to nominal cruising
         if drive_mode:
             # capture current poses BEFORE the swap (pose_of branches on
@@ -1819,7 +1846,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
                 if not a.traj:
                     scenario.simulate()
                 pose = a.pose_at_time(cutin_phase)
-                along = float(spec.get("along", 1.0))
+                along = clamp(float(spec.get("along", 1.0)),
+                              CUTIN_MIN_AHEAD_M, CUTIN_MAX_AHEAD_M)
                 lat = float(spec.get("lat", 0.0))
                 wx, wy = live_cutin_pin(e["x"], e["y"], e["theta"], along, lat)
                 # keep the actor's own plan-frame heading (lane-aligned):
@@ -1829,13 +1857,16 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
                 # temporary yaw mid-maneuver).
                 start = (pose[0], pose[1], a.start[2])
                 replanned.add(a.id)
-                if cutin_is_merged(pose, wx, wy, e["theta"]):
+                if cutin_is_merged(pose, wx, wy, e["theta"],
+                                   ego_x=e["x"], ego_y=e["y"]):
+                    # verifier rule 4: resume nominal cruise (not ego.v)
+                    v_nom = actor_cruise_speed(a)
                     a.start = start
-                    a.maneuvers = cruise_plan(start, e["v"])
+                    a.maneuvers = cruise_plan(start, v_nom)
                     cutin_committed = True
                     cutin_outcome = "merged"
                     changed = True
-                    set_status("cut-in merged — actor matching ego")
+                    set_status(f"cut-in merged — back to cruise {v_nom:.1f} m/s")
                     continue
                 t_rem = closed_loop_cutin_horizon(spec, T)
                 if t_rem <= 0.0:

@@ -11,8 +11,11 @@ recording what happened.
 Each trial:
   * spawns a random number of actors (1..5, uniform) at random, non-overlapping
     lane slots around the ego — all derived from a single ``--seed``;
-  * casts one actor as the CUT-IN and (traffic permitting) another as the
-    BLOCK, using the orchestrator's placement scores;
+  * **requires at least one actor ahead of the ego**; otherwise the seed is
+    skipped and nothing is written under ``experiments/``;
+  * casts one *eligible* actor (adjacent lane + ahead) as the CUT-IN and
+    (traffic permitting) another as the BLOCK, using the orchestrator's
+    placement scores aligned with the cut-in verifier rules;
   * lets the orchestrator run closed-loop while you drive the ego;
   * records: the random seed, the ego trajectory, every actor trajectory, the
     spawn poses, whether the cut-in and the block-cut-in each succeeded, and
@@ -64,6 +67,12 @@ PALETTE = [(210, 70, 60), (80, 140, 220), (240, 175, 65), (170, 110, 220),
 MIN_LANE_GAP = 7.0
 # nominal actors cruise straight for the whole trial (must exceed --max-time)
 TRIAL_CRUISE_T = 60.0
+# spawn gate: at least one actor must be this far ahead of the ego
+AHEAD_MIN_M = 1.0
+
+
+class SkipExperiment(Exception):
+    """Raised when a seeded layout cannot enter the experiment set."""
 
 
 # --------------------------------------------------------------------------- #
@@ -78,27 +87,71 @@ def _ego_lane_change_lat(ego: se.Actor) -> float:
     return -3.5
 
 
+def _is_ahead(ego_start: Pose, pose: Pose, min_ahead: float = AHEAD_MIN_M) -> bool:
+    along, _ = se.world_to_ego_offset(ego_start, pose[0], pose[1])
+    return along > min_ahead
+
+
 def _random_spawns(rng: random.Random, m, ego_start: Pose,
                    n: int) -> List[Pose]:
-    """`n` non-overlapping lane slots in a band around the ego.  Different
-    lanes never overlap laterally; same-lane cars are kept MIN_LANE_GAP apart."""
+    """`n` non-overlapping lane slots in a band around the ego.
+
+    Guarantees at least one actor is ahead of the ego.  The first slot is
+    seeded in an adjacent lane ahead so cut-in casting has an eligible
+    candidate (verifier rules 1–2).
+    """
     lanes = list(range(max(1, m.num_lanes)))
+    # which lane is the ego on?
+    ego_lane = min(lanes, key=lambda i: abs(m.lane_center_x(i) - ego_start[0]))
+    adj = [i for i in lanes if i != ego_lane] or lanes
     y_lo = max(ego_start[1] - 20.0, -m.half_length() + 6.0)
     y_hi = min(ego_start[1] + 45.0, m.half_length() - 6.0)
     occupied: List[Tuple[float, float]] = [(ego_start[0], ego_start[1])]
     out: List[Pose] = []
-    for _ in range(n):
+
+    def _try_place(lane: int, y: float) -> Optional[Pose]:
+        x = m.lane_center_x(lane)
+        if all(not (abs(x - ox) < 1.0 and abs(y - oy) < MIN_LANE_GAP)
+               for ox, oy in occupied):
+            occupied.append((x, y))
+            return (x, y, 90.0)
+        return None
+
+    # 1) force one adjacent + ahead spawn (cut-in eligible seed)
+    if n >= 1:
+        placed = None
+        for _try in range(200):
+            lane = rng.choice(adj)
+            y = rng.uniform(ego_start[1] + 8.0, min(ego_start[1] + 28.0, y_hi))
+            placed = _try_place(lane, y)
+            if placed is not None:
+                out.append(placed)
+                break
+        if placed is None:
+            # last resort: park one car clearly ahead in an adjacent lane
+            lane = adj[0]
+            y = min(ego_start[1] + 15.0, y_hi)
+            x = m.lane_center_x(lane)
+            occupied.append((x, y))
+            out.append((x, y, 90.0))
+
+    # 2) fill the rest randomly in the band
+    for _ in range(n - len(out)):
         for _try in range(300):
             lane = rng.choice(lanes)
-            x = m.lane_center_x(lane)
             y = rng.uniform(y_lo, y_hi)
-            if all(not (abs(x - ox) < 1.0 and abs(y - oy) < MIN_LANE_GAP)
-                   for ox, oy in occupied):
-                occupied.append((x, y))
-                out.append((x, y, 90.0))
+            p = _try_place(lane, y)
+            if p is not None:
+                out.append(p)
                 break
         else:
             break   # gave up placing this one; fewer actors than requested
+
+    # 3) safety: if somehow nobody is ahead, push the first spawn forward
+    if out and not any(_is_ahead(ego_start, p) for p in out):
+        x, _, hd = out[0]
+        y = min(ego_start[1] + 15.0, y_hi)
+        out[0] = (x, y, hd)
     return out
 
 
@@ -109,7 +162,11 @@ def build_random_scenario(base_path: str, seed: int,
     with a seeded random fleet and cast the cut-in / block roles by score.
 
     Returns (scenario, meta) where meta carries the seed, spawn poses, casting
-    and the per-actor placement scores."""
+    and the per-actor placement scores.
+
+    Raises ``SkipExperiment`` when no actor is ahead of the ego — that layout
+    must not enter the experiments set.
+    """
     rng = random.Random(seed)
     base = se.load_scenario(base_path)
     ego = next((a for a in base.actors if a.id == "0"), None)
@@ -118,6 +175,10 @@ def build_random_scenario(base_path: str, seed: int,
 
     cutin_tpl = next((dict(a.cutin) for a in base.actors if a.cutin),
                      dict(DEFAULT_CUTIN_SPEC))
+    # clamp merge station into the verifier's ≤10 m ahead window
+    cutin_tpl["along"] = float(se.clamp(
+        float(cutin_tpl.get("along", 6.0)),
+        se.CUTIN_MIN_AHEAD_M, se.CUTIN_MAX_AHEAD_M))
     target_lat = _ego_lane_change_lat(ego)
 
     n = rng.randint(min_actors, max_actors)
@@ -133,27 +194,38 @@ def build_random_scenario(base_path: str, seed: int,
             # theirs); without it a nominal actor has no maneuvers and freezes
             maneuvers=se.cruise_plan(sp, cruise, duration=TRIAL_CRUISE_T)))
 
+    others = actors[1:]
+    # --- experiment gate: at least one actor ahead of the ego ------------- #
+    if not any(_is_ahead(ego.start, a.start) for a in others):
+        raise SkipExperiment("no actor ahead of ego")
+
     # score every actor for each role at its spawn, cast distinct best actors
     ego_pose = ego.start
     lw = base.map.lane_width
-    others = actors[1:]
     cut_scores = {a.id: co.score_cutin_candidate(a.start, ego_pose, lw)
                   for a in others}
     blk_scores = {a.id: co.score_block_candidate(a.start, ego_pose, lw,
                                                  target_lat)
                   for a in others}
+    # cut-in: only verifier-eligible (adjacent + ahead) candidates
+    cut_elig = [a.id for a in others
+                if co.cutin_eligible(a.start, ego_pose, lw)]
     cut_id = block_id = None
     ids = [a.id for a in others]
+    if cut_elig:
+        cut_id = max(cut_elig, key=lambda i: cut_scores[i])
     if len(ids) == 1:
         a = ids[0]
-        if cut_scores[a] >= blk_scores[a]:
-            cut_id = a
-        else:
+        # single actor: prefer cut-in when eligible, else block
+        if cut_id is None and blk_scores[a] > 0.08:
             block_id = a
     elif ids:
-        cut_id = max(ids, key=lambda i: cut_scores[i])
-        block_id = max((i for i in ids if i != cut_id),
-                       key=lambda i: blk_scores[i])
+        block_pool = [i for i in ids if i != cut_id]
+        if block_pool:
+            block_id = max(block_pool, key=lambda i: blk_scores[i])
+            # don't assign a worthless block
+            if blk_scores[block_id] < 0.08:
+                block_id = None
     by = {a.id: a for a in others}
     if cut_id is not None:
         by[cut_id].cutin = dict(cutin_tpl)
@@ -177,6 +249,7 @@ def build_random_scenario(base_path: str, seed: int,
         "cast": {"cutin": cut_id, "block": block_id},
         "scores": {"cutin": {k: round(v, 4) for k, v in cut_scores.items()},
                    "block": {k: round(v, 4) for k, v in blk_scores.items()}},
+        "has_actor_ahead": True,
     }
     return sc, meta
 
@@ -316,4 +389,16 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except SkipExperiment as e:
+        # layout does not satisfy the experiment gate — do not write a run file
+        import sys
+        seed = None
+        # best-effort: recover seed from argv for the log line
+        if "--seed" in sys.argv:
+            i = sys.argv.index("--seed")
+            if i + 1 < len(sys.argv):
+                seed = sys.argv[i + 1]
+        print(f"seed={seed} SKIPPED: {e} — not entering experiments")
+        raise SystemExit(0)
