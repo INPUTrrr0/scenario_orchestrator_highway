@@ -39,8 +39,8 @@ from carla_port.carla_sync import (KINEMATIC, PHYSICS, StateSynchronizer,
 from . import scenarios as sc_mod
 from .closed_loop import DT_TICK, HighwayClosedLoop
 from .highway_ego import (DELTA_MAX, EGO_LENGTH, EGO_WIDTH, IDM_V0,
-                          V_MAX, Ego, HighwayEgoPolicy)
-from .highway_map import HighwayFrame
+                          IDM_V0_CUTIN, V_MAX, Ego, HighwayEgoPolicy)
+from .highway_map import FORWARD_HEADING, HighwayFrame
 from .script_bridge import DT, se
 
 BICYCLE = "bicycle"
@@ -138,7 +138,8 @@ class RunConfig:
     # orchestration
     casting: Optional[bool] = None
     cruise: float = 12.0
-    cutin_at: Optional[float] = None   # sim time to complete merge (cutin mode)
+    cutin_at: Optional[float] = None   # hold the cut-in off until this time
+    cutin_along: Optional[float] = None  # override the pin distance, m ahead
     # outputs
     video: Optional[str] = None
     video_dir: str = DEFAULT_VIDEO_DIR
@@ -151,6 +152,15 @@ class RunConfig:
     weather: str = "clear"
     spectator: bool = True
     report: Optional[str] = None
+    #: where to write the run in the UPSTREAM verifier's schema (the one
+    #: `scripts/scenario_verify.py` reads). Defaults beside `--report`.
+    verify_report: Optional[str] = None
+    #: seconds between recorded trajectory samples. The verifier walks the
+    #: trajectory linearly and its `pose_at_time` takes the last sample at or
+    #: before t, so the sampling period is the timing resolution of every
+    #: check it makes. 20 Hz puts the commit-instant pose within 0.6 m at
+    #: highway speed, well inside the 10 m station window.
+    traj_dt: float = 0.05
     verbose: bool = True
 
 
@@ -209,6 +219,17 @@ class HighwayRun:
         #: spawn_bindings adopts the real CARLA bounding boxes, so the
         #: gaps reported here are between the bodies that actually collide.
         self._extents: Dict[str, Tuple[float, float]] = {}
+        #: [t, x, y, heading_deg, speed] rows, in the SCRIPT frame — which is
+        #: the frame the upstream verifier assumes (+y along the road, lanes
+        #: separated in x, headings in degrees), so no conversion is needed on
+        #: the way out. Read back from CARLA, not from the commanded states:
+        #: the point of verifying a CARLA run is to check what the simulator
+        #: actually did with the plan.
+        self._ego_traj: List[List[float]] = []
+        self._actor_traj: Dict[str, List[List[float]]] = {}
+        self._spawns: Dict[str, List[float]] = {}
+        self._cruise: Dict[str, float] = {}
+        self._next_traj_t = 0.0
 
     def _log(self, msg: str) -> None:
         if self.cfg.verbose:
@@ -297,12 +318,20 @@ class HighwayRun:
         self._log(f"attached {self.collisions.attach()} collision sensors")
 
         # ---- orchestration ---- #
+        # A negative --cutin-at means "no delay": run the scenario on its own
+        # authored deadline. That is the default, and it has to be, because
+        # holding the cut-in off is not free. The actors cruise nominally while
+        # the orchestrator is asleep, and on `scenario_cutin` they are faster
+        # than the ego — so six seconds of silence puts every candidate 30-50 m
+        # ahead of the pin, and the run then measures nothing but the
+        # orchestrator failing to find anyone who can fall back that far.
         cutin_at = cfg.cutin_at
-        if cutin_at is None and cfg.scenario == sc_mod.CUTIN and cfg.casting is not False:
-            cutin_at = 6.0
+        if cutin_at is not None and cutin_at < 0:
+            cutin_at = None
         self.loop = HighwayClosedLoop(self.frame, background, spec,
                                       casting=cfg.casting, cruise=cfg.cruise,
-                                      cutin_at=cutin_at)
+                                      cutin_at=cutin_at,
+                                      cutin_along=cfg.cutin_along)
         if cutin_at is not None and self.loop.orch is not None:
             deadline = float(self.loop.orch.spec.get("t", cutin_at))
             self._log(f"cut-in starts at t={cutin_at:.1f}s (merge by t={deadline:.1f}s)")
@@ -314,9 +343,23 @@ class HighwayRun:
             self._build_ego(ego_actor)
 
         for a in background.actors:
-            self.interactions[str(a.id)] = Interaction(
-                actor_id=str(a.id),
-                oncoming=not sc_mod._is_forward(a.start[2]))
+            aid = str(a.id)
+            self.interactions[aid] = Interaction(
+                actor_id=aid, oncoming=not sc_mod._is_forward(a.start[2]))
+            # Spawn pose + body, in the verifier's [x, y, heading, L, W] form.
+            self._spawns[aid] = [round(float(a.start[0]), 3),
+                                 round(float(a.start[1]), 3),
+                                 round(float(a.start[2]), 3),
+                                 round(float(getattr(a, "length", 4.5)), 3),
+                                 round(float(getattr(a, "width", 2.0)), 3)]
+            cr = getattr(a, "cruise", None)
+            if cr is not None:
+                self._cruise[aid] = float(cr)
+        ex, ey, eh = ego_actor.start[0], ego_actor.start[1], ego_actor.start[2]
+        self._spawns[str(cfg.ego)] = [round(float(ex), 3), round(float(ey), 3),
+                                      round(float(eh), 3),
+                                      round(float(getattr(ego_actor, "length", 4.5)), 3),
+                                      round(float(getattr(ego_actor, "width", 2.0)), 3)]
 
         self.sync = StateSynchronizer(self.frame, self.bindings,
                                       mode=cfg.sync_mode, z_offset=cfg.z_offset,
@@ -536,6 +579,7 @@ class HighwayRun:
                 self.realized.append(rc)
                 self._log(f"  t={self.t_sim:6.2f}  {rc}")
             self._track(states)
+            self._sample_traj()
             if self.recorder is not None:
                 self.recorder.capture(self._hud())
         return self.report()
@@ -612,6 +656,91 @@ class HighwayRun:
             d_lat = abs(lat) - (ew + aw) / 2.0
             gap = max(d_long, d_lat, 0.0)
             it.update(along, gap)
+
+    # ------------------------------------------------------------------ #
+    # Trajectory recording, in the upstream verifier's schema
+    # ------------------------------------------------------------------ #
+    def _sample_traj(self) -> None:
+        """One [t, x, y, heading, v] row per vehicle, decimated to `traj_dt`.
+
+        Poses come back from CARLA through `carla_actor_to_script_state`, not
+        from the commanded script states: `sync_mode=physics` writes a target
+        velocity and lets the physics settle, so the two differ, and it is the
+        simulated motion the verifier is being asked about.
+        """
+        if self.bindings is None or self.t_sim + 1e-9 < self._next_traj_t:
+            return
+        self._next_traj_t = self.t_sim + max(self.cfg.traj_dt, 1e-3)
+        t = round(self.t_sim, 4)
+        ego_id = str(self.cfg.ego)
+        for b in self.bindings:
+            aid = str(b.script_actor_id)
+            try:
+                st = carla_actor_to_script_state(aid, b.carla_actor, self.frame)
+            except RuntimeError:
+                continue            # actor destroyed mid-run; drop the sample
+            row = [t, round(st.x, 3), round(st.y, 3),
+                   round(st.heading % 360.0, 3), round(st.speed, 3)]
+            if aid == ego_id:
+                self._ego_traj.append(row)
+            else:
+                self._actor_traj.setdefault(aid, []).append(row)
+        if ego_id not in self.bindings.ids() and self._ego_xyv is not None:
+            ex, ey, ev = self._ego_xyv
+            hd = (self.policy.heading_deg if self.policy is not None
+                  else FORWARD_HEADING)
+            self._ego_traj.append([t, round(ex, 3), round(ey, 3),
+                                   round(hd % 360.0, 3), round(ev, 3)])
+
+    def verify_report(self) -> dict:
+        """The run in the schema `scripts/scenario_verify.py` reads.
+
+        The port's own `report()` grades in CARLA's terms — did the collision
+        sensor fire, did the orchestrator declare a merge. That is a different
+        question from the upstream one, which is asked of the *trajectories*
+        and does not trust the orchestrator's own verdict: the cut-in verifier
+        re-derives where everybody was at the commit instant and checks the
+        four criteria in `docs/SCENARIOS_AND_VALIDATION.md` against the
+        recorded motion. Emitting this file is what lets a CARLA run be graded
+        by exactly the same code as a pygame run.
+
+        Frames line up without conversion: the script frame this port works in
+        is the frame the upstream scenarios are authored in (+y along the road,
+        lanes separated in x, headings in degrees).
+        """
+        mode = self.cfg.scenario
+        ego_id = str(self.cfg.ego)
+        out: Dict[str, object] = {
+            "scenario": mode,
+            "source": "carla_highway",
+            "town": self.cfg.town,
+            "lane_width": round(self.frame.lane_width, 4),
+            "duration": round(self.t_sim, 3),
+            "spawns": dict(self._spawns),
+            "cruise": dict(self._cruise),
+            "vehicle_dims": {aid: {"length": round(l, 3), "width": round(w, 3)}
+                             for aid, (l, w) in sorted(self._extents.items())},
+            "ego_trajectory": self._ego_traj,
+            "actor_trajectories": self._actor_traj,
+        }
+        roles = self.loop.roles or {}
+        if roles:
+            out["actor_roles"] = {str(k): str(v) for k, v in roles.items()}
+        if mode == sc_mod.CUTIN:
+            holder = self.loop.holder
+            if holder is not None:
+                out["cast"] = {"cutin": str(holder)}
+            # `success` is the orchestrator's own claim; the verifier requires
+            # it to be True and then goes on to disbelieve everything else,
+            # re-deriving the merge from the trajectories.
+            out["cutin"] = {
+                "performer": (str(holder) if holder is not None else None),
+                "success": self.loop.outcome == "merged",
+                "outcome": self.loop.outcome,
+                "t_commit": (round(self.loop.t_commit, 3)
+                             if self.loop.t_commit is not None else None),
+            }
+        return out
 
     # ------------------------------------------------------------------ #
     def _role_panel(self):
@@ -894,8 +1023,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "kinematic model, mirrored into CARLA")
     p.add_argument("--scripted-ego", action="store_true",
                    help="no policy: drive the ego along its maneuver plan")
-    p.add_argument("--desired-speed", type=float, default=IDM_V0,
-                   help=f"ego free-flow speed, m/s (default {IDM_V0})")
+    p.add_argument("--desired-speed", type=float, default=None,
+                   help=f"ego free-flow speed, m/s (default {IDM_V0}, "
+                        f"{IDM_V0_CUTIN} for --scenario cutin, matching the "
+                        "ego cruise those YAMLs are authored at)")
     p.add_argument("--no-lane-change", action="store_true",
                    help="lane-keeping ego only (the drivev2 baseline); "
                         "hard_brake and overtake are unsolvable this way")
@@ -908,8 +1039,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="force cut-in role casting off")
     p.add_argument("--cruise", type=float, default=12.0)
     p.add_argument("--cutin-at", type=float, default=None, dest="cutin_at",
-                   help="sim time when cut-in orchestration begins (cutin mode; "
-                        "merge deadline is ~lc_duration later; default 6)")
+                   help="hold cut-in orchestration off until this sim time, "
+                        "moving the merge deadline ~lc_duration later. Default "
+                        "and any negative value: no delay, use the deadline "
+                        "the scenario YAML authored")
+    p.add_argument("--cutin-along", type=float, default=None, dest="cutin_along",
+                   help="override the cut-in pin distance, m ahead of the ego "
+                        "centre-to-centre (YAML default 6.0). Real CARLA bodies "
+                        "are longer than the 4.5 m the scenario assumes, so the "
+                        "authored pin leaves ~1.5 m bumper to bumper; anything "
+                        "up to 10 m still counts as a merge and still verifies")
     p.add_argument("--policy", default=None, choices=sorted(POLICY_SHORTCUTS),
                    help="external ego_policy_v1 policy (default: highway IDM)")
     p.add_argument("--policy-request", default=None,
@@ -929,6 +1068,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weather", default="clear", choices=["clear", "keep"])
     p.add_argument("--no-spectator", action="store_true")
     p.add_argument("--report", default=None, help="write the JSON report here")
+    p.add_argument("--verify-report", default=None,
+                   help="write the run in the upstream verifier's schema here "
+                        "(scripts/scenario_verify.py). Defaults to "
+                        "<report>.verify.json when --report is given")
+    p.add_argument("--traj-dt", type=float, default=0.05,
+                   help="seconds between recorded trajectory samples "
+                        "(default 0.05 = 20 Hz)")
     p.add_argument("--quiet", action="store_true")
     return p
 
@@ -943,9 +1089,13 @@ def config_from_args(args) -> RunConfig:
         no_rendering=args.no_rendering, road_id=args.road_id,
         min_length=args.min_length, base=args.base, sync_mode=args.sync_mode,
         ego_mode=args.ego_mode, scripted_ego=args.scripted_ego,
-        desired_speed=args.desired_speed, no_lane_change=args.no_lane_change,
+        desired_speed=(args.desired_speed if args.desired_speed is not None
+                       else (IDM_V0_CUTIN if args.scenario == sc_mod.CUTIN
+                             else IDM_V0)),
+        no_lane_change=args.no_lane_change,
         lane_change=args.lane_change,
         casting=args.casting, cruise=args.cruise, cutin_at=args.cutin_at,
+        cutin_along=args.cutin_along,
         policy=args.policy, policy_request=args.policy_request,
         policy_hz=args.policy_hz,
         video=args.video,
@@ -954,6 +1104,7 @@ def config_from_args(args) -> RunConfig:
         video_top_span=args.video_top_span, hud=not args.no_hud,
         no_video=args.no_video or args.no_rendering, weather=args.weather,
         spectator=not args.no_spectator, report=args.report,
+        verify_report=args.verify_report, traj_dt=args.traj_dt,
         verbose=not args.quiet)
 
 
@@ -973,6 +1124,15 @@ def main(argv=None) -> int:
         with open(cfg.report, "w") as fh:
             json.dump(rep, fh, indent=2)
         print(f"  report     {cfg.report}")
+    vpath = cfg.verify_report or (
+        cfg.report[:-5] + ".verify.json" if (cfg.report or "").endswith(".json")
+        else (cfg.report + ".verify.json" if cfg.report else None))
+    if vpath:
+        os.makedirs(os.path.dirname(os.path.abspath(vpath)) or ".",
+                    exist_ok=True)
+        with open(vpath, "w") as fh:
+            json.dump(run.verify_report(), fh, indent=2)
+        print(f"  verify     {vpath}")
     return 0 if rep["grade"]["success"] else 1
 
 

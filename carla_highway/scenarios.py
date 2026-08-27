@@ -5,9 +5,9 @@
 The scenarios are NOT rewritten here. They are the authored YAML files that
 ship with the highway orchestrator:
 
-    highway/scenarios/scenario_cutin.yaml
-    highway/scenarios/scenario_hard_brake.yaml
-    highway/scenarios/scenario_overtake.yaml
+    scenarios/scenario_cutin.yaml
+    scenarios/scenario_hard_brake.yaml
+    scenarios/scenario_overtake.yaml
 
 loaded with `se.load_scenario` and then *retargeted* onto the road that
 `HighwayFrame.discover` actually found. That last step is the whole job of this
@@ -42,7 +42,12 @@ from .highway_map import FORWARD_HEADING, HighwayFrame
 from .script_bridge import mp, se
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SCENARIO_DIR = os.path.join(os.path.dirname(HERE), "highway", "scenarios")
+
+#: the authored YAML lives with the script layer — the repository root on this
+#: branch, a vendored `highway/` subdirectory when the port is dropped into
+#: another tree. Probed the same way `script_bridge.HIGHWAY` is.
+from .script_bridge import HIGHWAY as _HIGHWAY          # noqa: E402
+SCENARIO_DIR = os.path.join(_HIGHWAY, "scenarios")
 
 EGO_ID = "0"
 

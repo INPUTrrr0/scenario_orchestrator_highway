@@ -67,8 +67,9 @@ env PATH="${FFMPEG_DIR}:${PATH}" \
     --ego-mode physics \
     --video "${VIDEO}" \
     --video-view both \
-    --cutin-at 6 \
+    --cutin-along 9 \
     --report "${REPORT}" \
+    --verify-report "${OUT_DIR}/cutin_verify.json" \
     2>&1 | tee "${OUT_DIR}/record.log"
 RC=${PIPESTATUS[0]}
 echo "[step] runner rc=${RC}"

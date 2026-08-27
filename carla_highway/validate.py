@@ -246,6 +246,97 @@ def check_ego_policy(ck: Checks, cmap) -> None:
              f"lane {start_lane} -> {pol.target_lane}, "
              f"{pol.n_lane_changes} change(s), reason: {pol.reason}")
 
+    # --- MOBIL's safety criterion is what gap acceptance could not do --- #
+    # A follower 7 m behind is "clear" to a fixed-window rule either way; MOBIL
+    # asks how hard the merge makes it brake, so the answer must depend on how
+    # fast it is closing. If both cases agree, the safety term is not wired in.
+    from .highway_ego import Neighbour, MOBIL_B_SAFE
+    ego_m = Ego(x=x, y=y, theta=math.radians(h), v=12.0)
+    pol_m = HighwayEgoPolicy(frame, ego_m, bg, atime=0.0)
+    cur = pol_m.target_lane
+    cand = 1 if cur == 0 else 0
+    cand_x = frame.lane_center_x(cand)
+
+    def _follower(speed: float) -> Neighbour:
+        # 25 m back: a fixed-window gap rule (the old LC_REAR_GAP = 6 m) calls
+        # this clear at any speed. MOBIL has to disagree at one of them.
+        return Neighbour(actor_id="f", lane=cand, lat=cand_x, along=-25.0,
+                         gap=20.5, speed=speed, oncoming=False,
+                         length=4.5, width=2.0)
+
+    _, _, why_slow = pol_m._mobil_evaluate(cur, cand, [_follower(12.0)])
+    ok_fast, _, why_fast = pol_m._mobil_evaluate(cur, cand, [_follower(30.0)])
+    ck.check("ego/MOBIL: refuses a merge that would slam the new follower",
+             not ok_fast and "unsafe" in why_fast,
+             f"25 m back but closing at 30 m/s: {why_fast} "
+             f"(limit {MOBIL_B_SAFE} m/s^2)")
+    ck.check("ego/MOBIL: the same gap at matched speed is safe",
+             "unsafe" not in why_slow,
+             f"25 m back at 12 m/s: {why_slow} — a fixed-window gap rule "
+             "cannot tell these two apart")
+
+    # --- the keep-home bias must make coming home cheaper than leaving --- #
+    # On the 3-lane cut-in road, where home is the CENTRE lane and a keep-right
+    # bias would point the wrong way.
+    try:
+        frame3, ego_a3, bg3, _ = sc_mod.build(world, sc_mod.CUTIN)
+    except RuntimeError:
+        frame3 = None
+    if frame3 is not None and frame3.num_lanes >= 3:
+        frame, bg = frame3, bg3
+        y, h = ego_a3.start[1], ego_a3.start[2]
+        centre = 1
+        ego_h = Ego(x=frame.lane_center_x(centre), y=y,
+                    theta=math.radians(h), v=12.0)
+        pol_h = HighwayEgoPolicy(frame, ego_h, bg, atime=0.0)
+        pol_h.home_lane = centre
+        pol_h.target_lane = 2                 # pretend we are out of position
+        _, _, why_home = pol_h._mobil_evaluate(2, centre, [])
+        _, _, why_away = pol_h._mobil_evaluate(centre, 2, [])
+        thr_home = float(why_home.rsplit(" ", 1)[-1])
+        thr_away = float(why_away.rsplit(" ", 1)[-1])
+        ck.check("ego/MOBIL: keep-home bias makes returning cheaper",
+                 thr_home < thr_away,
+                 f"threshold home {thr_home:+.2f} vs away {thr_away:+.2f}")
+
+    # --- the lateral profile must be speed-independent and jerk-free --- #
+    ego_p = Ego(x=frame.lane_center_x(0), y=y, theta=math.radians(h), v=12.0)
+    pol_p = HighwayEgoPolicy(frame, ego_p, bg, atime=0.0)
+    s0, ds0, dds0 = pol_p._smoothstep(0.0)
+    s1, ds1, dds1 = pol_p._smoothstep(1.0)
+    ck.check("ego/MOBIL: the lane-change profile starts and ends at rest",
+             abs(s0) < 1e-9 and abs(s1 - 1.0) < 1e-9
+             and max(abs(ds0), abs(ds1), abs(dds0), abs(dds1)) < 1e-9,
+             "quintic smoothstep: S'=S''=0 at both ends, so no steering step")
+    from .highway_ego import LC_DISTANCE
+    pol_p._commit(1, now=0.0)
+    pol_p.advance_lane_change(LC_DISTANCE * 0.5)
+    half = pol_p.lane_target_lateral()[0]
+    mid = (frame.lane_center_x(0) + frame.lane_center_x(1)) / 2.0
+    ck.check("ego/MOBIL: half the distance is half the lane change",
+             abs(half - mid) < 1e-6,
+             f"x={half:.3f} at s=LC_DISTANCE/2, lane midpoint {mid:.3f}")
+    pol_p.advance_lane_change(LC_DISTANCE * 0.5 + 1e-6)
+    ck.check("ego/MOBIL: the manoeuvre retires when the distance is covered",
+             pol_p.lc is None, "profile cleared at s >= LC_DISTANCE")
+    # a stopped ego makes no progress along the profile — correct, not a stall
+    pol_p._commit(0, now=10.0)
+    before = pol_p.lc["s"]
+    pol_p.advance_lane_change(0.0)
+    ck.check("ego/MOBIL: a stopped ego does not advance the profile",
+             pol_p.lc is not None and pol_p.lc["s"] == before,
+             "distance-parameterised, so braking to a crawl stops the merge")
+
+    # --- signed speeds: an oncoming car must not read as a fast leader --- #
+    ego_s = Ego(x=x, y=y, theta=math.radians(h), v=12.0)
+    pol_s = HighwayEgoPolicy(frame, ego_s, bg, atime=0.0)
+    a_same = pol_s._idm_accel(20.0, 12.0)
+    a_head_on = pol_s._idm_accel(20.0, -12.0)
+    ck.check("ego: IDM brakes harder for a head-on than for a matched leader",
+             a_head_on < a_same - 1.0,
+             f"20 m gap: same-direction {a_same:+.2f}, oncoming "
+             f"{a_head_on:+.2f} m/s^2")
+
     # --- the same ego with lane changes disabled must NOT change --- #
     ego2 = Ego(x=x, y=y, theta=math.radians(h), v=12.0)
     pol2 = HighwayEgoPolicy(frame, ego2, bg, atime=0.0, allow_lane_change=False)
@@ -333,6 +424,31 @@ def check_closed_loop(ck: Checks, cmap) -> None:
              loop.n_recasts > 0 or loop.outcome == "merged",
              f"{loop.n_recasts} recast(s); CutinOrchestrator alone locks its "
              f"first pick forever")
+    # The regression the whole port turned on: a holder that has drifted into
+    # the ego's lane scores zero for casting, and `cast_roles` would hand the
+    # role away on the very tick the merge is detectable.
+    from .closed_loop import StickyCutinOrchestrator
+    from .script_bridge import ROLE_CUTIN as _RC
+    ck.check("closed loop: the orchestrator is sticky on feasibility",
+             isinstance(loop.orch, StickyCutinOrchestrator),
+             "cast_roles alone drops a lock whose score has fallen to 0 — "
+             "which is every holder that is actually merging")
+    if loop.orch is not None:
+        orch = loop.orch
+        actors = loop.sc.actors
+        keep = str(actors[0].id)
+        orch.committed = False
+        orch.cutin_id = keep
+        orch.sticky_id = keep
+        # put the "holder" exactly on the ego's line, where it scores 0
+        saved = actors[0].start
+        actors[0].start = (ego.x, ego.y + 6.0, saved[2] if len(saved) > 2 else 90.0)
+        orch.cast(actors, ego, loop.sc.map.lane_width, sticky=True)
+        actors[0].start = saved
+        ck.check("closed loop: a merging holder keeps the role",
+                 orch.cutin_id == keep and orch.roles.get(actors[0].id) == _RC,
+                 f"holder {keep} on the ego's own line still holds the cut-in")
+
     ck.check("closed loop: it logged what it did", len(loop.events) > 0,
              f"{len(loop.events)} events; last: "
              f"{loop.events[-1].text if loop.events else '-'}")

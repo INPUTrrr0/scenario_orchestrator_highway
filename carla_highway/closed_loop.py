@@ -70,13 +70,75 @@ def cutin_spec_of(sc: "se.Scenario") -> Optional[dict]:
     return None
 
 
+class StickyCutinOrchestrator(co.CutinOrchestrator):
+    """`CutinOrchestrator` whose cast is sticky on FEASIBILITY, not score.
+
+    This is the one place the port has to override the orchestration kernel
+    rather than merely drive it, and the reason is a contradiction inside
+    `cast_roles` that makes a merge undetectable:
+
+    * `cast_roles` honours a `lock_id` only while that actor still scores
+      above zero, and `score_cutin_candidate` returns exactly zero for an
+      actor that is not `cutin_eligible` — *adjacent lane* and ahead.
+    * A cut-in succeeds by leaving the adjacent lane. `cutin_is_merged`
+      requires the actor within 0.5 m of a pin whose lateral offset is 0, i.e.
+      on the ego's own line; `cutin_adjacent` requires at least 0.4 lane widths
+      away from it. The two conditions cannot hold at once.
+
+    So on the very tick the holder arrives at the pin, `tick` casts *before* it
+    plans, the lock is refused for scoring zero, the role moves to somebody
+    else, and `apply_closed_loop_cutin` — the only thing that can return
+    "merged" — is never called for the actor that just merged. Every cut-in
+    then runs out its deadline and reports `abandoned`. That is what the first
+    CARLA runs did, without exception, including the scripted-ego run that
+    reproduces upstream's authored conditions.
+
+    `scenario_editor.py`'s own casting, which is what `experiment.py` drives
+    and where the repository's successful runs come from, does not have this
+    problem: it identifies the holder by *which actor carries the spec* and
+    states the rule in as many words — "mid-chase the holder drifts toward the
+    ego's lane, which tanks its candidate score — that is progress, not
+    failure — so stickiness is on feasibility, not score." This class applies
+    that rule to `CutinOrchestrator`, and nothing more: the holder keeps the
+    role while `HighwayClosedLoop._recast_if_hopeless` judges it still able to
+    make the pin, and `cast_roles` decides everything else exactly as before.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #: the holder the port has decided to keep this tick, or None to let
+        #: `cast_roles` have its way. Set by `_recast_if_hopeless`.
+        self.sticky_id: Optional[str] = None
+
+    def cast(self, actors, ego, lane_width, sticky: bool = True):
+        n_before = self.n_interventions
+        castings = super().cast(actors, ego, lane_width, sticky=sticky)
+        keep = self.sticky_id
+        if (keep is None or self.committed or self.cutin_id == keep
+                or not any(str(c.actor_id) == str(keep) for c in castings)):
+            return castings
+        castings = [co.Casting(actor_id=c.actor_id,
+                               role=(ROLE_CUTIN if str(c.actor_id) == str(keep)
+                                     else ROLE_NOMINAL),
+                               score=c.score)
+                    for c in castings]
+        self.roles = {c.actor_id: c.role for c in castings}
+        self.scores = {c.actor_id: c.score for c in castings}
+        self.cutin_id = keep
+        # `super().cast` counted moving the role away as an intervention; it
+        # did not happen, so do not report it.
+        self.n_interventions = n_before
+        return castings
+
+
 class HighwayClosedLoop:
     """Owns the background scenario, its clock, and the orchestration cadence."""
 
     def __init__(self, frame: HighwayFrame, background: "se.Scenario",
                  mode: ModeSpec, casting: Optional[bool] = None,
                  cruise: float = 12.0, cutin_spec: Optional[dict] = None,
-                 cutin_at: Optional[float] = None):
+                 cutin_at: Optional[float] = None,
+                 cutin_along: Optional[float] = None):
         self.frame = frame
         self.sc = background
         self.mode = mode
@@ -85,6 +147,11 @@ class HighwayClosedLoop:
         self.events: List[Event] = []
         self.cutin_at = cutin_at
         self.cutin_start = 0.0
+        #: sim time the orchestrator first declared the cut-in committed. The
+        #: upstream verifier keys every one of its four cut-in checks off this
+        #: instant (`docs/SCENARIOS_AND_VALIDATION.md`), so it has to be
+        #: recorded when it happens — it cannot be recovered afterwards.
+        self.t_commit: Optional[float] = None
         self._next_tick = 0.0
         self._last_msg = ""
         self.n_recasts = 0
@@ -97,13 +164,25 @@ class HighwayClosedLoop:
                 self._note(0.0, "cast",
                            "no `cutin:` spec in this scenario; casting disabled")
             else:
+                if cutin_along is not None:
+                    # The pin is authored centre-to-centre against 4.5 m
+                    # bodies. CARLA spawns whatever the blueprint is, and on
+                    # Town04 that has reached 5.2 m — so the authored 6.0 m is
+                    # 1.55 m bumper to bumper and the merge cannot help but
+                    # touch. Widening the pin is the port's business, not the
+                    # scenario's: `se.cutin_is_merged` and the upstream
+                    # verifier both accept anything up to CUTIN_MAX_AHEAD_M
+                    # (10 m), so there is room to give without leaving the
+                    # window either of them checks.
+                    spec = dict(spec)
+                    spec["along"] = float(cutin_along)
                 if cutin_at is not None:
                     spec = dict(spec)
                     lc = float(spec.get("lc_duration", 2.0))
                     self.cutin_start = max(0.0, float(cutin_at))
                     spec["t"] = float(cutin_at) + max(lc + 2.0, 4.0)
                     self._next_tick = self.cutin_start
-                self.orch = co.CutinOrchestrator(spec, cruise_speed=cruise)
+                self.orch = StickyCutinOrchestrator(spec, cruise_speed=cruise)
                 if cutin_at is not None:
                     self._note(0.0, "cast",
                                f"cut-in starts at t={self.cutin_start:.1f}s, "
@@ -140,6 +219,17 @@ class HighwayClosedLoop:
         self.atime = 0.0
 
         changed = self.orch.n_interventions != before_n
+        # `committed` latches on either outcome, and the recorded `t_commit` is
+        # that instant — the same convention `experiment.py` writes upstream,
+        # so a CARLA run and a pygame run mean the same thing by the field. It
+        # is only meaningful alongside `success`, and the verifier checks that
+        # first.
+        if self.t_commit is None and self.orch.committed:
+            self.t_commit = t_sim
+            self._note(t_sim, "cutin",
+                       f"cut-in {self.orch.outcome} by actor "
+                       f"{self.orch.cutin_id} at t={t_sim:.2f}s",
+                       actor=self.orch.cutin_id)
         if self.orch.cutin_id != before_holder:
             self._note(t_sim, "cast",
                        f"cut-in cast to actor {self.orch.cutin_id}"
@@ -180,7 +270,10 @@ class HighwayClosedLoop:
         which is what upstream does too.
         """
         orch = self.orch
-        if orch is None or orch.committed or not orch.cutin_id:
+        if orch is None:
+            return
+        orch.sticky_id = None
+        if orch.committed or not orch.cutin_id:
             return
         holder = next((a for a in self.sc.actors
                        if str(a.id) == str(orch.cutin_id)), None)
@@ -194,6 +287,11 @@ class HighwayClosedLoop:
 
         if se.live_cutin_feasible(pose_of(holder), ego.x, ego.y, theta,
                                   ego.v, spec, t_sim):
+            # Still able to make the pin, so it keeps the role — even once it
+            # has drifted far enough into the ego's lane that `cast_roles`
+            # would score it zero and hand the part to somebody else. See
+            # `StickyCutinOrchestrator`.
+            orch.sticky_id = str(orch.cutin_id)
             return
 
         cands = [a for a in self.sc.actors
@@ -204,12 +302,33 @@ class HighwayClosedLoop:
                     if se.live_cutin_feasible(pose_of(a), ego.x, ego.y, theta,
                                               ego.v, spec, t_sim)]
         if not feasible:
+            orch.sticky_id = str(orch.cutin_id)
             return                     # nobody can; the holder abandons on time
 
         ego_pose = (ego.x, ego.y, math.degrees(theta))
         lw = self.sc.map.lane_width
         scores = {a.id: co.score_cutin_candidate(pose_of(a), ego_pose, lw)
                   for a in feasible}
+        # Feasibility and eligibility are different tests, and the recast has
+        # to respect BOTH or it deadlocks against the very function it is
+        # feeding. `live_cutin_feasible` asks "could this actor still reach the
+        # pin by the deadline" — an actor coming up from behind can. But
+        # `cast_roles` only casts actors that are `cutin_eligible` (adjacent
+        # lane AND already ahead), and it only honours a lock whose score is
+        # > 0, so an actor still behind the ego scores 0 and is refused.
+        #
+        # Handing the role to such an actor produces a two-tick oscillation:
+        # this method sets cutin_id, `cast` next tick rejects the lock and
+        # falls back to "no viable candidate", cutin_id goes to None, the tick
+        # after that re-picks the same infeasible holder, and round it goes at
+        # 10 Hz. That is exactly what the first CARLA runs did — 19
+        # interventions and 5 recasts inside four seconds, never committing.
+        # If nobody eligible can make it, the holder keeps the role and
+        # abandons on time, which is what upstream does.
+        feasible = [a for a in feasible if scores[a.id] > 0.0]
+        if not feasible:
+            orch.sticky_id = str(orch.cutin_id)
+            return                     # the holder keeps it and abandons on time
         best = max(feasible, key=lambda a: scores[a.id])
         v_req, _ = se.live_cutin_required_speed(pose_of(holder), ego.x, ego.y,
                                                 theta, ego.v, spec, t_sim)
@@ -218,6 +337,7 @@ class HighwayClosedLoop:
                    f"{v_req:.1f} m/s) — recast to {best.id} "
                    f"(score {scores[best.id]:.2f})", actor=str(best.id))
         orch.cutin_id = str(best.id)
+        orch.sticky_id = str(best.id)
         orch.n_interventions += 1
         self.n_recasts += 1
 
@@ -259,6 +379,8 @@ class HighwayClosedLoop:
             "holder": self.holder,
             "outcome": self.outcome,
             "committed": self.committed,
+            "t_commit": (round(self.t_commit, 3)
+                         if self.t_commit is not None else None),
             "interventions": self.n_interventions,
             "recasts": self.n_recasts,
             "roles": self.roles,
