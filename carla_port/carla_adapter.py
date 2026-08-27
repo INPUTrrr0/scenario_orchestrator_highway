@@ -164,7 +164,10 @@ def spawn_bindings(world, frame: IntersectionFrame, scenario: "se.Scenario",
                    z_offset: float = 0.10, simulate_physics: bool = True,
                    blueprint_filter: str = "vehicle.*",
                    adopt_carla_extents: bool = True,
-                   snap_to_ground: bool = True) -> BindingSet:
+                   snap_to_ground: bool = True,
+                   models: Optional[Dict[str, str]] = None,
+                   colors: Optional[Dict[str, str]] = None,
+                   notes: Optional[List[str]] = None) -> BindingSet:
     """Spawn one CARLA vehicle per script actor at that actor's initial pose.
 
     Script actors that cannot be spawned (occupied spot, off-road pose) are
@@ -175,6 +178,17 @@ def spawn_bindings(world, frame: IntersectionFrame, scenario: "se.Scenario",
     into the script actor's length/width, so PREDICTED body overlap (the
     orchestrator's oriented-rectangle sweep) and REALIZED CARLA collisions use
     the same geometry. It mutates only length/width, never the maneuver plan.
+
+    `models` maps script actor id -> a blueprint id or filter (`"*"` is the
+    catch-all key, applied to any actor without its own entry); `colors` does
+    the same for an `"R,G,B"` paint. Both are *preferences*: an id that matches
+    nothing in this build falls back to the body-size match below and appends a
+    line to `notes` rather than failing the run.
+
+    Left to itself, the size match hands every actor with the same declared
+    body the same blueprint — on Town04 that was a 5.2 m box truck for the
+    whole fleet, which is both hard to read in a video and 0.7 m longer than
+    the 4.5 m body the scenario's geometry was authored against.
     """
     library = world.get_blueprint_library()
     if blueprint_filter != "vehicle.*":
@@ -184,12 +198,32 @@ def spawn_bindings(world, frame: IntersectionFrame, scenario: "se.Scenario",
     if not pool:
         raise RuntimeError(f"no blueprints matched {blueprint_filter!r}")
 
+    models = dict(models or {})
+    colors = dict(colors or {})
+    notes = notes if notes is not None else []
+
     bindings = BindingSet(frame)
     for i, actor in enumerate(scenario.actors):
         want = (actor.length, actor.width)
-        bp = _closest_blueprint(pool, want, i)
+        aid = str(actor.id)
+        wanted = models.get(aid, models.get("*"))
+        bp = None
+        if wanted:
+            bp = _named_blueprint(library, wanted)
+            if bp is None:
+                notes.append(f"no blueprint matched {wanted!r} for actor {aid}; "
+                             "fell back to the closest body-size match")
+        if bp is None:
+            bp = _closest_blueprint(pool, want, i)
         if bp.has_attribute("role_name"):
             bp.set_attribute("role_name", f"script_{actor.id}")
+        paint = colors.get(aid, colors.get("*"))
+        if paint and bp.has_attribute("color"):
+            try:
+                bp.set_attribute("color", paint)
+            except (RuntimeError, ValueError):
+                notes.append(f"blueprint {bp.id} refused colour {paint!r} "
+                             f"for actor {aid}")
         x, y, h = actor.start
         z = frame.anchor.z
         if snap_to_ground:
@@ -214,6 +248,23 @@ def spawn_bindings(world, frame: IntersectionFrame, scenario: "se.Scenario",
     if adopt_carla_extents:
         scenario.simulate()                       # dimensions changed; refresh
     return bindings
+
+
+def _named_blueprint(library, wanted: str):
+    """A blueprint for an explicit id or filter, or None if nothing matches.
+
+    Accepts a full id (`vehicle.audi.tt`), a bare model (`audi.tt`) or a
+    wildcard (`vehicle.audi.*`); ties break on id so the choice is stable
+    across runs.
+    """
+    for pattern in (wanted, f"vehicle.{wanted}"):
+        try:
+            found = sorted(library.filter(pattern), key=lambda b: b.id)
+        except RuntimeError:
+            found = []
+        if found:
+            return found[0]
+    return None
 
 
 def _closest_blueprint(pool: List, want: Tuple[float, float], index: int):

@@ -110,6 +110,55 @@ class StickyCutinOrchestrator(co.CutinOrchestrator):
         #: `cast_roles` have its way. Set by `_recast_if_hopeless`.
         self.sticky_id: Optional[str] = None
 
+    def tick(self, asc, atime, ego, clock_t):
+        """`CutinOrchestrator.tick`, with the merged actor driving its OWN
+        cruise instead of matching the live ego.
+
+        Upstream, an actor that has merged is re-planned every tick at
+        `speed = ego.v`:
+
+            if (self.committed and a.id == self.cutin_id
+                    and self.outcome == "merged"):
+                speed = ego.v
+
+        Against the pygame ego that is harmless — that ego runs a scripted
+        speed profile and keeps moving whatever happens in front of it. Against
+        a closed-loop ego it is a deadlock, and a total one. The ego brakes for
+        the car that just cut in; the merged actor is then commanded to match
+        the ego's reduced speed; the smaller gap makes IDM brake harder; the
+        actor matches that too. Both spiral to a standstill within a second of
+        the merge and neither ever moves again. In the first CARLA cut-in the
+        actor went 12.0 -> 0.5 m/s in 0.6 s and both cars sat still for the
+        remaining nine seconds of the run.
+
+        `docs/SCENARIOS_AND_VALIDATION.md` asks for "a **nominal speed** (near
+        the ego's speed and/or its own cruise), not crawling or abandoned" — so
+        its own cruise satisfies the criterion, and it is the only one of the
+        two that cannot collapse. The scenario YAML authors a `cruise` for
+        every actor; `actor_cruise_speed` reads it.
+
+        Note that the verifier does not catch the deadlock: criterion 4 accepts
+        "near the ego's speed", and a stopped actor behind a stopped ego is
+        very near it indeed.
+        """
+        out = super().tick(asc, atime, ego, clock_t)
+        if not (self.committed and self.outcome == "merged" and self.cutin_id):
+            return out
+        sc = out[0]
+        for a in sc.actors:
+            if str(a.id) != str(self.cutin_id):
+                continue
+            v_nom = se.actor_cruise_speed(a, default=self.cruise_speed)
+            cur = (float(a.maneuvers[0].intercept)
+                   if a.maneuvers and hasattr(a.maneuvers[0], "intercept")
+                   else None)
+            if cur is None or abs(cur - v_nom) > 1e-3:
+                co.apply_nominal(a, v_nom,
+                                 heading_deg=self.headings.get(a.id))
+                sc.simulate()
+            break
+        return out
+
     def cast(self, actors, ego, lane_width, sticky: bool = True):
         n_before = self.n_interventions
         castings = super().cast(actors, ego, lane_width, sticky=sticky)

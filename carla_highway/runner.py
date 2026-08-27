@@ -124,6 +124,15 @@ class RunConfig:
     z_offset: float = 0.10
     reground_every: int = 0
     adopt_carla_extents: bool = True
+    #: CARLA blueprint for the background actors. A compact hatch/coupe keeps
+    #: the fleet legible in the video AND close to the 4.5 m body the scenario
+    #: geometry is authored against; the body-size match on its own picked a
+    #: 5.2 m box truck for every actor on Town04.
+    actor_model: str = "vehicle.audi.tt"
+    actor_color: str = "200,30,30"
+    #: the ego is painted apart from the traffic — the scripts draw it green.
+    ego_model: Optional[str] = None
+    ego_color: str = "90,190,110"
     ego: str = sc_mod.EGO_ID
     # ego
     ego_mode: str = PHYSICS_EGO
@@ -297,10 +306,17 @@ class HighwayRun:
         self._ego_start_y = ego_actor.start[1]
 
         # ---- CARLA bodies ---- #
+        models = {"*": cfg.actor_model} if cfg.actor_model else {}
+        colors = {"*": cfg.actor_color} if cfg.actor_color else {}
+        if cfg.ego_model:
+            models[str(cfg.ego)] = cfg.ego_model
+        if cfg.ego_color:
+            colors[str(cfg.ego)] = cfg.ego_color
         self.bindings = spawn_bindings(
             self.world, self.frame, self.scenario, z_offset=cfg.z_offset,
             simulate_physics=(cfg.sync_mode == PHYSICS),
-            adopt_carla_extents=cfg.adopt_carla_extents)
+            adopt_carla_extents=cfg.adopt_carla_extents,
+            models=models, colors=colors, notes=self.notes)
         self._log(f"spawned {len(self.bindings)}/{len(self.scenario.actors)} "
                   f"CARLA vehicles")
         if self.bindings.unbound:
@@ -1067,6 +1083,18 @@ def build_parser() -> argparse.ArgumentParser:
                    help="headless CARLA; implies --no-video")
     p.add_argument("--weather", default="clear", choices=["clear", "keep"])
     p.add_argument("--no-spectator", action="store_true")
+    p.add_argument("--actor-model", default="vehicle.audi.tt",
+                   help="CARLA blueprint for the background actors "
+                        "(default vehicle.audi.tt); falls back to the closest "
+                        "body-size match if this build has no such blueprint")
+    p.add_argument("--actor-color", default="200,30,30",
+                   help="R,G,B paint for the background actors (default red)")
+    p.add_argument("--ego-model", default=None,
+                   help="CARLA blueprint for the ego (default: closest match "
+                        "to its declared body)")
+    p.add_argument("--ego-color", default="90,190,110",
+                   help="R,G,B paint for the ego (default green, as the "
+                        "scripts draw it)")
     p.add_argument("--report", default=None, help="write the JSON report here")
     p.add_argument("--verify-report", default=None,
                    help="write the run in the upstream verifier's schema here "
@@ -1103,6 +1131,8 @@ def config_from_args(args) -> RunConfig:
         video_size=(int(w), int(h or 540)), video_fps=args.video_fps,
         video_top_span=args.video_top_span, hud=not args.no_hud,
         no_video=args.no_video or args.no_rendering, weather=args.weather,
+        actor_model=args.actor_model, actor_color=args.actor_color,
+        ego_model=args.ego_model, ego_color=args.ego_color,
         spectator=not args.no_spectator, report=args.report,
         verify_report=args.verify_report, traj_dt=args.traj_dt,
         verbose=not args.quiet)

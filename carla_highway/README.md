@@ -473,9 +473,9 @@ Town04 road 40, `--ego-mode physics --duration 14 --cutin-along 9`:
 
 | ego | port verdict | upstream verifier | what happened |
 |---|---|---|---|
-| `--lane-change` (IDM + **MOBIL**, §4) | **PASS** merged, no contact | **FAIL** `ego left target lane before actor merged` | MOBIL leaves the centre lane at t=1.3 s; the role is recast 2 → 4 at t=3.2 s and actor 4 merges at t=4.28 s, 8.8 m ahead and 0.2 m off the ego's line |
-| default (IDM, lane-keeping) | **PASS** merged, no contact | **OK 4/4** | same recast, merge at t=3.87 s, 6.2 m ahead |
-| `--scripted-ego` (the authored 13 → 4 m/s profile) | **PASS** merged, no contact | **OK 4/4** | actor 2 holds the role throughout and merges at t=5.48 s, 10.0 m ahead |
+| `--lane-change` (IDM + **MOBIL**, §4) | **PASS** merged, no contact | **FAIL** `ego left target lane before actor merged` | 2 lane changes, 122 m travelled; the role is recast to actor 4, which merges and then holds its 12 m/s cruise |
+| default (IDM, lane-keeping) | **PASS** merged, no contact | **OK 4/4** | same recast, merge at t=3.63 s, 121 m travelled |
+| `--scripted-ego` (the authored 13 → 4 m/s profile) | **PASS** merged, no contact | **OK 4/4** | actor 2 holds the role throughout and merges at t=5.48 s |
 
 The third row is the fidelity check: it drives the ego the YAML was authored
 around, so the casting runs under upstream's own conditions.
@@ -515,9 +515,9 @@ are what distinguish them.
 
 | run | verdict | what happened |
 |---|---|---|
-| `hard_brake` | **PASS** | 2 lane changes, 133 m, closest pass 1.6 m |
+| `hard_brake` | **PASS** | MOBIL pulls left at t≈4.4 s (`lane 1 -> 0, gain 0.30 > threshold 0.30`), passes the 4 m/s lead with 1.48 m to spare and returns to lane 1; 152.8 m, ends at 11.8 m/s |
 | `overtake` | **PASS** | waits out the oncoming car, creeps past the blocker, returns to lane |
-| `hard_brake --no-lane-change` | **FAIL** | "stuck behind the slow lead" |
+| `hard_brake --no-lane-change` | **FAIL** | "stuck behind the slow lead" — 85.3 m, ends at 4.11 m/s |
 
 **`hard_brake --no-lane-change` failing is the evidence for §4.**
 
@@ -526,6 +526,25 @@ lane-keeping IDM — drivev2's original behaviour — the ego closes on the 4 m/
 matches its speed and sits there for the whole run. The scenario is not
 solvable without a lateral decision, so a port that only inherited drivev2's
 policy would have reported the harness failing rather than the policy.
+
+### The merged actor must hold its own cruise, not the ego's
+
+`CutinOrchestrator.tick` re-plans a merged actor at `speed = ego.v` every tick.
+Against a scripted ego that is harmless. Against a closed-loop one it is a
+deadlock: the ego brakes for the car that just cut in, the actor is commanded
+to match the ego, the smaller gap makes IDM brake harder, and both are at a
+standstill within a second of the merge. The actor went 12.0 → 0.5 m/s in
+0.6 s and neither car moved again for the remaining nine seconds. The ego
+covered **39 m in 14 s**.
+
+`StickyCutinOrchestrator.tick` gives the merged actor its authored `cruise`
+instead — which is what criterion 4 asks for ("near the ego's speed **and/or**
+its own cruise"), and the only one of the two that cannot collapse. The actor
+now holds 12.0 m/s flat while the ego recovers 0 → 11 m/s behind it, and the
+ego covers **121 m**.
+
+The verifier does not catch the deadlock: criterion 4 accepts "near the ego's
+speed", and a stopped actor behind a stopped ego is very near it indeed.
 
 ### The pin is authored against bodies CARLA does not spawn
 
@@ -544,10 +563,18 @@ pin that overlaps is simply drawn overlapping — while CARLA's collision sensor
 do. `runner.py` reports this clearance at setup and flags it when it is under
 `CUTIN_TIGHT_CLEARANCE`. The port does not edit the authored scenario to hide
 it; `--cutin-along` overrides the pin from the command line instead, and the
-runs above use `--cutin-along 9` — 4.55 m bumper to bumper, and still inside
-the 10 m window that both `se.cutin_is_merged` and the verifier check. Note
-that the cut-in verifier would not have caught this either way: it never calls
-`_any_collision` (§6).
+runs above use `--cutin-along 9`. Note that the cut-in verifier would not have
+caught this either way: it never calls `_any_collision` (§6).
+
+The blueprint choice was making it worse. `spawn_bindings` picks the body
+closest to the actor's declared 4.5 × 2.0 m, which gave every actor on Town04
+the *same* 5.2 m box truck — 0.7 m longer than the scenario assumes, and hard
+to tell apart in a video. `--actor-model` / `--actor-color` (default
+`vehicle.audi.tt`, red) and `--ego-model` / `--ego-color` (default green, as
+the scripts draw it) name the vehicles instead; an id this build does not have
+falls back to the size match and appends a note rather than failing the run.
+With the TT the fleet is 4.2 m and `--cutin-along 9` leaves **4.82 m** bumper
+to bumper.
 
 The background collision in `overtake` (`2 x static.vegetation @ 19.75s`) is
 the oncoming car outliving the scenario and driving off the end of the fitted
