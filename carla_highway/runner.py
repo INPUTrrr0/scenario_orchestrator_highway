@@ -160,6 +160,12 @@ class RunConfig:
     policy_hz: float = 20.0
     # orchestration
     casting: Optional[bool] = None
+    #: clearance that counts as the scenario's target interaction; same
+    #: meaning and default as carla_port's flag of this name
+    interaction_gap_m: float = 4.0
+    #: how far off the ego's own line still counts as "in my lane" when
+    #: deciding a conflict happened (IDM_LANE_TOL's role, one lane wide)
+    lane_conflict_m: float = 2.2
     cruise: float = 12.0
     cutin_at: Optional[float] = None   # hold the cut-in off until this time
     cutin_along: Optional[float] = None  # override the pin distance, m ahead
@@ -192,21 +198,73 @@ class RunConfig:
 # --------------------------------------------------------------------------- #
 @dataclass
 class Interaction:
-    """What the ego did relative to one background actor."""
+    """What the ego did relative to one background actor.
+
+    Facts only, with the times they happened. Whether these add up to a
+    scenario family's target interaction is a question about the family, and
+    that belongs to the harness projection (`scenario_orchestration/metrics.py`),
+    not here: the harness owns the family definition, this repository owns its
+    native realization.
+    """
     actor_id: str
     oncoming: bool
+    #: lane index and signed longitudinal offset at spawn, which is how the
+    #: projection tells a blocking lead from adjacent-lane traffic without
+    #: hard-coding actor ids
+    start_lane: int = -1
+    start_along: float = 0.0
+    same_lane_at_start: bool = False
     min_gap: float = float("inf")
+    t_min_gap: Optional[float] = None
+    #: first time this actor was BOTH inside the interaction band and laterally
+    #: inside the ego's own lane -- see `update` for why both are required
+    t_conflict: Optional[float] = None
+    #: first time inside the band on distance alone, ignoring lane. Diagnostic:
+    #: it is what `t_conflict` would have been without the lateral gate.
+    t_close: Optional[float] = None
     passed: bool = False
+    t_passed: Optional[float] = None
     _was_ahead: Optional[bool] = None
 
-    def update(self, along: float, gap: float) -> None:
-        self.min_gap = min(self.min_gap, gap)
+    def update(self, along: float, gap: float, lat: float, t: float,
+               band: float, lane_tol: float) -> None:
+        """One step of the ego's relationship with this actor.
+
+        `t_conflict` needs the lateral gate, not just the gap. On a 3-lane road
+        an actor spawned one lane over sits 3.5 m abeam, which is a box
+        clearance of about 1.5 m -- inside a 4 m band -- so a band tested on
+        distance alone reports the target interaction at t=0, before anything
+        has happened. That is exactly what made `cut_in` report
+        `time_to_event: 0.017` for a merge that had not begun.
+        """
+        if gap < self.min_gap:
+            self.min_gap, self.t_min_gap = gap, round(t, 3)
+        if self.t_close is None and gap <= band:
+            self.t_close = round(t, 3)
+        if self.t_conflict is None and gap <= band and abs(lat) <= lane_tol:
+            self.t_conflict = round(t, 3)
         ahead = along > 0
         if self._was_ahead is None:
             self._was_ahead = ahead
         elif self._was_ahead and not ahead:
             self.passed = True          # it was in front, now it is behind
+            self.t_passed = round(t, 3)
             self._was_ahead = False
+
+    def to_dict(self) -> dict:
+        return {
+            "oncoming": self.oncoming,
+            "start_lane": self.start_lane,
+            "start_along": round(self.start_along, 2),
+            "same_lane_at_start": self.same_lane_at_start,
+            "min_gap": (round(self.min_gap, 3)
+                        if self.min_gap != float("inf") else None),
+            "t_min_gap": self.t_min_gap,
+            "t_conflict": self.t_conflict,
+            "t_close": self.t_close,
+            "passed": self.passed,
+            "t_passed": self.t_passed,
+        }
 
 
 class HighwayRun:
@@ -242,6 +300,10 @@ class HighwayRun:
         #: spawn_bindings adopts the real CARLA bounding boxes, so the
         #: gaps reported here are between the bodies that actually collide.
         self._extents: Dict[str, Tuple[float, float]] = {}
+        #: (t, lane index) each time the ego's occupied lane changes. The
+        #: projection needs WHEN the ego was in the opposing lane, which a
+        #: final-state summary cannot answer.
+        self._lane_track: List[Tuple[float, int]] = []
         #: [t, x, y, heading_deg, speed] rows, in the SCRIPT frame — which is
         #: the frame the upstream verifier assumes (+y along the road, lanes
         #: separated in x, headings in degrees), so no conversion is needed on
@@ -425,10 +487,16 @@ class HighwayRun:
         if not cfg.scripted_ego:
             self._build_ego(ego_actor)
 
+        ex0, ey0, _eh0 = ego_actor.start
+        ego_lane0 = self.frame.lane_index_of(ex0)
         for a in background.actors:
             aid = str(a.id)
+            ax0, ay0, ah0 = a.start
+            lane0 = self.frame.lane_index_of(ax0)
             self.interactions[aid] = Interaction(
-                actor_id=aid, oncoming=not sc_mod._is_forward(a.start[2]))
+                actor_id=aid, oncoming=not sc_mod._is_forward(ah0),
+                start_lane=lane0, start_along=ay0 - ey0,
+                same_lane_at_start=(lane0 == ego_lane0))
             # Spawn pose + body, in the verifier's [x, y, heading, L, W] form.
             self._spawns[aid] = [round(float(a.start[0]), 3),
                                  round(float(a.start[1]), 3),
@@ -742,7 +810,11 @@ class HighwayRun:
             d_long = abs(along) - (el + al) / 2.0
             d_lat = abs(lat) - (ew + aw) / 2.0
             gap = max(d_long, d_lat, 0.0)
-            it.update(along, gap)
+            it.update(along, gap, lat, self.t_sim,
+                      self.cfg.interaction_gap_m, self.cfg.lane_conflict_m)
+        lane = self.frame.lane_index_of(ex)
+        if not self._lane_track or self._lane_track[-1][1] != lane:
+            self._lane_track.append((round(self.t_sim, 3), lane))
 
     # ------------------------------------------------------------------ #
     # Trajectory recording, in the upstream verifier's schema
@@ -1049,14 +1121,28 @@ class HighwayRun:
             "orchestration": self.loop.summary(),
             "body_extents": {aid: [round(l, 2), round(w, 2)]
                              for aid, (l, w) in sorted(self._extents.items())},
-            "interactions": {
-                aid: {"oncoming": it.oncoming,
-                      "min_gap": (round(it.min_gap, 3)
-                                  if it.min_gap != float("inf") else None),
-                      "passed": it.passed}
-                for aid, it in self.interactions.items()},
-            "realized_collisions": [str(rc) for rc in self.realized],
-            "ego_collisions": [str(rc) for rc in self.ego_collisions()],
+            "interactions": {aid: it.to_dict()
+                             for aid, it in self.interactions.items()},
+            # Structured, not the human-readable strings: the harness
+            # projection reads actor/other/sim_time off these, and it is the
+            # same shape carla_port emits so one projection serves both.
+            "realized_collisions": [
+                {"sim_time": round(getattr(rc, "sim_time", 0.0), 3),
+                 "actor": getattr(rc, "actor_id", None),
+                 "other": getattr(rc, "other_id", None),
+                 "other_type": getattr(rc, "other_type", ""),
+                 "impulse": round(getattr(rc, "impulse", 0.0), 1)}
+                for rc in self.realized],
+            "collisions_text": [str(rc) for rc in self.realized],
+            "ego_collisions_text": [str(rc) for rc in self.ego_collisions()],
+            # keys the harness projection reads
+            "sim_time": round(self.t_sim, 3),
+            "interaction_gap_m": self.cfg.interaction_gap_m,
+            "lane_conflict_m": self.cfg.lane_conflict_m,
+            "intervention_cost": float(self.loop.n_interventions),
+            "ego_lane_track": [[t, ln] for t, ln in self._lane_track],
+            "lanes": [{"index": i, "oncoming": not ln.same_direction}
+                      for i, ln in enumerate(self.frame.lanes)],
             "grade": grade,
             "notes": self.notes,
         }
@@ -1115,10 +1201,10 @@ def summarize(rep: dict) -> str:
         out.append(f"  actor {aid}    min gap {it['min_gap']} m  "
                    f"{'PASSED' if it['passed'] else 'not passed'}"
                    + ("  (oncoming)" if it["oncoming"] else ""))
-    for rc in rep["ego_collisions"]:
+    for rc in rep["ego_collisions_text"]:
         out.append(f"  COLLISION  {rc}")
-    for rc in rep["realized_collisions"]:
-        if rc not in rep["ego_collisions"]:
+    for rc in rep["collisions_text"]:
+        if rc not in rep["ego_collisions_text"]:
             out.append(f"  (background) {rc}")
     checks = "  ".join(f"{k}{'+' if v else '-'}" for k, v in g["checks"].items())
     out.append(f"  VERDICT    {'PASS' if g['success'] else 'FAIL'}  [{checks}]  "

@@ -1,0 +1,30 @@
+{
+  "name": "orchestrator_highway",
+  "schema_version": "1.0.0",
+  "scenario_families": [
+    "cut_in",
+    "lane_change",
+    "overtake"
+  ],
+  "policy_interfaces": [
+    "ego_policy_v1"
+  ],
+  "observation_spaces": [
+    "state",
+    "sensor"
+  ],
+  "action_spaces": [
+    "control",
+    "waypoints"
+  ],
+  "closed_loop": true,
+  "notes": {
+    "scenario_families": "The three straight-road families, realized as carla_highway's three scenario modes (carla_highway/scenarios.py): cut_in as `cutin`, overtake as `overtake`, and lane_change as `hard_brake` -- the same situation under this repository's own name for it, a 4 m/s lead in the ego lane with 10.5 m/s traffic squeezing the adjacent one, which satisfies all three of that family's declared preconditions. The signalised-junction families belong to a different method; this repository's carla_port/ carries only the script-agnostic CARLA mechanics that carla_highway imports, not the junction port.",
+    "roads": "These families need a road fit, not a junction fit. Town04 is the only stock town where all three fit at their authored scale: it has both the multi-lane highway (390 m of 3-lane one-way) and a two-way road (170 m), which overtake requires. Town05 fits cut_in and lane_change. A purpose-built OpenDRIVE road can be supplied instead with the `xodr` parameter. The fit is validated offline against real OpenDRIVE geometry by carla_highway/validate.py, and every run report carries the lane fit error actually achieved in its `frame` block.",
+    "policies": "The analytic family is realized natively by binding the request onto carla_highway/highway_ego.py's own constants: `idm`, `idm_assertive` and `idm_conservative` run it lane-keeping, and `mobil` runs it with MOBIL deciding the lane. Those two are the same ego with one flag between them, and they are reported as separate policies because the lane-keeping one is the baseline that makes lane_change and overtake unsolvable -- which is the evidence those families need a lateral decision at all. Any other ego_policy_v1 policy is loaded from its own repository and driven through carla_port.ego_driver.PolicyEgoDriver.",
+    "observation_spaces": "carla_highway owns the CARLA world, so it can serve both the object-centric `state` document and a `sensor` block of camera images from carla_port/carla_sensors.py. The rig is the POLICY's to declare -- a sensorimotor model is trained behind one specific mounting -- so an ego_policy_v1 policy exposes sensors() and gets exactly that. LiDAR and radar are not served.",
+    "action_spaces": "The ego is actuated from a control. A policy declaring `waypoints` is accepted and run through the control its own controllers return alongside them, so its published closed-loop behaviour is reproduced rather than re-derived here; a waypoint policy that returns no control cannot be actuated and is reported as such.",
+    "scenario_realized": "For these families this answers 'did the scenario happen', not 'did the ego cope'. cut_in: the cast actor completed its merge AND entered the ego's lane inside the interaction band -- the lateral gate matters, because an actor spawned one lane over is already inside the band on distance alone. lane_change: the ego's own lane was blocked inside the band AND the target lane was occupied. overtake: the manoeuvre was forced AND oncoming traffic constrained it -- waiting for the oncoming car counts, because it is the oncoming car that made the ego wait. The port's own pass/fail verdict asks the other question and is reported separately as method_metrics.port_verdict.",
+    "environment": "CARLA 0.9.16 in synchronous mode at the script's own 1/60 s step, plus -- for an external policy -- that policy's own inference stack in the same interpreter."
+  }
+}

@@ -13,3 +13,4 @@ run_output/
 *.mp4
 # CARLA writes generated worlds back into its own OpenDrive dir
 OpenDriveMap.xodr
+scenario_orchestration/__pycache__/
