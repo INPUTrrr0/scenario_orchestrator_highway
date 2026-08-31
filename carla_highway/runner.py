@@ -44,6 +44,16 @@ from .highway_ego import (DELTA_MAX, EGO_LENGTH, EGO_WIDTH, IDM_V0,
 from .highway_map import FORWARD_HEADING, HighwayFrame
 from .script_bridge import DT, se
 
+def tr_mod():
+    """The trace-recording module, imported lazily.
+
+    Lazily because it loads the *harness's* recorder by path, and a run with
+    `--no-trace` should not depend on the harness being findable at all.
+    """
+    from . import trace_recording
+    return trace_recording
+
+
 BICYCLE = "bicycle"
 PHYSICS_EGO = "physics"
 EGO_MODES = (PHYSICS_EGO, BICYCLE)
@@ -163,6 +173,33 @@ class RunConfig:
     cruise: float = 12.0
     cutin_at: Optional[float] = None   # hold the cut-in off until this time
     cutin_along: Optional[float] = None  # override the pin distance, m ahead
+    #: Target time-to-conflict, in seconds: how much margin the orchestrator is
+    #: asked to leave at the point where the two bodies have to share road. 0.0
+    #: is a collision. `None` leaves the authored scenario alone.
+    #:
+    #: The mapping is per mode and is NOT the same kind of quantity in all
+    #: three, which matters when reading a delivery table:
+    #:
+    #:   cutin       absolute. The cut-in pin's `along` is the centre-to-centre
+    #:               distance the holder merges at, so the ego's projected time
+    #:               to that point is `along / v_ego` and the target is met by
+    #:               solving `along = ttc_target * v_ego` (floored at the
+    #:               feasibility minimum below). This is the mode where the
+    #:               orchestrator actually re-plans against the live ego, so it
+    #:               is the mode the orchestration claim rests on.
+    #:   hard_brake  offset. Casting is off, the conflict is authored, and the
+    #:               knob shifts the slow lead's start station by
+    #:               `ttc_target * v_ego` further up the road. The delivered
+    #:               time-to-conflict therefore tracks the request with the
+    #:               authored baseline added, and the delivery error is offset
+    #:               by construction rather than by a failure to aim.
+    #:   overtake    offset, the same way, on the oncoming actor.
+    ttc_target: Optional[float] = None
+    #: Where the per-tick canonical trace goes (`states.jsonl`, `scene.json`).
+    #: The harness's metrics package cannot compute scenario success without it,
+    #: and unlike video it costs no rendering.
+    trace_dir: Optional[str] = None
+    trace_rate_hz: float = 10.0
     # outputs
     video: Optional[str] = None
     video_dir: str = DEFAULT_VIDEO_DIR
@@ -227,7 +264,9 @@ class HighwayRun:
         self.bindings = None
         self.sync = None
         self.collisions = None
-        self.recorder = None
+        self.recorder = None          # video
+        self.trace = None             # the harness's per-tick canonical trace
+        self._trace_events = 0
         self.t_sim = 0.0
         self.notes: List[str] = []
         self.realized: List[object] = []
@@ -356,6 +395,10 @@ class HighwayRun:
         self.notes.extend(notes)
         for n in notes:
             self._log(f"  ! {n}")
+        # Before split_ego and before anything is spawned: for the two modes
+        # with no casting, aiming the conflict means moving an actor's spawn.
+        if cfg.ttc_target is not None:
+            self._aim_scripted_conflict(float(cfg.ttc_target))
         ego_actor, background = sc_mod.split_ego(self.scenario, cfg.ego)
         self.ego_actor = ego_actor
         self._ego_start_y = ego_actor.start[1]
@@ -411,10 +454,13 @@ class HighwayRun:
         cutin_at = cfg.cutin_at
         if cutin_at is not None and cutin_at < 0:
             cutin_at = None
+        cutin_along = cfg.cutin_along
+        if cfg.ttc_target is not None and cfg.scenario == sc_mod.CUTIN:
+            cutin_along = self._aim_cutin_pin(float(cfg.ttc_target))
         self.loop = HighwayClosedLoop(self.frame, background, spec,
                                       casting=cfg.casting, cruise=cfg.cruise,
                                       cutin_at=cutin_at,
-                                      cutin_along=cfg.cutin_along)
+                                      cutin_along=cutin_along)
         if cutin_at is not None and self.loop.orch is not None:
             deadline = float(self.loop.orch.spec.get("t", cutin_at))
             self._log(f"cut-in starts at t={cutin_at:.1f}s (merge by t={deadline:.1f}s)")
@@ -456,11 +502,106 @@ class HighwayRun:
         if not cfg.no_video:
             self._build_recorder()
 
+        self._build_trace()
+
         # place everyone at their initial state and let CARLA settle one tick
         self.sync.apply(world_states(self.scenario, 0.0))
         self.world.tick()
         if self.recorder is not None:
             self.recorder.start()
+
+    #: The smallest cut-in pin distance that leaves a manoeuvre to perform.
+    #: Below the two bodies' half-lengths the merge is inside the ego and the
+    #: lane change cannot complete at all, so a requested time-to-conflict of
+    #: zero is aimed at contact rather than at an impossibility -- which is
+    #: exactly what the intersection port's `ttc_target = 0` means too.
+    MIN_CUTIN_ALONG_M = 5.0
+
+    def _aim_cutin_pin(self, target: float) -> float:
+        """The cut-in pin distance that delivers a target time-to-conflict.
+
+        The pin's `along` is the centre-to-centre distance the holder merges at,
+        so the ego's projected time to the merge point is `along / v_ego` and the
+        aim is `along = ttc_target * v_ego`. Absolute, and this is the mode the
+        orchestration claim rests on: the holder is *cast* and re-planned against
+        the live ego every 0.1 s, so the pin is an instruction the orchestrator
+        then has to satisfy rather than a spawn offset.
+        """
+        v = float(self.cfg.desired_speed or IDM_V0)
+        along = max(self.MIN_CUTIN_ALONG_M, target * v)
+        self.notes.append(
+            "ttc_target %.2f s -> cut-in pin along = %.2f m at the ego's "
+            "%.1f m/s free-flow speed%s. Absolute: the ego's projected time to "
+            "the merge point is along / v_ego by construction."
+            % (target, along, v,
+               " (floored at %.1f m, so a zero target is aimed at contact "
+               "rather than at an impossible merge)" % self.MIN_CUTIN_ALONG_M
+               if target * v < self.MIN_CUTIN_ALONG_M else ""))
+        self._log("  ttc_target %.2f s -> cutin_along %.2f m" % (target, along))
+        return along
+
+    def _aim_scripted_conflict(self, target: float) -> None:
+        """Aim a non-casting mode's conflict, by moving its spawn.
+
+        `hard_brake` and `overtake` turn casting off on purpose -- cast roles or
+        yields would change the very timings those scenarios are tuned around --
+        so there is no plan to re-solve and the only place the timing can be
+        aimed from is the conflict actor's start station. It is shifted
+        `ttc_target * v_ego` further along the road, away from the ego, so a
+        larger target is more time.
+
+        This is an **offset, not an absolute aim**, and the note says so: the
+        authored conflict timing is the baseline, so the delivered
+        time-to-conflict tracks the request with that baseline added. Read the
+        delivery table for these two modes as a slope, not an intercept. Making
+        it absolute would mean solving for the meeting point of two actors whose
+        speeds the scenario also authors, which is a change to those scenarios
+        rather than a knob on them.
+
+        Called before `split_ego` and before anything is spawned, because a
+        start pose edited after `spawn_bindings` moves nothing.
+        """
+        aid, role = self._scripted_conflict()
+        if aid is None:
+            self.notes.append(
+                "ttc_target %.2f s was requested but mode %r has no conflict "
+                "actor this port can aim; the authored scenario is unchanged"
+                % (target, self.cfg.scenario))
+            return
+        actor = next((a for a in self.scenario.actors if str(a.id) == aid), None)
+        if actor is None:
+            return
+        v = float(self.cfg.desired_speed or IDM_V0)
+        x, y, h = actor.start
+        forward = 1.0 if sc_mod._is_forward(h) else -1.0
+        shift = forward * target * v
+        actor.start = (x, y + shift, h)
+        self.notes.append(
+            "ttc_target %.2f s -> the %s actor (%s) starts %+.2f m along the "
+            "road at the ego's %.1f m/s. An OFFSET, not an absolute aim: "
+            "casting is off in this mode, so the authored conflict timing is "
+            "the baseline and the delivered time-to-conflict tracks the "
+            "request with that baseline added."
+            % (target, role, aid, shift, v))
+        self._log("  ttc_target %.2f s -> actor %s spawn %+.2f m" %
+                  (target, aid, shift))
+
+    def _scripted_conflict(self):
+        """`(actor id, role)` for the conflict of a non-casting mode."""
+        want = {sc_mod.HARD_BRAKE: "slow", sc_mod.OVERTAKE: "blocker"}.get(
+            self.cfg.scenario)
+        if want is None:
+            return None, None
+        for a in self.scenario.actors:
+            if str(getattr(a, "role", "") or "") == want:
+                return str(a.id), want
+        # The geometric fallback `_derive_roles` uses is not available yet --
+        # this runs before the frame is fitted -- so the authored id is the
+        # guess, and `_derive_roles` is what checks it later.
+        for a in self.scenario.actors:
+            if str(a.id) == "1":
+                return "1", want
+        return None, None
 
     #: Bumper-to-bumper metres a cut-in pin should leave once real CARLA bodies
     #: are in play. Below this, contact is expected rather than a bug.
@@ -589,6 +730,47 @@ class HighwayRun:
         spec.set_transform(carla.Transform(
             loc, carla.Rotation(pitch=-90.0, yaw=self.frame.to_carla_yaw(90.0))))
 
+    def _build_trace(self) -> None:
+        """Open the per-tick canonical trace the harness's metrics package reads.
+
+        Nothing here may fail the run: a trace is worth less than a run, so
+        every failure becomes a note in the report. The scene is declared here
+        rather than on the first tick because the reference paths are a property
+        of the setup, and because a failure to declare them is then reported
+        where it can still be read.
+        """
+        if not self.cfg.trace_dir:
+            return
+        from . import trace_recording as tr
+        self.trace, note = tr.make_recorder(
+            self.cfg.trace_dir, rate_hz=self.cfg.trace_rate_hz,
+            context={"town": self.cfg.town, "scenario": self.cfg.scenario,
+                     "road_id": self.frame.road_id,
+                     "lane_width_m": round(float(self.frame.lane_width), 3),
+                     "num_lanes": int(self.frame.num_lanes),
+                     "method": "orchestrator_highway"})
+        if note:
+            self.notes.append(note)
+            self._log(f"  ! {note}")
+        if self.trace is not None:
+            tr.declare_scene(self.trace, self)
+            self._log(f"recording a per-tick trace at "
+                      f"{self.cfg.trace_rate_hz:g} Hz -> {self.cfg.trace_dir}")
+
+    def orchestration_roles(self) -> Dict[str, str]:
+        """Role labels as the orchestrator and the scenario have them.
+
+        Used by the trace declaration, so an actor's declared role travels into
+        the canonical trace and the metric's geometrically resolved hero can be
+        compared against it.
+        """
+        try:
+            roles = (self.loop.roles if self.loop is not None else None) \
+                or self._derive_roles()
+        except Exception:                         # pragma: no cover - defensive
+            roles = {}
+        return {str(k): str(v) for k, v in (roles or {}).items()}
+
     def _build_recorder(self) -> None:
         from carla_port.carla_video import Recorder
         cfg = self.cfg
@@ -665,8 +847,16 @@ class HighwayRun:
             for rc in self.collisions.drain():
                 self.realized.append(rc)
                 self._log(f"  t={self.t_sim:6.2f}  {rc}")
+                if self.trace is not None:
+                    tr_mod().note_collision(self.trace, self, rc)
             self._track(states)
             self._sample_traj()
+            if self.trace is not None:
+                m = tr_mod()
+                m.capture(self.trace, self)
+                m.note_hero(self.trace, self)
+                self._trace_events = m.note_events(self.trace, self,
+                                                   self._trace_events)
             if self.recorder is not None:
                 self.recorder.capture(self._hud())
         return self.report()
@@ -1062,11 +1252,23 @@ class HighwayRun:
         }
         if self.recorder is not None:
             rep["video"] = self.recorder.path
+        if self.trace is not None:
+            rep["trace_v2"] = {"dir": self.cfg.trace_dir,
+                               "rate_hz": self.cfg.trace_rate_hz,
+                               "ticks": getattr(self.trace, "n_ticks", None),
+                               "errors": list(getattr(self.trace, "errors", ()))}
+        if self.cfg.ttc_target is not None:
+            rep["ttc_target"] = float(self.cfg.ttc_target)
         if self.ego_driver is not None:
             rep["ego_driver"] = self.ego_driver.metadata()
         return rep
 
     def teardown(self) -> None:
+        if self.trace is not None:
+            try:
+                self.trace.close()
+            except Exception as exc:
+                self.notes.append(f"trace close: {exc}")
         if self.ego_driver is not None:
             try:
                 self.ego_driver.close()
@@ -1191,6 +1393,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "moving the merge deadline ~lc_duration later. Default "
                         "and any negative value: no delay, use the deadline "
                         "the scenario YAML authored")
+    p.add_argument("--ttc-target", type=float, default=None, dest="ttc_target",
+                   help="target time-to-conflict in seconds; 0 aims at a "
+                        "collision. Absolute for cutin (the pin distance is "
+                        "solved for it), an offset on the conflict actor's "
+                        "spawn for hard_brake and overtake -- see RunConfig")
+    p.add_argument("--trace-out", default=None, dest="trace_dir",
+                   help="write the harness's per-tick canonical trace "
+                        "(states.jsonl, scene.json) into this directory")
+    p.add_argument("--trace-rate-hz", type=float, default=10.0,
+                   dest="trace_rate_hz")
     p.add_argument("--cutin-along", type=float, default=None, dest="cutin_along",
                    help="override the cut-in pin distance, m ahead of the ego "
                         "centre-to-centre (YAML default 6.0). Real CARLA bodies "
@@ -1265,7 +1477,8 @@ def config_from_args(args) -> RunConfig:
         no_lane_change=args.no_lane_change,
         lane_change=args.lane_change,
         casting=args.casting, cruise=args.cruise, cutin_at=args.cutin_at,
-        cutin_along=args.cutin_along,
+        cutin_along=args.cutin_along, ttc_target=args.ttc_target,
+        trace_dir=args.trace_dir, trace_rate_hz=args.trace_rate_hz,
         policy=args.policy, policy_request=args.policy_request,
         policy_hz=args.policy_hz,
         video=args.video,
