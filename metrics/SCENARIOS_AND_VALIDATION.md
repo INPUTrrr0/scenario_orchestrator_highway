@@ -1,8 +1,8 @@
 # Scenarios and validation metrics
 
-Implementation lives in `scripts/scenario_verify.py`;
-use `scripts/verify_run.py` on a single JSON file or `scripts/summarize_experiments.py`
-on a folder.
+Implementation lives in `metrics/scripts/scenario_verify.py`;
+use `metrics/scripts/verify_run.py` on a single JSON file or
+`metrics/scripts/summarize_experiments.py` on a folder.
 
 
 
@@ -91,18 +91,18 @@ A actor is in the same lane as the ego and ahead of the ego. This actor slows do
 ```bash
 # Cut-in batch experiments
 .venv/bin/python experiment.py --seed 42
-.venv/bin/python scripts/summarize_experiments.py -v
+.venv/bin/python metrics/scripts/summarize_experiments.py -v
 
 # Stress scenarios (overtake / hard_brake)
 .venv/bin/python stress_experiment.py scenarios/scenario_overtake.yaml
 .venv/bin/python stress_experiment.py scenarios/scenario_hard_brake.yaml
 
 # Verify one run
-.venv/bin/python scripts/verify_run.py experiments/stress/scenario_overtake_0.json -v
-.venv/bin/python scripts/verify_run.py --setup-only experiments/stress/scenario_overtake_0.json
+.venv/bin/python metrics/scripts/verify_run.py experiments/stress/scenario_overtake_0.json -v
+.venv/bin/python metrics/scripts/verify_run.py --setup-only experiments/stress/scenario_overtake_0.json
 
 # Summarize all JSON under experiments/ (includes stress/ subfolder)
-.venv/bin/python scripts/summarize_experiments.py --dir experiments -v
+.venv/bin/python metrics/scripts/summarize_experiments.py --dir experiments -v
 ```
 
 ---
@@ -110,6 +110,8 @@ A actor is in the same lane as the ego and ahead of the ego. This actor slows do
 
 
 ## Tunable parameters
+
+Defined at the top of `metrics/scripts/scenario_verify.py`.
 
 
 | Parameter                          | Default    | Used for                                      |

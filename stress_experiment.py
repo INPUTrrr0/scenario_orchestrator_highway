@@ -2,7 +2,7 @@
 """Record overtake / hard_brake driving trials to JSON for verification.
 
 Loads a stress-test scenario YAML, drops you into Drive mode, and writes
-trajectories plus role metadata for ``scripts/verify_run.py``.
+trajectories plus role metadata for ``metrics/scripts/verify_run.py``.
 
 Usage:
     .venv/bin/python stress_experiment.py scenarios/scenario_overtake.yaml

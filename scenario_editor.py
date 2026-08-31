@@ -787,7 +787,7 @@ def load_scenario(path: str) -> Scenario:
 # --------------------------------------------------------------------------- #
 CUTIN_MIN_SPEED = 0.5
 CUTIN_MAX_SPEED = 40.0
-# Verifier-aligned merge station (scripts/summarize_experiments.py)
+# Verifier-aligned merge station (metrics/scripts/summarize_experiments.py)
 CUTIN_MAX_AHEAD_M = 10.0
 CUTIN_MIN_AHEAD_M = 0.5
 

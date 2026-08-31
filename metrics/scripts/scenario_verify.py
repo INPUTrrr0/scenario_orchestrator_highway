@@ -5,7 +5,7 @@ Used by ``summarize_experiments.py`` and ``verify_run.py``.  Each verifier
 returns ``(ok, reason, details)`` where ``details["checks"]`` maps criterion
 keys to booleans.
 
-See ``docs/SCENARIOS_AND_VALIDATION.md`` for natural-language descriptions.
+See ``metrics/SCENARIOS_AND_VALIDATION.md`` for natural-language descriptions.
 """
 from __future__ import annotations
 
@@ -17,7 +17,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 _HERE = __file__
 import os
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# metrics/scripts/ -> repo root (scenario_editor_new)
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
@@ -206,7 +207,7 @@ def detect_scenario(data: dict) -> str:
 def verify_proper_cutin(data: dict,
                         lane_width: Optional[float] = None
                         ) -> Tuple[bool, str, Dict[str, Any]]:
-    """Cut-in: four checks (see docs/SCENARIOS_AND_VALIDATION.md)."""
+    """Cut-in: four checks (see metrics/SCENARIOS_AND_VALIDATION.md)."""
     cast = data.get("cast") or {}
     rec = data.get("cutin") or {}
     performer = rec.get("performer") or cast.get("cutin")
@@ -499,7 +500,7 @@ def verify_overtake(data: dict,
 def verify_hard_brake_setup(data: dict,
                             lane_width: Optional[float] = None
                             ) -> Tuple[bool, str, Dict[str, Any]]:
-    """Hard-brake stage checks (1–2) per docs/SCENARIOS_AND_VALIDATION.md.
+    """Hard-brake stage checks (1–2) per metrics/SCENARIOS_AND_VALIDATION.md.
 
     1. Braking actor same-lane ahead; brakes only once gap ≤ trigger, with
        normal deceleration.
