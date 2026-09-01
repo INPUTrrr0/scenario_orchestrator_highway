@@ -280,11 +280,22 @@ def _from_actor(actor):
 
 
 def note_collision(rec, run, rc) -> None:
+    """One collision, with **who** was in it.
+
+    `RealizedCollision` names its participants `actor_id` and `other_id`
+    (`carla_port/carla_collision.py`). Reading `actor`/`other` off it, as this
+    did, always missed and always silently, so every collision this port has
+    written landed with `actors: []` -- and that list is what the scenario
+    kernels' "no third party redirected the interaction" predicate tests, and
+    what bounds a measurement at the moment two bodies met. Same defect, same
+    fix, as the intersection port's.
+    """
     if rec is None:
         return
-    actors = [a for a in (getattr(rc, "actor", None), getattr(rc, "other", None))
-              if a is not None]
-    rec.event(getattr(rc, "sim_time", run.t_sim), "collision", actors=actors,
+    actors = [a for a in (getattr(rc, "actor_id", None),
+                          getattr(rc, "other_id", None)) if a is not None]
+    rec.event(getattr(rc, "sim_time", run.t_sim), "collision",
+              actors=[str(a) for a in actors],
               other_type=getattr(rc, "other_type", None),
               impulse=getattr(rc, "impulse", None))
 
