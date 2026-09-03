@@ -677,7 +677,37 @@ class HighwayRun:
             self.policy = None
             return
 
-        use_external = bool(self.cfg.policy or self.cfg.policy_request)
+        # THREE ways an external ego policy can arrive, not two.
+        #
+        # `--policy NAME` and `--policy-request FILE` are the port's own CLI
+        # paths, and it loads the driver itself for both. The third is an
+        # ALREADY-BUILT driver assigned to `self.ego_driver` before `run()` --
+        # which is what `scenario_orchestration/run.py` does, on purpose: the
+        # harness has already resolved the policy repository, and injecting the
+        # driver is also the only way the BEV source gets attached, since the
+        # port's own loader does not build one.
+        #
+        # That third path used to be invisible here, and the consequence was
+        # that `orchestrator_highway` + a NETWORK ego policy never ran at all:
+        # neither cfg field is set by the injection, so `use_external` was
+        # False, this method took the internal IDM branch below, and `attach()`
+        # was never called. The injected driver survived untouched -- nothing
+        # in the internal branch clears it -- so `_drive_ego` found a non-None,
+        # unattached driver and raised "PolicyEgoDriver.control() before
+        # attach()" on the first tick. Every plant2 cell of experiments 004,
+        # 005 and 006 failed exactly that way.
+        #
+        # `idm` was never affected, and for a reason worth stating so nobody
+        # "fixes" it too: an analytic IDM is realized ANALYTICALLY by design
+        # (`scenario_orchestration/run.py :: build_ego_driver`, whose docstring
+        # says so). It returns no driver to inject, and the request's IDM
+        # parameters are bound onto this port's own highway IDM instead -- so
+        # the internal branch below IS the correct realization for it, and the
+        # run reports which constants were applied. Only a policy that needs a
+        # driver takes the branch above.
+        injected = self.ego_driver is not None
+        use_external = bool(self.cfg.policy or self.cfg.policy_request
+                            or injected)
         if use_external:
             if self.cfg.ego_mode != PHYSICS_EGO:
                 raise RuntimeError(
@@ -685,9 +715,18 @@ class HighwayRun:
                     f"ego policy: it emits carla.VehicleControl, which needs "
                     f"'{PHYSICS_EGO}'")
             binding.carla_actor.set_simulate_physics(True)
-            driver, loaded = _load_external_ego_driver(self.cfg, self.policy)
-            self.ego_driver = driver
-            self._external_policy_name = loaded.name
+            if injected:
+                # Already resolved and constructed by the caller; loading a
+                # second driver here would re-read the policy document, build a
+                # second network and drop the BEV source the caller attached.
+                driver = self.ego_driver
+                if not self._external_policy_name:
+                    self._external_policy_name = str(
+                        getattr(driver, "name", "") or "external")
+            else:
+                driver, loaded = _load_external_ego_driver(self.cfg, self.policy)
+                self.ego_driver = driver
+                self._external_policy_name = loaded.name
             driver.attach(EgoContext(
                 world=self.world, frame=self.frame, bindings=self.bindings,
                 ego_id=self.cfg.ego, ego_actor=binding.carla_actor,
