@@ -1,0 +1,16 @@
+[submodule "policies/tfv6"]
+	path = policies/tfv6
+	url = https://github.com/kesai-labs/lead.git
+	branch = main
+[submodule "policies/simlingo"]
+	path = policies/simlingo
+	url = https://github.com/RenzKa/simlingo.git
+	branch = main
+[submodule "policies/ltfv6"]
+	path = policies/ltfv6
+	url = https://github.com/autonomousvision/lead.git
+	branch = cvpr2026
+[submodule "policies/plant2"]
+	path = policies/plant2
+	url = https://github.com/friedeggs/plant2.git
+	branch = frong/orchestration
