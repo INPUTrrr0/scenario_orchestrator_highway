@@ -308,14 +308,230 @@ class HudPainter:
 
 
 # --------------------------------------------------------------------------- #
+# Overhead occluders
+# --------------------------------------------------------------------------- #
+#: How far above the road surface a mesh has to sit before it counts as
+#: "overhead" rather than "part of the road". Town04's overpass decks clear the
+#: carriageway by ~8.6 m.
+OCCLUDER_MIN_CLEARANCE_M = 4.0
+
+#: Enumerating environment objects is a server-side walk over the whole map —
+#: 18.5k objects on Town04 — and routinely outruns a normal client timeout. The
+#: call is made under this one instead, and restored afterwards.
+OCCLUDER_QUERY_TIMEOUT_S = 120.0
+
+
+def clear_top_view_occluders(world, frame, span: float,
+                             clearance: float = OCCLUDER_MIN_CLEARANCE_M,
+                             client=None) -> Tuple[List[str], str]:
+    """Hide the overpass decks that block the bird's-eye panel.
+
+    Town04's road 47 runs under an overpass, so several seconds of the top view
+    are deck rather than scenario. `enable_environment_object` turns a static
+    mesh off world-wide, which is the only lever CARLA offers: there is no
+    per-camera cull mask.
+
+    Selection is BY LABEL first, then by geometry, and the order matters. A
+    purely geometric filter — "anything whose box sits above the road" — picks
+    up 249 objects on Town04 including `Road_Road_Town04_104_SM_0` and the
+    `Town04_TerrainNode_*` meshes, because the town's road and terrain geometry
+    spans elevated sections whose bounding boxes clear the carriageway by
+    definition. Hiding those would delete the road the scenario runs on.
+    `CityObjectLabel.Bridge` separates the deck from the carriageway that the
+    geometry cannot: the decks are themselves named `Road_Road_Town04_33x_SM_0`
+    and are only distinguishable by label. Scoped that way, Town04 yields
+    exactly the two decks over road 47.
+
+    Returns `(names_hidden, diagnostic)`. The diagnostic is never empty — an
+    earlier version returned a bare list and swallowed a timeout into it, so a
+    silent failure was indistinguishable from "nothing to hide" and cost two
+    rounds of runs to notice.
+    """
+    label = getattr(getattr(carla, "CityObjectLabel", None), "Bridge", None)
+    if label is None:
+        return [], "this CARLA build has no CityObjectLabel.Bridge"
+
+    restore = None
+    if client is not None:
+        try:
+            client.set_timeout(OCCLUDER_QUERY_TIMEOUT_S)
+            restore = client
+        except (RuntimeError, AttributeError):
+            restore = None
+    try:
+        objects = world.get_environment_objects(label)
+    except (RuntimeError, AttributeError) as exc:
+        return [], f"bridge query failed: {type(exc).__name__}: {exc}"
+    finally:
+        if restore is not None:
+            try:
+                restore.set_timeout(20.0)
+            except (RuntimeError, AttributeError):
+                pass
+
+    anchor = frame.anchor
+    reach = 0.5 * span * 1.25          # the recorded footprint, with a margin
+    floor = float(anchor.z) + clearance
+    hidden, names = [], []
+    for obj in objects:
+        try:
+            box = obj.bounding_box
+            loc = box.location
+            if float(loc.z) - float(box.extent.z) < floor:
+                continue               # at grade: it cannot occlude
+            if (abs(float(loc.x) - float(anchor.x)) > reach
+                    or abs(float(loc.y) - float(anchor.y)) > reach):
+                continue               # outside what the camera records
+            hidden.append(obj.id)
+            names.append(str(getattr(obj, "name", obj.id)))
+        except (AttributeError, TypeError):
+            continue
+    if not hidden:
+        return [], (f"{len(objects)} bridge mesh(es) on this map, none overhead "
+                    f"within {reach:.0f} m of the camera anchor")
+    # `enable_environment_objects` is the 0.9.16 spelling; the singular does not
+    # exist. Both are tried because the name has moved between releases and a
+    # wrong guess here is silent in the video and loud nowhere else.
+    toggle = (getattr(world, "enable_environment_objects", None)
+              or getattr(world, "enable_environment_object", None))
+    if toggle is None:
+        return [], (f"found {len(hidden)} overhead bridge mesh(es) but this "
+                    "CARLA build exposes no enable_environment_object(s)")
+    try:
+        toggle(set(hidden), False)
+    except (RuntimeError, AttributeError, TypeError) as exc:
+        return [], (f"found {len(hidden)} overhead bridge mesh(es) but could "
+                    f"not hide them: {type(exc).__name__}: {exc}")
+    return names, f"hid {len(names)} overhead bridge mesh(es)"
+
+
+# --------------------------------------------------------------------------- #
 # Cameras
 # --------------------------------------------------------------------------- #
+class VisionPanel:
+    """The ego policy's own input, rendered as a third panel.
+
+    The other two panels show the world. This one shows what the MODEL sees,
+    which is a different question and the one that explains a run: a policy that
+    stops for a red light the scenario does not model, or that never registers a
+    stopped car, is answering the picture in this panel and not the one beside
+    it.
+
+    What that picture is depends on the policy's observation space:
+
+      cameras   simlingo's single wide forward frame, tfv6's three views
+                stitched left-to-right in the rig's own order. Whatever the
+                policy asked `carla_sensors.py` for, in the order it asked.
+      bev       plant2 is privileged and reads no camera; its input is the
+                `bev_semantic_classes` raster `scenario_orchestration/bev.py`
+                renders. Class indices, so it is colourised here to be legible
+                — the palette is this panel's, the raster is the policy's.
+
+    A policy with neither gets a caption saying so rather than a black rectangle
+    that could be mistaken for a dead camera.
+    """
+
+    #: chauffeurnet's semantic classes, as distinguishable colours. Index order
+    #: is the raster's own; anything beyond the table wraps.
+    BEV_PALETTE = [
+        (18, 18, 22), (70, 70, 78), (140, 140, 150), (235, 235, 240),
+        (90, 190, 110), (210, 70, 60), (240, 175, 65), (80, 140, 220),
+        (170, 110, 220), (60, 200, 200), (200, 120, 170), (120, 200, 90),
+    ]
+
+    def __init__(self, width: int, height: int):
+        self.width = int(width)
+        self.height = int(height)
+        self._font = _font(16)
+
+    # ------------------------------------------------------------------ #
+    def render(self, vision: Optional[dict]) -> "np.ndarray":
+        frame = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+        frame[:] = (14, 14, 18)
+        if np is None:
+            return frame
+        image, caption = self._compose(vision)
+        if image is not None:
+            frame = self._fit(image, frame)
+        self._caption(frame, caption)
+        return frame
+
+    # ------------------------------------------------------------------ #
+    def _compose(self, vision: Optional[dict]):
+        """(image or None, caption)."""
+        if not vision:
+            return None, "ego input: unavailable"
+        cameras = vision.get("cameras") or {}
+        views = [(name, arr) for name, arr in cameras.items()
+                 if getattr(arr, "ndim", 0) == 3 and arr.shape[2] == 3]
+        if views:
+            heights = [v.shape[0] for _n, v in views]
+            target = min(heights)
+            tiles = []
+            for _name, arr in views:
+                if arr.shape[0] != target:
+                    scale = target / max(arr.shape[0], 1)
+                    arr = self._resize(arr, max(1, int(arr.shape[1] * scale)),
+                                       target)
+                tiles.append(arr)
+            image = tiles[0] if len(tiles) == 1 else np.hstack(tiles)
+            names = ", ".join(n for n, _v in views)
+            return image, f"ego input: {names}"
+        raster = vision.get("bev")
+        if raster is not None:
+            return self._colourise(raster), "ego input: BEV semantic raster"
+        return None, "ego input: state only (no visual input)"
+
+    def _colourise(self, raster) -> "np.ndarray":
+        arr = np.asarray(raster)
+        while arr.ndim > 2:                    # (C, H, W) or (H, W, C)
+            arr = arr[0] if arr.shape[0] <= 8 else arr[..., 0]
+        arr = arr.astype(np.int32)
+        table = np.asarray(self.BEV_PALETTE, dtype=np.uint8)
+        return table[arr % len(table)]
+
+    # ------------------------------------------------------------------ #
+    def _fit(self, image, frame):
+        """Letterbox `image` into the panel, preserving aspect."""
+        h, w = image.shape[0], image.shape[1]
+        if h <= 0 or w <= 0:
+            return frame
+        scale = min(self.width / w, self.height / h)
+        out_w = max(1, min(self.width, int(w * scale)))
+        out_h = max(1, min(self.height, int(h * scale)))
+        resized = self._resize(image, out_w, out_h)
+        y0 = (self.height - out_h) // 2
+        x0 = (self.width - out_w) // 2
+        frame[y0:y0 + out_h, x0:x0 + out_w] = resized
+        return frame
+
+    @staticmethod
+    def _resize(image, width: int, height: int):
+        """Nearest-neighbour, so this needs no PIL and cannot interpolate a
+        semantic class index into a colour that means something else."""
+        h, w = image.shape[0], image.shape[1]
+        ys = (np.arange(height) * (h / max(height, 1))).astype(np.int32)
+        xs = (np.arange(width) * (w / max(width, 1))).astype(np.int32)
+        ys = np.clip(ys, 0, h - 1)
+        xs = np.clip(xs, 0, w - 1)
+        return image[ys][:, xs]
+
+    def _caption(self, frame, text: str) -> None:
+        if Image is None:
+            return
+        img = Image.fromarray(frame)
+        dr = ImageDraw.Draw(img)
+        dr.rectangle([0, 0, self.width, 24], fill=(0, 0, 0))
+        dr.text((8, 4), text, font=self._font, fill=(235, 235, 240))
+        frame[:] = np.asarray(img)
+
+
 class CameraRig:
     """One or two RGB cameras, read synchronously."""
 
     def __init__(self, world, frame: IntersectionFrame, view: str = "both",
                  width: int = 720, height: int = 540, fov: float = 90.0,
-                 top_span: Optional[float] = None):
+                 top_span: Optional[float] = None, top_follow: bool = True):
         if view not in VIEWS:
             raise ValueError(f"unknown view {view!r}; expected one of {VIEWS}")
         self.world = world
@@ -325,6 +541,23 @@ class CameraRig:
         self.height = height
         self.fov = fov
         self.top_span = top_span or default_top_span(frame)
+        #: keep the top view centred on the ego instead of pinned to the road
+        #: anchor. A fixed camera spans `top_span` (94.5 m on Town04 road 47)
+        #: while the ego covers 119 m in a fourteen-second run, so the car
+        #: leaves frame after a few seconds and the panel records empty road —
+        #: and on a viaduct a large share of what is left is pier and grass
+        #: rather than scenario. Following costs nothing: the camera is
+        #: unattached and simply re-placed each tick, so the frame keeps the
+        #: script's +y up instead of yawing with the car.
+        self.top_follow = bool(top_follow)
+        self._top_cam = None
+        self._ego_actor = None
+        #: (camera xyz, ego xyz, applied?) from the last `follow()`. Read by the
+        #: runner for a periodic log line. Inferring whether the camera really
+        #: tracked the car from the pixels alone cost several rounds; this makes
+        #: it a number in the run log instead.
+        self.last_follow: Optional[Tuple[tuple, tuple, bool]] = None
+        self.follow_failures = 0
         self.sensors: List[object] = []
         self.queues: Dict[str, "Queue"] = {}
         self._last: Dict[str, "np.ndarray"] = {}
@@ -339,7 +572,7 @@ class CameraRig:
         bp.set_attribute("sensor_tick", "0.0")     # one image per world tick
         return bp
 
-    def _top_transform(self):
+    def _top_transform(self, ego_actor=None):
         """Straight down over the junction. For a camera pitched -90 the image's
         up direction is its yaw direction projected on the ground, so yawing it
         along the script's +y axis puts the N arm at the top of the frame — the
@@ -352,16 +585,50 @@ class CameraRig:
         a = self.frame.anchor
         aspect = max(1.0, self.width / max(self.height, 1))
         z = 0.5 * self.top_span * aspect / math.tan(math.radians(0.5 * self.fov))
+        x, y, ground = a.x, a.y, a.z
+        if ego_actor is not None:
+            try:
+                loc = ego_actor.get_transform().location
+                x, y, ground = loc.x, loc.y, loc.z
+            except (RuntimeError, AttributeError):
+                pass
         return carla.Transform(
-            carla.Location(x=a.x, y=a.y, z=a.z + z),
+            carla.Location(x=x, y=y, z=ground + z),
             carla.Rotation(pitch=-90.0, yaw=self.frame.to_carla_yaw(90.0),
                            roll=0.0))
+
+    def follow(self) -> None:
+        """Re-centre the top camera on the ego. Called once per tick.
+
+        The yaw is left at the frame's, not the ego's: this is a map view that
+        travels, not a camera bolted to the roof. A rigid attachment would spin
+        the whole frame every time the car changed lane.
+        """
+        if not (self.top_follow and self._top_cam and self._ego_actor):
+            return
+        tf = self._top_transform(self._ego_actor)
+        try:
+            eloc = self._ego_actor.get_transform().location
+            ego_xyz = (round(eloc.x, 2), round(eloc.y, 2), round(eloc.z, 2))
+        except (RuntimeError, AttributeError):
+            ego_xyz = (float("nan"),) * 3
+        cam_xyz = (round(tf.location.x, 2), round(tf.location.y, 2),
+                   round(tf.location.z, 2))
+        ok = True
+        try:
+            self._top_cam.set_transform(tf)
+        except (RuntimeError, AttributeError):
+            ok = False
+            self.follow_failures += 1
+        self.last_follow = (cam_xyz, ego_xyz, ok)
 
     def attach(self, ego_actor=None) -> int:
         """Spawn the cameras. `ego_actor` is required for the chase view."""
         bp = self._blueprint()
+        self._ego_actor = ego_actor
         if self.view in (TOP, "both"):
-            cam = self.world.spawn_actor(bp, self._top_transform())
+            cam = self.world.spawn_actor(bp, self._top_transform(ego_actor))
+            self._top_cam = cam
             self._register(TOP, cam)
         if self.view in (CHASE, "both") and ego_actor is not None:
             cam = self.world.spawn_actor(
@@ -483,11 +750,16 @@ class Recorder:
     def __init__(self, world, frame: IntersectionFrame, path: str,
                  view: str = "both", width: int = 720, height: int = 540,
                  fps: float = 30.0, sim_fps: float = 60.0, hud: bool = True,
-                 top_span: Optional[float] = None):
+                 top_span: Optional[float] = None, vision: bool = False,
+                 top_follow: bool = True):
         self.rig = CameraRig(world, frame, view=view, width=width, height=height,
-                             top_span=top_span)
+                             top_span=top_span, top_follow=top_follow)
         self.path = path
         self.fps = fps
+        #: show the ego policy's own input as a third panel
+        self.show_vision = bool(vision)
+        self.vision_panel: Optional[VisionPanel] = None
+        self.panel_width = int(width)
         self.stride = max(1, int(round(sim_fps / max(fps, 1e-6))))
         self.writer: Optional[VideoWriter] = None
         self.painter: Optional[HudPainter] = None
@@ -502,14 +774,25 @@ class Recorder:
         self.rig.drain()
         self._n = 0
 
-    def capture(self, hud: Hud) -> bool:
+    def capture(self, hud: Hud, vision: Optional[dict] = None) -> bool:
         """Take the frame the last `world.tick()` produced. Returns True when a
         frame was written. Must be called once per tick even when it is not a
-        recorded one, so the sensor queues cannot run away."""
+        recorded one, so the sensor queues cannot run away.
+
+        `vision` is the ego policy's own input, as `carla_port.ego_driver`
+        reports it. The panel is appended on EVERY written frame once enabled,
+        placeholder included, because `VideoWriter` fixes the frame size on the
+        first write and a panel that came and went would change it.
+        """
+        self.rig.follow()
         rgb = self.rig.grab()
         n, self._n = self._n, self._n + 1
         if rgb is None or n % self.stride:
             return False
+        if self.show_vision and np is not None:
+            if self.vision_panel is None:
+                self.vision_panel = VisionPanel(self.panel_width, rgb.shape[0])
+            rgb = np.hstack([rgb, self.vision_panel.render(vision)])
         if self.writer is None:
             h, w = rgb.shape[0], rgb.shape[1]
             self.writer = VideoWriter(self.path, w, h, self.fps)

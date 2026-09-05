@@ -55,6 +55,11 @@ DEFAULT_VIDEO_DIR = os.path.join(HERE, "outputs")
 DEFAULT_REPORT_DIR = os.path.join(HERE, "reports")
 
 #: Shorthand names -> policy.json fields for `--policy NAME`.
+#: The CARLA leaderboard's ego vehicle. simlingo, tfv6 and plant2 were all
+#: trained and published behind it, and a camera rig is only reproducible on the
+#: body it was calibrated against.
+LEADERBOARD_HERO = "vehicle.lincoln.mkz_2020"
+
 POLICY_SHORTCUTS = {
     "simlingo": {
         "name": "simlingo",
@@ -72,7 +77,37 @@ POLICY_SHORTCUTS = {
         "repository": "third_party/tfv6",
         "entry_point": "scenario_orchestration/policy.py",
     },
+    "plant2": {
+        "name": "plant2",
+        "interface": "ego_policy_v1",
+        "observation_space": "state",
+        "action_space": "waypoints",
+        "repository": "third_party/plant2",
+        "entry_point": "scenario_orchestration/policy.py",
+    },
 }
+
+#: Policies whose `state` observation has to carry a BEV semantic raster. The
+#: raster is the policy repository's own representation, so it is rendered
+#: there and not here; see `scenario_orchestration/bev.py`.
+BEV_POLICIES = ("plant2",)
+
+
+def _bev_source(loaded):
+    """The BEV callable for a policy that needs one, or None.
+
+    Every released PlanT 2.0 checkpoint is trained with `input_bev=True`, so the
+    object-centric observation alone is not enough to drive it. `PLANT2_BLANK_BEV`
+    is the policy's own escape hatch: honouring it here means leaving the
+    observation without a `bev` block, so the policy substitutes its own blank
+    raster and prints its own warning about what that does to the driving.
+    """
+    if loaded.name not in BEV_POLICIES:
+        return None
+    import bev as bev_mod                    # scenario_orchestration/bev.py
+    if bev_mod.blank_allowed():
+        return None
+    return bev_mod.build(loaded.repository)
 
 
 def _load_external_ego_driver(cfg: "RunConfig", companion: HighwayEgoPolicy):
@@ -97,7 +132,8 @@ def _load_external_ego_driver(cfg: "RunConfig", companion: HighwayEgoPolicy):
         raise ValueError(f"unknown --policy {cfg.policy!r}; "
                          f"have {sorted(POLICY_SHORTCUTS)}")
     loaded = pol_mod.load_policy(req, harness_root=None, repo_root=REPO_ROOT)
-    driver = PolicyEgoDriver(loaded.policy, name=loaded.name, hz=cfg.policy_hz)
+    driver = PolicyEgoDriver(loaded.policy, name=loaded.name, hz=cfg.policy_hz,
+                             bev=_bev_source(loaded))
     return driver, loaded
 
 
@@ -120,6 +156,20 @@ class RunConfig:
     #: the generated world walls the road edge; 0.5 m is enough to stop a car
     #: leaving it without walling the cameras in.
     xodr_wall_height: float = 0.5
+    #: show the ego policy's own input as a third video panel
+    video_vision: bool = True
+    #: keep the bird's-eye panel centred on the ego rather than on the road
+    video_top_follow: bool = True
+    #: slide the whole scenario this many metres along the road before running
+    along_offset: float = 0.0
+    #: hold every traffic light green for the run
+    lights_green: bool = True
+    #: hide bridge-labelled meshes overhanging the top camera. OFF by default:
+    #: it works, but on Town04 it hides two meshes that are not the deck the
+    #: bird's-eye camera actually loses the ego behind. `--along-offset` is the
+    #: fix for that; this stays available for a map where a labelled bridge
+    #: really is the occluder.
+    clear_occluders: bool = False
     duration: Optional[float] = None
     linger: float = 1.0
     fixed_delta: float = DT
@@ -304,6 +354,7 @@ class HighwayRun:
         #: projection needs WHEN the ego was in the opposing lane, which a
         #: final-state summary cannot answer.
         self._lane_track: List[Tuple[float, int]] = []
+        self._last_follow_log = -1e9
         #: [t, x, y, heading_deg, speed] rows, in the SCRIPT frame — which is
         #: the frame the upstream verifier assumes (+y along the road, lanes
         #: separated in x, headings in degrees), so no conversion is needed on
@@ -414,7 +465,8 @@ class HighwayRun:
 
         # ---- the scenario, refitted onto it ---- #
         authored = sc_mod.load(cfg.scenario, cfg.base)
-        self.scenario, notes = sc_mod.retarget(authored, self.frame)
+        self.scenario, notes = sc_mod.retarget(
+            authored, self.frame, along_offset=self.cfg.along_offset)
         self.notes.extend(notes)
         for n in notes:
             self._log(f"  ! {n}")
@@ -439,6 +491,18 @@ class HighwayRun:
             colors = {}
         if cfg.ego_model:
             models[str(cfg.ego)] = cfg.ego_model
+        elif cfg.policy or cfg.policy_request:
+            # Every policy in this family was trained behind the CARLA
+            # leaderboard's hero, `vehicle.lincoln.mkz_2020`, with its cameras
+            # mounted relative to THAT body. The port's default actor is a 4.18 m
+            # car, and the same `x=-1.5, z=2.0` mount then sits behind the cabin:
+            # the captured frame is a third full of the ego's own roof and
+            # bonnet. Spawn the hero so the rig geometry matches the training
+            # distribution. `--ego-model` still overrides.
+            models[str(cfg.ego)] = LEADERBOARD_HERO
+            self.notes.append(
+                f"ego spawned as {LEADERBOARD_HERO} (the leaderboard hero these "
+                "policies were trained behind); pass --ego-model to override")
         if cfg.ego_color:
             colors[str(cfg.ego)] = cfg.ego_color
         self.bindings = spawn_bindings(
@@ -482,6 +546,9 @@ class HighwayRun:
             self._log(f"cut-in starts at t={cutin_at:.1f}s (merge by t={deadline:.1f}s)")
         self._log(f"orchestration: {self.loop.status}")
         self._check_cutin_clearance(ego_actor, background)
+
+        if cfg.lights_green:
+            self._hold_lights_green()
 
         # ---- the ego ---- #
         if not cfg.scripted_ego:
@@ -639,6 +706,39 @@ class HighwayRun:
                   f"home lane {self.policy.home_lane}, "
                   f"max_steer={self.actuator.max_steer_deg:.0f} deg")
 
+    def _hold_lights_green(self) -> None:
+        """Freeze every traffic light green.
+
+        These are highway scenarios: they measure what the ego does about a
+        cut-in, a braking lead or a blocker. None of them is about intersection
+        compliance, and none of them manages signal phases — so a red light in
+        view simply ends the run early. simlingo is camera-only and obeys
+        lights, and on Town04 road 47 it stopped dead after 12 m reporting
+        "remain stopped due to the red traffic light", which is correct driving
+        and a useless measurement.
+
+        Frozen rather than merely set, so a phase timer cannot cycle one back to
+        red mid-run. `--traffic-lights keep` leaves them alone.
+        """
+        try:
+            lights = list(self.world.get_actors().filter("traffic.traffic_light*"))
+        except (RuntimeError, AttributeError) as exc:
+            self.notes.append(f"could not read traffic lights: "
+                              f"{type(exc).__name__}: {exc}")
+            return
+        held = 0
+        for light in lights:
+            try:
+                light.set_state(carla.TrafficLightState.Green)
+                light.set_green_time(1e6)
+                light.freeze(True)
+                held += 1
+            except (RuntimeError, AttributeError):
+                continue
+        msg = f"held {held}/{len(lights)} traffic light(s) green for the run"
+        self._log(f"  {msg}")
+        self.notes.append(msg)
+
     def _apply_weather(self) -> None:
         if self.cfg.weather != "clear":
             return
@@ -672,12 +772,34 @@ class HighwayRun:
         elif cfg.video_view in ("chase", "both"):
             self.notes.append("no CARLA body for the ego; the chase camera was "
                               "skipped and only the top view recorded")
+        # The bird's-eye panel is a camera pointed down at the road, so anything
+        # spanning the road above it — Town04 road 47 runs under an overpass —
+        # is what the panel records instead of the scenario. Hidden before the
+        # cameras spawn, and reported: this changes the world the policies see.
+        if cfg.clear_occluders and cfg.video_view in ("top", "both"):
+            from carla_port.carla_video import (clear_top_view_occluders,
+                                                default_top_span)
+            try:
+                span = cfg.video_top_span or default_top_span(self.frame)
+                hidden, why = clear_top_view_occluders(
+                    self.world, self.frame, span, client=self.client)
+            except Exception as exc:                  # never fail a run for this
+                hidden = []
+                why = f"{type(exc).__name__}: {exc}"
+            # Logged and noted either way. A silent empty result here is what
+            # made an earlier version look like it worked for two whole grids.
+            detail = (f"{why}: {', '.join(hidden[:6])}"
+                      + (" ..." if len(hidden) > 6 else "")) if hidden else why
+            self._log(f"top-view occluders: {detail}")
+            self.notes.append(f"top-view occluders: {detail}")
         try:
             self.recorder = Recorder(
                 self.world, self.frame, path, view=cfg.video_view,
                 width=cfg.video_size[0], height=cfg.video_size[1],
                 fps=cfg.video_fps, sim_fps=1.0 / cfg.fixed_delta, hud=cfg.hud,
-                top_span=cfg.video_top_span)
+                top_span=cfg.video_top_span,
+                vision=cfg.video_vision and self.ego_driver is not None,
+                top_follow=cfg.video_top_follow)
             n = self.recorder.attach(ego_actor)
             if getattr(self.recorder, "hud_unavailable", False):
                 self.notes.append("Pillow is not installed; the video has no HUD")
@@ -735,8 +857,13 @@ class HighwayRun:
                 self._log(f"  t={self.t_sim:6.2f}  {rc}")
             self._track(states)
             self._sample_traj()
+            if self.recorder is not None and self.cfg.verbose:
+                self._log_follow()
             if self.recorder is not None:
-                self.recorder.capture(self._hud())
+                self.recorder.capture(
+                    self._hud(),
+                    vision=(self.ego_driver.vision()
+                            if self.ego_driver is not None else None))
         return self.report()
 
     def _read_ego(self) -> None:
@@ -768,6 +895,53 @@ class HighwayRun:
             self._xtrack_max = max(self._xtrack_max,
                                    abs(self.policy.lane_offset()))
 
+    def _log_follow(self) -> None:
+        """Once a second, say where the bird's-eye camera actually is.
+
+        The top camera is supposed to sit directly over the ego. Whether it
+        really does is invisible in the video until the car leaves frame, and by
+        then the run is over — so the numbers go in the log.
+        """
+        rig = getattr(self.recorder, "rig", None)
+        last = getattr(rig, "last_follow", None)
+        if last is None:
+            return
+        if self.t_sim - self._last_follow_log < 1.0:
+            return
+        self._last_follow_log = self.t_sim
+        cam, ego, ok = last
+        dx, dy = cam[0] - ego[0], cam[1] - ego[1]
+        self._log(f"  t={self.t_sim:5.2f} top-cam ({cam[0]:.1f},{cam[1]:.1f},"
+                  f"{cam[2]:.1f}) ego ({ego[0]:.1f},{ego[1]:.1f},{ego[2]:.1f}) "
+                  f"offset ({dx:+.2f},{dy:+.2f}) applied={ok}")
+
+    def _advance_route(self, dt: float) -> None:
+        """Step the companion's lane decision while an external policy drives.
+
+        `HighwayEgoPolicy.choose_lane` is MOBIL plus the port's contraflow veto;
+        committing a change sets `target_lane` and builds the lateral profile
+        `reference_path` renders. `advance_lane_change` walks that profile by
+        the distance the ego actually covered, so a merge completes in road
+        distance rather than in wall time.
+
+        Guarded by `allow_lane_change`, which the mode spec sets
+        (`ego_lane_changes`) and `--lane-change` / `--no-lane-change` override,
+        so `cutin` still holds its lane: upstream drives that ego straight on
+        purpose and the scenario measures what the ACTORS do around it.
+        """
+        pol = self.policy
+        if pol is None or not pol.allow_lane_change:
+            return
+        try:
+            pol.choose_lane(pol.neighbours(), self.t_sim)
+            pol.advance_lane_change(max(pol.ego.v, 0.0) * max(dt, 0.0))
+        except (RuntimeError, ValueError, KeyError, IndexError) as exc:
+            # A route that cannot be re-planned must not take the run down: the
+            # ego keeps the lane it has and the note reaches the report.
+            note = f"lane re-planning failed ({type(exc).__name__}: {exc})"
+            if note not in self.notes:
+                self.notes.append(note)
+
     def _drive_ego(self, dt: float) -> None:
         if self.policy is None:
             return
@@ -775,6 +949,17 @@ class HighwayRun:
         if b is None:
             return
         if self.ego_driver is not None:
+            # The companion does not DRIVE here — the external policy owns the
+            # pedals — but it still owns the route, and the route is the only
+            # channel through which a lane change can reach a route-conditioned
+            # planner. `command()` is what normally runs MOBIL; skipping it
+            # wholesale, as this branch used to, froze `target_lane` at
+            # `home_lane` for the whole run, so `reference_path` was a straight
+            # line down the starting lane and no policy ever had a reason to
+            # merge. Run the DECISION half only: pick the lane, walk the
+            # lane-change profile, and let `reference_path` render it. Nothing
+            # here produces a throttle or a steering angle.
+            self._advance_route(dt)
             b.carla_actor.apply_control(self.ego_driver.control(dt))
             return
         throttle, steer = self.policy.command(now=self.t_sim, dt=dt)
@@ -1110,7 +1295,16 @@ class HighwayRun:
                                  "highway IDM + lane select")),
                 "home_lane": (p.home_lane if p else None),
                 "final_lane": (p.frame.lane_index_of(p.ego.x) if p else None),
-                "lane_changes": (p.n_lane_changes if p else 0),
+                # What the EGO did, read off the lane it was actually in. Under
+                # an external policy `n_lane_changes` counts what the companion's
+                # MOBIL asked the ROUTE for, which is a different question and
+                # is reported separately — a policy that ignores an offered
+                # merge has to be visible as exactly that.
+                "lane_changes": (max(0, len(self._lane_track) - 1)
+                                 if self.ego_driver is not None
+                                 else (p.n_lane_changes if p else 0)),
+                "route_lane_changes": ((p.n_lane_changes if p else 0)
+                                       if self.ego_driver is not None else None),
                 "used_oncoming_lane": (p.used_oncoming if p else False),
                 "max_cross_track": round(self._xtrack_max, 3),
                 "distance": (round(self._ego_xyv[1] - self._ego_start_y, 2)
@@ -1192,6 +1386,8 @@ def summarize(rep: dict) -> str:
         f"{f['length']:.0f} m, fit {f['lane_fit_error']:.2f} m) ===",
         f"  ego        {e['policy']} / {e['mode']}: "
         f"{e['lane_changes']} lane change(s)"
+        + ("" if e.get("route_lane_changes") is None
+           else f" (route offered {e['route_lane_changes']})")
         + (", used the oncoming lane" if e["used_oncoming_lane"] else "")
         + f", {e['distance']} m travelled, cross-track max {e['max_cross_track']} m",
         f"  orchestr.  casting={o['casting']} holder={o['holder']} "
@@ -1296,6 +1492,32 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--video-fps", type=float, default=30.0)
     p.add_argument("--video-top-span", type=float, default=None)
     p.add_argument("--no-hud", action="store_true")
+    p.add_argument("--no-vision-panel", action="store_true",
+                   help="drop the third video panel showing the ego policy's "
+                        "own input (cameras, or the BEV raster for a "
+                        "privileged policy)")
+    p.add_argument("--traffic-lights", default="green",
+                   choices=["green", "keep"], dest="traffic_lights",
+                   help="'green' freezes every light green for the run (the "
+                        "default: these scenarios are not about intersections, "
+                        "and a red light just ends them early). 'keep' leaves "
+                        "the signals alone.")
+    p.add_argument("--along-offset", type=float, default=0.0,
+                   dest="along_offset",
+                   help="slide the whole scenario N metres along the road. "
+                        "Staging only: lateral layout, spacing and speeds are "
+                        "unchanged. Use it to keep a run off a stretch the "
+                        "bird's-eye camera cannot see, such as Town04 road 47's "
+                        "overpass at script y=-10..+30")
+    p.add_argument("--static-top-view", action="store_true",
+                   help="pin the bird's-eye camera to the road anchor instead "
+                        "of following the ego. The ego outruns the fixed span "
+                        "in a few seconds, so the default is to follow")
+    p.add_argument("--hide-occluders", action="store_true",
+                   help="hide bridge-labelled meshes overhanging the top "
+                        "camera. Off by default: on Town04 the deck that hides "
+                        "the ego is not bridge-labelled, and --along-offset is "
+                        "the fix there")
     p.add_argument("--no-video", action="store_true")
     p.add_argument("--no-rendering", action="store_true",
                    help="headless CARLA; implies --no-video")
@@ -1341,6 +1563,11 @@ def config_from_args(args) -> RunConfig:
         timeout=args.timeout, load_timeout=args.load_timeout,
         town=args.town, xodr=args.xodr,
         xodr_wall_height=args.xodr_wall_height, duration=args.duration,
+        video_vision=not args.no_vision_panel,
+        video_top_follow=not args.static_top_view,
+        along_offset=args.along_offset,
+        lights_green=(args.traffic_lights == "green"),
+        clear_occluders=args.hide_occluders,
         linger=args.linger, fixed_delta=args.fixed_delta,
         no_rendering=args.no_rendering, road_id=args.road_id,
         min_length=args.min_length, base=args.base, sync_mode=args.sync_mode,

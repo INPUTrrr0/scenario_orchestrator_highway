@@ -1,0 +1,74 @@
+# HARD_BRAKE — delayed trigger, so the brake is something you can WATCH.
+#
+# `scenario_hard_brake.yaml` starts the lead already crawling at 4 m/s from
+# t=0. There is no "before": the ego opens its eyes with a slow car in its lane
+# and the whole run is the reaction. This variant gives the run a first act.
+#
+#   t = 0.0 .. 3.0   everyone drives nominally. Ego 12 m/s, lead 11 m/s, so the
+#                    gap closes gently (1 m/s) and nothing is happening yet.
+#   t = 3.0 .. 4.75  the lead brakes: -4 m/s^2, 11 -> 4 m/s.
+#   t = 4.75 ..      the lead holds 4 m/s and the ego has to have decided.
+#
+# The ego closes on the braking lead at ~8 m/s once it is down to 4, from a gap
+# of roughly 15 m at the moment the brake starts, which is a genuine choice
+# between braking and moving over rather than a foregone one.
+#
+# A note on `scripts/scenario_verify.py`
+# --------------------------------------
+# Its hard_brake SETUP metric wants the brake triggered by PROXIMITY — it fails
+# a run where deceleration starts at a longitudinal gap above
+# `HARD_BRAKE_TRIGGER_GAP_M` (6 m, +1 m tolerance). This scenario triggers on
+# TIME instead, at t=3, and the gap there is ~15 m, so that setup check will
+# report "braking started at gap 15 m". That is the scenario disagreeing with
+# the metric, not the run going wrong: the runner's own PASS/FAIL verdict
+# (no_hit / passed) is computed separately and is unaffected. Use the authored
+# `scenario_hard_brake.yaml` when the proximity-triggered staging is what you
+# want to measure.
+#
+# Lanes (heading 90 deg = north): left/adjacent x=-1.75, right/ego x=+1.75
+
+map:
+  kind: straight
+  num_lanes: 2
+  lane_width: 3.5
+  length: 160
+
+render:
+  pixels_per_meter: 6
+
+actors:
+  # Ego — right lane, constant 12 m/s profile (no scripted evasive action).
+  # Ignored under `--policy`: the learned ego drives and this is route only.
+  - id: 0
+    color: [90, 190, 110]
+    length: 4.5
+    width: 2.0
+    start: {x: 1.75, y: -60.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 12.0, accel: 0.0}}
+
+  # Slow lead — ego's lane, 18 m ahead. Nominal at 11 m/s for three seconds,
+  # then brakes to 4 m/s and stays there.
+  - id: 1
+    color: [210, 70, 60]
+    length: 4.5
+    width: 2.0
+    start: {x: 1.75, y: -42.0, heading: 90}
+    role: slow
+    autonomy: self
+    maneuvers:
+      - {type: go_straight, duration: 3.0, curve: {v0: 11.0, accel: 0.0}}
+      - {type: decelerate, duration: 1.75, curve: {v0: 11.0, accel: -4.0}}
+      - {type: go_straight, duration: 40.0, curve: {v0: 4.0, accel: 0.0}}
+
+  # Normal-speed lead — adjacent lane, 12 m ahead, 10.5 m/s: squeezes the
+  # merge gap during the overtake. Unchanged from the authored scenario.
+  - id: 2
+    color: [240, 175, 65]
+    length: 4.5
+    width: 2.0
+    start: {x: -1.75, y: -48.0, heading: 90}
+    role: adjacent
+    autonomy: self
+    maneuvers:
+      - {type: go_straight, duration: 40.0, curve: {v0: 10.5, accel: 0.0}}

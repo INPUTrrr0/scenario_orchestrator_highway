@@ -132,11 +132,26 @@ def discover_frame(world, mode: str, min_length: Optional[float] = None,
 
 
 def retarget(sc: "se.Scenario", frame: HighwayFrame,
-             stretch: bool = True) -> Tuple["se.Scenario", List[str]]:
+             stretch: bool = True,
+             along_offset: float = 0.0) -> Tuple["se.Scenario", List[str]]:
     """Move an authored scenario onto `frame`'s real road, in place-ish.
 
     Returns (scenario, notes). The scenario is a deep copy; the original YAML
     object is left alone so a caller can diff the two.
+
+    `along_offset` slides the whole scenario — every actor, the ego included —
+    that many metres up the road. The lateral layout, the spacing between actors
+    and every speed are untouched, so it moves WHERE the scenario happens and
+    not WHAT happens.
+
+    It exists because a stretch of road can be unusable for reasons the fitter
+    cannot see. Town04's road 47 runs under an overpass between script y=-10 and
+    y=+30, and while the driving there is fine, the bird's-eye camera films the
+    deck instead of the cars — the ego simply vanishes from the recording for
+    half the run. The deck cannot be hidden reliably: it is many meshes, and the
+    ones large enough to matter are indistinguishable by label or bounding box
+    from the carriageway itself. Moving the scenario is the cheap fix, and the
+    road either side is 260 m of the same geometry.
     """
     sc = copy.deepcopy(sc)
     notes: List[str] = []
@@ -151,6 +166,9 @@ def retarget(sc: "se.Scenario", frame: HighwayFrame,
     # straight is shorter, squeeze; never stretch beyond the authored spacing,
     # because the scenarios are timing-critical (a 30 m gap at 8 m/s is the
     # scenario).
+    if along_offset:
+        notes.append(f"scenario slid {along_offset:+.0f} m along the road "
+                     "(staging only; spacing and speeds unchanged)")
     src_len = float(getattr(src, "length", 0.0) or 0.0)
     y_scale = 1.0
     if stretch and src_len > 0 and frame.length < src_len:
@@ -165,7 +183,7 @@ def retarget(sc: "se.Scenario", frame: HighwayFrame,
         idx = _nearest_lane_index(src, x, n_src)
         idx = min(idx, frame.num_lanes - 1)
         new_x = frame.lane_center_x(idx)
-        new_y = y * y_scale
+        new_y = y * y_scale + along_offset
         # Preserve the authored direction of travel, but express it as the real
         # lane's heading so oncoming traffic actually faces into the ego.
         authored_forward = _is_forward(h)
@@ -235,12 +253,12 @@ def split_ego(sc: "se.Scenario", ego_id: str = EGO_ID
 
 def build(world, mode: str, path: Optional[str] = None,
           min_length: Optional[float] = None, road_id: Optional[int] = None,
-          frame: Optional[HighwayFrame] = None
+          frame: Optional[HighwayFrame] = None, along_offset: float = 0.0
           ) -> Tuple[HighwayFrame, "se.Actor", "se.Scenario", List[str]]:
     """Everything a run needs: (frame, ego actor, background scenario, notes)."""
     frame = frame or discover_frame(world, mode, min_length=min_length,
                                     road_id=road_id)
     authored = load(mode, path)
-    fitted, notes = retarget(authored, frame)
+    fitted, notes = retarget(authored, frame, along_offset=along_offset)
     ego, bg = split_ego(fitted)
     return frame, ego, bg, notes

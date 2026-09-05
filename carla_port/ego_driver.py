@@ -51,7 +51,9 @@ comparable number across every policy.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -151,6 +153,12 @@ class PolicyEgoDriver(EgoDriver):
         self._next_decision = 0.0          # seconds of driver time
         self._clock = 0.0
         self._last: Dict[str, Any] = {}
+        #: the policy's own input for the most recent decision, for the
+        #: recorder's vision panel. Held rather than recomputed: the rig is
+        #: captured once per DECISION, not once per tick, so re-reading it here
+        #: would either block on an empty queue or steal the next decision's
+        #: frame.
+        self._last_vision: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------ #
     def attach(self, ctx: EgoContext) -> None:
@@ -249,6 +257,16 @@ class PolicyEgoDriver(EgoDriver):
             self.actions.append(self._summarize(action))
         return self._control
 
+    def vision(self) -> Dict[str, Any]:
+        """What the policy saw when it last decided.
+
+        `{"cameras": {name: HxWx3 uint8}, "bev": raster or None}`. Empty before
+        the first decision. The recorder renders this; nothing else reads it, and
+        nothing here copies the arrays — they are the observation's own, and the
+        observation is rebuilt every decision.
+        """
+        return dict(self._last_vision)
+
     # ------------------------------------------------------------------ #
     def _act(self) -> Dict[str, Any]:
         ctx = self.ctx
@@ -260,6 +278,12 @@ class PolicyEgoDriver(EgoDriver):
             ego_speed=policy.ego.v)
         if self.rig is not None and self.rig.active:
             observation["sensor"] = {"cameras": self.rig.capture(self._frame())}
+        self._last_vision = {
+            "cameras": (observation.get("sensor") or {}).get("cameras") or {},
+            # A privileged policy reads no camera; `carla_obs` puts its raster
+            # here and that raster IS its visual input.
+            "bev": ((observation.get("bev") or {}).get("semantic_classes")),
+        }
         act = getattr(self.policy, "act", None) or getattr(self.policy, "step", None)
         if not callable(act):
             act = self.policy if callable(self.policy) else None
@@ -273,7 +297,66 @@ class PolicyEgoDriver(EgoDriver):
                 f"ego policy {self.name!r} returned {type(action).__name__}, not a "
                 "mapping; ego_policy_v1 actions are JSON-compatible mappings")
         self._last = action
+        self._dump(observation, action)
         return action
+
+    # ------------------------------------------------------------------ #
+    # Observation capture, for offline replay
+    # ------------------------------------------------------------------ #
+    def _dump(self, observation: Dict[str, Any], action: Dict[str, Any]) -> None:
+        """Write this decision's inputs and outputs to `$AV_DUMP_OBS`.
+
+        A policy bug — "it brakes when it should drive" — is a pure function of
+        the observation, but reproducing it costs a CARLA server, a GPU and
+        ninety seconds. Dumping the observation once turns every later iteration
+        into an offline `policy.act(...)` call on the same numbers, which is the
+        difference between a feedback loop and a batch job.
+
+        Off unless `$AV_DUMP_OBS` names a directory. `$AV_DUMP_STEPS` selects
+        which decisions to keep (comma-separated indices, default the first
+        three and then every twentieth) so a run does not write gigabytes.
+        """
+        out_dir = os.environ.get("AV_DUMP_OBS")
+        if not out_dir:
+            return
+        wanted = os.environ.get("AV_DUMP_STEPS")
+        step = self.steps
+        if wanted:
+            try:
+                keep = step in {int(v) for v in wanted.split(",") if v.strip()}
+            except ValueError:
+                keep = False
+        else:
+            keep = step < 3 or step % 20 == 0
+        if not keep:
+            return
+        try:
+            import numpy as _np
+        except ImportError:
+            return
+        os.makedirs(out_dir, exist_ok=True)
+        arrays, meta = {}, {}
+        for key, value in (observation.get("sensor") or {}).get("cameras", {}).items():
+            if getattr(value, "shape", None) is not None:
+                arrays[f"sensor.{key}"] = _np.asarray(value)
+        raster = (observation.get("bev") or {}).get("semantic_classes")
+        if raster is not None:
+            arrays["bev"] = _np.asarray(raster)
+        for key, value in observation.items():
+            if key in ("sensor", "bev"):
+                continue
+            try:
+                json.dumps(value)
+                meta[key] = value
+            except (TypeError, ValueError):
+                meta[key] = repr(value)[:2000]
+        meta["_action"] = {k: v for k, v in action.items() if k != "waypoints"}
+        meta["_policy"] = self.name
+        meta["_step"] = step
+        base = os.path.join(out_dir, f"{self.name}_step{step:04d}")
+        _np.savez_compressed(base + ".npz", **arrays)
+        with open(base + ".json", "w") as fh:
+            json.dump(meta, fh, indent=1, default=str)
 
     def _frame(self) -> Optional[int]:
         """The world frame the images must be stamped with — see

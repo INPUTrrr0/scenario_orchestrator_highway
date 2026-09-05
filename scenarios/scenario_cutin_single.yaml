@@ -1,0 +1,62 @@
+# Highway cut-in on a straight 3-lane road — SINGLE cut-in actor.
+#
+# Same road, same ego, same `cutin:` spec as `scenario_cutin.yaml`; the three
+# nominal-traffic actors (2, 3, 4) are removed. What is left is the ego and
+# exactly one car, and that car holds the cut-in.
+#
+# Why a separate file rather than a flag
+# --------------------------------------
+# Dropping the extra traffic changes what the scenario measures, so it is a
+# different scenario, not a different setting:
+#
+#   * `scenario_cutin.yaml` measures RECASTING. Actor 1 holds the role, the ego
+#     brakes (or a policy ego simply drives slower than 12 m/s), the pin falls
+#     behind actor 1, and the orchestrator hands the role to actor 4, which is
+#     coming up from behind. Two of the three recorded policy runs never got
+#     there — the role was abandoned instead — and the video is busy enough
+#     that which car is the cut-in is not obvious.
+#   * This file measures the CUT-IN ITSELF. One candidate, no yields to solve
+#     around, nowhere to recast to: either actor 1 makes the pin by the
+#     deadline or the run reports `abandoned`. The car that cuts in is the only
+#     car on screen besides the ego.
+#
+# Actor 1 is copied verbatim from `scenario_cutin.yaml` — same lane, same start,
+# same cruise, same `cutin:` spec — so a run of this file is directly
+# comparable to the actor-1 half of a run of that one.
+#
+# Lanes (northbound, heading 90°): left x=-3.5, center x=0, right x=+3.5
+#
+# The EGO block is kept for the pygame editor, which drives the authored
+# script. `carla_highway --policy ...` ignores it: the ego is driven by the
+# learned policy and the script is only a route reference.
+
+map:
+  kind: straight
+  num_lanes: 3
+  lane_width: 3.5
+  length: 120
+
+render:
+  pixels_per_meter: 6
+
+actors:
+  # Ego — center lane; cruises at 13 then brakes hard to 4 m/s
+  - id: 0
+    color: [90, 190, 110]
+    length: 4.5
+    width: 2.0
+    start: {x: 0.0, y: -50.0, heading: 90}
+    maneuvers:
+      - {type: go_straight, duration: 1.2, curve: {v0: 13.0, accel: 0.0}}
+      - {type: decelerate, duration: 1.5, curve: {v0: 13.0, accel: -6.0}}
+      - {type: go_straight, duration: 5.3, curve: {v0: 4.0, accel: 0.0}}
+
+  # The one cut-in car — right lane, 20 m ahead of the ego. Holds the cutin
+  # spec at load and keeps it: there is no second candidate to recast to.
+  - id: 1
+    color: [210, 70, 60]
+    length: 4.5
+    width: 2.0
+    start: {x: 3.5, y: -30.0, heading: 90}
+    cruise: 12.0
+    cutin: {t: 6.0, along: 6.0, lat: 0.0, lc_duration: 2.0, tail: 4.0}

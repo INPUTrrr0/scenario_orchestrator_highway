@@ -837,10 +837,34 @@ class HighwayEgoPolicy:
     @property
     def reference_path(self) -> List[Tuple[float, float]]:
         """The intended path as a polyline, for an external policy's route
-        conditioning and for the recorder."""
-        x = self.frame.lane_center_x(self.target_lane)
+        conditioning and for the recorder.
+
+        While a lane change is running the path is the MANOEUVRE, not the
+        destination lane: the same quintic `_smoothstep` profile `self.lc`
+        carries, sampled forwards in distance. That matters because this
+        polyline is the only route an external policy ever sees. Snapping it to
+        the new lane centre the instant MOBIL commits would hand a route-
+        conditioned planner a 3.5 m lateral step 2.5 m in front of its bumper —
+        a shape no leaderboard route has and none of these models was trained
+        on. Ramped, it is an ordinary merge, which is what they have seen.
+
+        With no manoeuvre running this is the target lane centre, unchanged.
+        """
         y0 = self.ego.y
-        return [(x, y0 + s) for s in range(0, int(self.frame.length / 2), 2)]
+        span = range(0, int(self.frame.length / 2), 2)
+        lc = self.lc
+        if lc is None:
+            x = self.frame.lane_center_x(self.target_lane)
+            return [(x, y0 + s) for s in span]
+        x0, x1 = float(lc["x0"]), float(lc["x1"])
+        travelled, total = float(lc["s"]), float(lc.get("L", LC_DISTANCE))
+        total = total if total > 1e-6 else LC_DISTANCE
+        out: List[Tuple[float, float]] = []
+        for s in span:
+            f = (travelled + s) / total
+            shape, _dx, _ddx = self._smoothstep(f)
+            out.append((x0 + (x1 - x0) * shape, y0 + s))
+        return out
 
     def lane_offset(self) -> float:
         """Signed distance from the target lane centre — the cross-track error."""
