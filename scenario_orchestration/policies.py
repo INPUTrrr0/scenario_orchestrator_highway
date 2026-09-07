@@ -226,6 +226,65 @@ def resolve_repository(request: PolicyRequest, harness_root: Optional[str],
         f"Tried: " + "; ".join(tried))
 
 
+#: Request keys whose value is a path when it is one. `checkpoint` is in the
+#: contract; the rest are the conventional names a policy repository uses for a
+#: file inside its checkpoint, and are only rewritten when the rewrite lands on
+#: something that exists.
+PATH_PARAMETERS = ("weights", "checkpoint", "config", "config_path",
+                   "model_path", "weights_path")
+
+
+def _absolutize(payload: dict, root: Optional[str]) -> dict:
+    """Make a policy request's relative checkpoint paths absolute.
+
+    The harness writes them relative to ITS root -- `checkpoint:
+    third_party/checkpoints/tfv6/tfv6_resnet34` -- because that is where the
+    declaration lives and where an operator reads it. The policy resolves them
+    against the working directory, which for a method subprocess is the METHOD's
+    repository. Those two only ever agreed by accident, and when they disagree
+    the policy reports a missing checkpoint that is sitting right there.
+
+    The same rewrite the OSC2 runner's bridge does
+    (`osc2carla_policy_bridge.PolicyBridge._absolutize`), for the same reason and
+    on the same keys, so a policy behaves identically under both methods.
+
+    Rewritten only when the rewrite lands on something that exists, so a
+    genuinely missing checkpoint still fails naming the path the harness asked
+    for rather than one invented here.
+    """
+    if not root or not os.path.isdir(root):
+        return payload
+
+    def resolve(value):
+        if not isinstance(value, str) or not value or os.path.isabs(value):
+            return value
+        candidate = os.path.join(root, value)
+        if not os.path.exists(candidate):
+            return value
+        return os.path.abspath(candidate)
+
+    payload["checkpoint"] = resolve(payload.get("checkpoint"))
+    parameters = payload.get("parameters")
+    if isinstance(parameters, dict):
+        for key in PATH_PARAMETERS:
+            if key in parameters:
+                parameters[key] = resolve(parameters[key])
+    return payload
+
+
+def _carla_python_api() -> Optional[str]:
+    """`$CARLA_ROOT/PythonAPI/carla`, when that is a real directory.
+
+    `CARLA_ROOT` is upstream's own name for this and describes the machine, so
+    it is read from the environment rather than declared in a config.
+    """
+    root = (os.environ.get("CARLA_ROOT") or "").strip()
+    if not root:
+        return None
+    api = os.path.join(root, "PythonAPI", "carla")
+    return api if os.path.isdir(os.path.join(api, "agents")) else None
+
+
 def load_module(repository: str, entry_point: str, name: str):
     """Import a policy repository's `policy.py` from its path.
 
@@ -233,11 +292,28 @@ def load_module(repository: str, entry_point: str, name: str):
     repository is not required to be an installable package, and two policies
     may each ship a `policy.py`. Its own directory goes on `sys.path` first,
     because a policy module may import its repository's siblings by bare name.
+
+    Three paths, matching what the OSC2 runner's bridge puts there
+    (`osc2carla_policy_bridge._load_module`), because the same three policies
+    are loaded through both and neither should have to be told twice:
+
+      the repository ROOT   a vision policy's adapter imports its own package by
+                            bare name -- `lead.inference...` for TFv6 -- and the
+                            entry point's directory is one level below it.
+      the entry point's dir the adapter's own siblings.
+      CARLA's PythonAPI     `$CARLA_ROOT/PythonAPI/carla` carries the `agents`
+                            package (GlobalRoutePlanner, RoadOption) that ships
+                            with the SERVER and not with the pip wheel. Every
+                            route-conditioned policy needs it and the installed
+                            ones disagree about whose job it is to find: SimLingo
+                            adds it itself, TFv6 expects a symlink in its own
+                            checkout. Doing it here means neither has to be right.
     """
     path = os.path.join(repository, entry_point)
     directory = os.path.dirname(path)
-    if directory not in sys.path:
-        sys.path.insert(0, directory)
+    for candidate in (repository, directory, _carla_python_api()):
+        if candidate and candidate not in sys.path:
+            sys.path.insert(0, candidate)
     module_name = f"ego_policy_{name}".replace("-", "_")
     spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:      # pragma: no cover - unreadable file
@@ -255,24 +331,30 @@ def load_module(repository: str, entry_point: str, name: str):
     return module
 
 
+#: What this port can put in front of a policy. `state` is object-centric scene,
+#: route and neighbours (`carla_obs`); `sensor` is whatever rig the policy
+#: declares through `sensors()`, attached by `ego_driver._build_rig`.
+OBSERVATION_SPACES = ("state", "sensor")
+
+
 def load_policy(request: PolicyRequest, harness_root: Optional[str],
                 repo_root: str) -> LoadedPolicy:
     """Build an external `ego_policy_v1` policy from its repository.
 
-    Checks the declaration first: this port provides `state` observations, so a
-    policy wanting `sensor` input cannot be run here whatever else is true, and
-    saying so before importing torch is cheaper for everyone.
+    Checks the declaration first, because saying no before importing torch is
+    cheaper for everyone. This port serves `state` always and `sensor` when the
+    policy asks for a rig (`ego_driver._build_rig` -> `carla_sensors`), so the
+    only observation spaces refused here are the ones nothing can produce.
     """
     if request.interface != EGO_POLICY_INTERFACE:
         raise PolicyTranslationError(
             f"ego policy {request.name!r} declares interface "
             f"{request.interface!r}; this repository speaks "
             f"{EGO_POLICY_INTERFACE!r}")
-    if request.observation_space != "state":
+    if request.observation_space not in OBSERVATION_SPACES:
         raise PolicyTranslationError(
             f"ego policy {request.name!r} needs {request.observation_space!r} "
-            "observations; this port provides 'state' only (it owns the CARLA "
-            "world but attaches no sensor rig to the ego)")
+            f"observations; this port provides {sorted(OBSERVATION_SPACES)}")
 
     entry_point = request.entry_point or "scenario_orchestration/policy.py"
     repository, how = resolve_repository(request, harness_root, repo_root)
@@ -287,7 +369,7 @@ def load_policy(request: PolicyRequest, harness_root: Optional[str],
             f"{FACTORY}(request); ego_policy_v1 requires "
             f"{FACTORY}(request: dict) -> policy. Found: {public}")
     try:
-        policy = factory(request.to_dict())
+        policy = factory(_absolutize(request.to_dict(), harness_root))
     except Exception as exc:
         raise PolicyTranslationError(
             f"{FACTORY}() of ego policy {request.name!r} raised "
@@ -339,10 +421,10 @@ def describe_unsupported(request: PolicyRequest) -> str:
     if request.interface != EGO_POLICY_INTERFACE:
         reasons.append(f"interface {request.interface!r} is not "
                        f"{EGO_POLICY_INTERFACE!r}")
-    if request.observation_space != "state":
+    if request.observation_space not in OBSERVATION_SPACES:
         reasons.append(
             f"observation space {request.observation_space!r} is not provided by "
-            "this port (it has no ego sensor rig)")
+            f"this port, which serves {sorted(OBSERVATION_SPACES)}")
     if not request.entry_point:
         reasons.append(
             "the policy declares no entry point, so it can neither be realized "

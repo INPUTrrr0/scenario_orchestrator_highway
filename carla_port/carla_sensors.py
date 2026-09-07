@@ -34,8 +34,9 @@ makes too.
 from __future__ import annotations
 
 import math
+import os
 import queue
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .carla_api import carla
@@ -92,8 +93,18 @@ class LidarSpec:
     name: str = "lidar"
     channels: int = 64
     range_m: float = 100.0
+    #: Points per REVOLUTION is what matters to a model; CARLA is configured in
+    #: points per second, so the spawn scales this by the actual rotation rate.
+    points_per_revolution: int = 30000
     points_per_second: int = 600000
-    rotation_frequency: float = 20.0        # = 1 / leaderboard agent period
+    #: Revolutions per second. This MUST match the simulation tick rate, not the
+    #: policy's decision rate. CARLA accumulates returns over simulated time and
+    #: emits whatever swept past on each tick: at 20 rev/s in a world ticking at
+    #: 60 Hz, one frame carries a third of a revolution — a fixed 120 deg wedge
+    #: that, measured on a real run, spanned 180-299 deg. Behind and to the left,
+    #: never straight ahead, so the fusion branch never saw the car in front.
+    #: `CameraRig.spawn` overwrites this from the world's fixed_delta.
+    rotation_frequency: float = 20.0
     upper_fov: float = 10.0
     lower_fov: float = -30.0
     x: float = -0.5
@@ -118,6 +129,70 @@ class LidarSpec:
                 "upper_fov": str(float(self.upper_fov)),
                 "lower_fov": str(float(self.lower_fov))}
 
+    def for_tick_rate(self, hz: float) -> "LidarSpec":
+        """This spec, rotating once per tick at `hz`.
+
+        One full revolution per tick is the only setting that gives the model a
+        complete sweep, and `points_per_second` has to rise with the rotation
+        rate to keep the same number of points in each one.
+        """
+        if hz <= 0:
+            return self
+        return replace(self, rotation_frequency=float(hz),
+                       points_per_second=int(round(self.points_per_revolution * hz)))
+
+
+@dataclass(frozen=True)
+class RadarSpec:
+    """One radar, in CARLA blueprint units.
+
+    TFv6's config sets `use_radar_detection: True` and its `RadarDetector`
+    tokenizes `batch["radar"]` into the planner's cross-attention keys, so a rig
+    without radar leaves the model reading a tensor its training data always
+    filled. Upstream PADS short sweeps with zero rows, so an all-zero tensor is
+    not a malformed input — it is a well-formed one that says "the radar is
+    working and nothing is out there", which is worse than a malformed one
+    because nothing downstream can tell it apart from a clear road.
+
+    Detections are returned in the EGO frame, x forward, metres, matching the
+    LiDAR path: `rasterize_lidar_bev` takes raw CARLA points and the BEV bounds
+    it filters against are x in [-32, 64] — forward-biased, so x is forward.
+    """
+    name: str = "radar"
+    horizontal_fov: float = 90.0
+    vertical_fov: float = 0.1
+    range_m: float = 100.0
+    #: Returns per TICK the consumer wants. `lead` pads or truncates each
+    #: sensor's block to `num_radar_points_per_sensor` (75), so anything less
+    #: than this per tick is zero padding pretending to be clear road.
+    points_per_tick: int = 150
+    points_per_second: int = 1500
+    x: float = 2.6
+    y: float = 0.0
+    z: float = 0.6
+    roll: float = 0.0
+    pitch: float = 0.0
+    yaw: float = 0.0
+    kind: str = "sensor.other.radar"
+
+    def to_transform(self):
+        return carla.Transform(
+            carla.Location(x=float(self.x), y=float(self.y), z=float(self.z)),
+            carla.Rotation(roll=float(self.roll), pitch=float(self.pitch),
+                           yaw=float(self.yaw)))
+
+    def attributes(self) -> Dict[str, str]:
+        return {"horizontal_fov": str(float(self.horizontal_fov)),
+                "vertical_fov": str(float(self.vertical_fov)),
+                "range": str(float(self.range_m)),
+                "points_per_second": str(int(self.points_per_second))}
+
+    def for_tick_rate(self, hz: float) -> "RadarSpec":
+        """This spec, delivering `points_per_tick` returns on every tick."""
+        if hz <= 0:
+            return self
+        return replace(self, points_per_second=int(round(self.points_per_tick * hz)))
+
 
 #: The rigs the two installed sensorimotor policies are trained behind. A
 #: policy may return its own `sensors()` instead; these exist so a policy that
@@ -131,6 +206,13 @@ RIGS: Dict[str, List[object]] = {
         CameraSpec("PCAM_F0", width=384, height=384, fov=90.0, yaw=0.0),
         CameraSpec("PCAM_R0", width=384, height=384, fov=90.0, yaw=60.0),
         LidarSpec("lidar"),
+        # `lead.config.expert.sensor_rig.SensorRigConfig.radars`, in list order:
+        # `_preprocess_radar_input` identifies a sensor by its index and writes
+        # that index into the fifth column, so the order is part of the format.
+        RadarSpec("radar1", x=2.6, z=0.60, yaw=-45.0),
+        RadarSpec("radar2", x=2.6, z=0.60, yaw=45.0),
+        RadarSpec("radar3", x=-2.6, z=0.60, yaw=135.0),
+        RadarSpec("radar4", x=-2.6, z=0.60, yaw=225.0),
     ],
     # SimLingo: one wide forward camera. The model tiles it itself
     # (`dynamic_preprocess`), so the rig only has to deliver the full frame.
@@ -155,16 +237,18 @@ def specs_from(declared: Sequence[object]) -> List[object]:
     """
     out: List[object] = []
     for item in declared:
-        if isinstance(item, (CameraSpec, LidarSpec)):
+        if isinstance(item, (CameraSpec, LidarSpec, RadarSpec)):
             out.append(item)
         elif isinstance(item, dict):
-            cls = LidarSpec if "lidar" in str(item.get("kind", "")) else CameraSpec
+            kind = str(item.get("kind", ""))
+            cls = (RadarSpec if "radar" in kind
+                   else LidarSpec if "lidar" in kind else CameraSpec)
             known = set(cls.__dataclass_fields__)
             out.append(cls(**{k: v for k, v in item.items() if k in known}))
         else:
             raise TypeError(
-                f"a policy's sensors() must yield CameraSpec, LidarSpec or "
-                f"dict, got {type(item).__name__}")
+                f"a policy's sensors() must yield CameraSpec, LidarSpec, "
+                f"RadarSpec or dict, got {type(item).__name__}")
     return out
 
 
@@ -179,17 +263,41 @@ class CameraRig:
         # failed spawn cannot misalign a spec with another camera's queue.
         self.attached: List[Tuple[object, object, "queue.Queue"]] = []
         self.failed: List[str] = []
+        #: tick rate the sweeping sensors were retimed to, for the run report
+        self.sensor_hz: float = 0.0
 
     # ------------------------------------------------------------------ #
+    def _tick_hz(self) -> float:
+        """Simulation ticks per second, from the world's own settings.
+
+        Read rather than assumed: a sweeping sensor's rate has to match the tick
+        rate, and the tick rate is the runner's `--fixed-delta`, not a constant.
+        """
+        try:
+            delta = float(self.world.get_settings().fixed_delta_seconds or 0.0)
+        except (RuntimeError, AttributeError, TypeError):
+            return 0.0
+        return 1.0 / delta if delta > 0 else 0.0
+
     def spawn(self) -> "CameraRig":
         """Attach every camera. A camera that cannot be created is recorded in
         `failed` rather than raised: the offline test double has no sensor
         blueprints, and `validate.py` must keep running without a server."""
         library = self.world.get_blueprint_library()
+        hz = 0.0 if os.environ.get("AV_SENSOR_RETIME") == "off" else self._tick_hz()
+        if hz > 0:
+            # Retime the sweeping sensors to the world's tick rate. Without this
+            # a LiDAR at 20 rev/s in a 60 Hz world delivers a 120 deg wedge per
+            # frame and a radar delivers a third of the returns its consumer
+            # pads out with zeros.
+            self.specs = [spec.for_tick_rate(hz)
+                          if hasattr(spec, "for_tick_rate") else spec
+                          for spec in self.specs]
+            self.sensor_hz = hz
         for spec in self.specs:
             try:
                 bp = library.find(spec.kind)
-                if isinstance(spec, LidarSpec):
+                if isinstance(spec, (LidarSpec, RadarSpec)):
                     for key, value in spec.attributes().items():
                         bp.set_attribute(key, value)
                 else:
@@ -223,8 +331,12 @@ class CameraRig:
             image = self._await(q, frame)
             if image is None:
                 continue
-            array = (self._to_points(image) if isinstance(spec, LidarSpec)
-                     else self._to_rgb(image))
+            if isinstance(spec, RadarSpec):
+                array = self._to_radar(image, spec)
+            elif isinstance(spec, LidarSpec):
+                array = self._to_points(image)
+            else:
+                array = self._to_rgb(image)
             if array is not None:
                 out[spec.name] = array
         return out
@@ -236,6 +348,40 @@ class CameraRig:
             return None
         raw = _np.frombuffer(measurement.raw_data, dtype=_np.float32)
         return _np.reshape(raw, (-1, 4)).copy()
+
+    @staticmethod
+    def _to_radar(measurement, spec: "RadarSpec"):
+        """CARLA hands over flat float32 (velocity, azimuth, altitude, depth)
+        per detection, in the SENSOR frame. Return Nx4 `(x, y, z, v)` in the
+        EGO frame, which is what `filter_and_pad_radars` bounds-checks and what
+        `_tokenize_radar` samples BEV features at.
+
+        `velocity` is radial and signed the way CARLA reports it (negative is
+        closing); it is passed through untouched, because a sign convention
+        invented here would be a different quantity wearing the same name.
+        """
+        if _np is None:
+            return None
+        raw = _np.frombuffer(measurement.raw_data, dtype=_np.float32)
+        det = _np.reshape(raw, (-1, 4))
+        if det.size == 0:
+            return _np.zeros((0, 4), dtype=_np.float32)
+        vel, azimuth, altitude, depth = (det[:, 0], det[:, 1],
+                                         det[:, 2], det[:, 3])
+        # spherical -> the sensor's own cartesian frame (x along the boresight)
+        horiz = depth * _np.cos(altitude)
+        xs = horiz * _np.cos(azimuth)
+        ys = horiz * _np.sin(azimuth)
+        zs = depth * _np.sin(altitude)
+        # sensor -> ego: yaw about z, then the mounting offset. Roll and pitch
+        # are zero on every radar in this rig; asserting that is cheaper than
+        # carrying a full rotation that is never exercised.
+        yaw = _np.radians(float(spec.yaw))
+        cos_y, sin_y = _np.cos(yaw), _np.sin(yaw)
+        xe = xs * cos_y - ys * sin_y + float(spec.x)
+        ye = xs * sin_y + ys * cos_y + float(spec.y)
+        ze = zs + float(spec.z)
+        return _np.stack([xe, ye, ze, vel], axis=1).astype(_np.float32)
 
     @staticmethod
     def _await(q: "queue.Queue", frame: Optional[int]):
@@ -280,5 +426,13 @@ class CameraRig:
                 "lidars": [{"name": s.name, "channels": s.channels,
                             "range_m": s.range_m}
                            for s in self.specs if isinstance(s, LidarSpec)],
+                "radars": [{"name": s.name, "yaw": s.yaw,
+                            "horizontal_fov": s.horizontal_fov,
+                            "range_m": s.range_m}
+                           for s in self.specs if isinstance(s, RadarSpec)],
                 "attached": [s.name for s, _sn, _q in self.attached],
+                "sensor_hz": self.sensor_hz,
+                "lidar_points_per_rev": [s.points_per_revolution
+                                         for s in self.specs
+                                         if isinstance(s, LidarSpec)],
                 "failed": list(self.failed)}

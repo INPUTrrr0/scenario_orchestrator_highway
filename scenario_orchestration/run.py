@@ -340,14 +340,24 @@ def build_ego_driver(policy: PolicyRequest, settings: Settings,
     return loaded, meta
 
 
-def build_bev(loaded, settings: Settings, notes: List[str]):
+def build_bev(loaded, policy: PolicyRequest, settings: Settings,
+              notes: List[str]):
     """The BEV raster source an object-centric policy needs, if it needs one.
 
     Identical to the sibling port's, including the reason: every released
     PlanT 2.0 checkpoint is trained with `input_bev=True`, so a checkpoint handed
     nothing is not a result. `PLANT2_BLANK_BEV` is the escape hatch and it says
     in the report that the run's driving is not meaningful.
+
+    A `sensor` policy is skipped outright. It reads the rig
+    (`ego_driver._build_rig`), never the raster, and building one anyway would
+    make an unrelated dependency of the policy repository -- h5py, and a town
+    raster that ships only for some maps -- a hard prerequisite for running a
+    camera policy that has no use for either.
     """
+    if policy.observation_space == "sensor":
+        return None
+
     import bev as bev_module
 
     if bev_module.blank_allowed():
@@ -397,7 +407,7 @@ def execute(request: ScenarioRequest, policy: PolicyRequest,
         # own path does not build one.
         run.ego_driver = PolicyEgoDriver(
             loaded.policy, name=loaded.name, hz=float(settings["policy_hz"]),
-            bev=build_bev(loaded, settings, notes),
+            bev=build_bev(loaded, policy, settings, notes),
             keep_actions=int(settings["keep_actions"]))
         run._external_policy_name = loaded.name
 

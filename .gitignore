@@ -13,3 +13,9 @@ run_output/
 *.mp4
 # CARLA writes generated worlds back into its own OpenDrive dir
 OpenDriveMap.xodr
+
+# SimLingo resolves its InternVL2 cache as `pretrained/<variant>` relative to
+# the CWD, and the harness runs a method in its own repository directory -- so
+# this is a link to wherever the backbone actually lives on the node. Multiple
+# gigabytes; never a tracked file.
+/pretrained
