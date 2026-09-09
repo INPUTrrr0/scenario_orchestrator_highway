@@ -11,7 +11,7 @@
 set -u
 POLICY="${1:?policy}"; DUMP="${2:?dump dir}"; shift 2
 AV_ROOT="/scratch/zwang179/traffic_orchestration"
-ORCH="${AV_ROOT}/scenario_orchestration_repo/third_party/orchestrator_highway"
+ORCH="${AV_ROOT}/scenario_orchestrator_meta_repo/third_party/orchestrator_highway"
 source "${AV_ROOT}/install/env.sh"; source "${AV_ROOT}/third_party/env.sh"
 av_clean_python_env
 FF=/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin

@@ -10,7 +10,7 @@ policies/
 ├── simlingo/   RenzKa/simlingo         @ 743b243   CVPR'25 VLA, CARLA
 ├── tfv6/       kesai-labs/lead         @ 197fb5dd  TransFuser v6, CARLA
 ├── ltfv6/      autonomousvision/lead   @ 730bc1a2  cvpr2026 branch — NAVSIM, see below
-└── plant2 ->   ../scenario_orchestration_repo/third_party/plant2
+└── plant2 ->   ../scenario_orchestrator_meta_repo/third_party/plant2
                 friedeggs/plant2        @ 928b919   PlanT 2.0, CARLA
 ```
 

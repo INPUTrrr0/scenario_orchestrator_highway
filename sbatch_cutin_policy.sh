@@ -9,4 +9,4 @@
 # Record the Town04 cut-in with one learned ego policy.
 #   sbatch --job-name=av-cutin-plant2 sbatch_cutin_policy.sh plant2
 set -uo pipefail
-exec /scratch/zwang179/traffic_orchestration/scenario_orchestration_repo/third_party/orchestrator_highway/run_record_cutin_policy.sh "${1:?usage: sbatch_cutin_policy.sh simlingo|tfv6|plant2}"
+exec /scratch/zwang179/traffic_orchestration/scenario_orchestrator_meta_repo/third_party/orchestrator_highway/run_record_cutin_policy.sh "${1:?usage: sbatch_cutin_policy.sh simlingo|tfv6|plant2}"

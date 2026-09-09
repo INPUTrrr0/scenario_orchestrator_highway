@@ -13,4 +13,4 @@ av_clean_python_env
 module load StdEnv/2020 gcc/9.3.0 python/3.8.10 opencv/4.5.5 >/dev/null 2>&1
 source "${AV_VENV}/bin/activate"
 exec "${AV_VENV}/bin/python" \
-    "${AV_ROOT}/scenario_orchestration_repo/third_party/orchestrator_highway/scripts/validate_scenarios.py"
+    "${AV_ROOT}/scenario_orchestrator_meta_repo/third_party/orchestrator_highway/scripts/validate_scenarios.py"

@@ -15,4 +15,4 @@ export AV_DUMP_OBS="/scratch/zwang179/traffic_orchestration/install/run_output/_
 export AV_DUMP_STEPS="${STEPS}"
 rm -rf "${AV_DUMP_OBS}"; mkdir -p "${AV_DUMP_OBS}"
 echo "[capture] dumping steps ${STEPS} to ${AV_DUMP_OBS}"
-exec /scratch/zwang179/traffic_orchestration/scenario_orchestration_repo/third_party/orchestrator_highway/run_record_policy.sh "${POLICY}" "${SCEN}"
+exec /scratch/zwang179/traffic_orchestration/scenario_orchestrator_meta_repo/third_party/orchestrator_highway/run_record_policy.sh "${POLICY}" "${SCEN}"

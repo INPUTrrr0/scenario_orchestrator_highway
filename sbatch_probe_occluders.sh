@@ -8,7 +8,7 @@
 #SBATCH --output=/scratch/zwang179/traffic_orchestration/third_party/logs/%x-%j.out
 set -u
 AV_ROOT="/scratch/zwang179/traffic_orchestration"
-ORCH="${AV_ROOT}/scenario_orchestration_repo/third_party/orchestrator_highway"
+ORCH="${AV_ROOT}/scenario_orchestrator_meta_repo/third_party/orchestrator_highway"
 source "${AV_ROOT}/install/env.sh"
 source "${AV_ROOT}/third_party/env.sh"
 PORT=$(( 2000 + (${SLURM_JOB_ID:-0} % 200) * 4 ))
