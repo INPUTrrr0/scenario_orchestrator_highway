@@ -138,7 +138,7 @@ when autonomous).
 
 ## Experiment harness (recorded trials)
 
-See **`docs/SCENARIOS_AND_VALIDATION.md`** for scenario descriptions and
+See **`metrics/SCENARIOS_AND_VALIDATION.md`** for scenario descriptions and
 trajectory validation metrics (cut-in, overtake, hard_brake).
 
 `experiment.py` is a thin wrapper over the editor for collecting labelled

@@ -5,9 +5,9 @@ Reads experiment JSON (from ``experiment.py`` or ``stress_experiment.py``) and
 runs the appropriate verifier from ``scenario_verify.py``.
 
 Usage:
-    .venv/bin/python scripts/verify_run.py experiments/run_42.json
-    .venv/bin/python scripts/verify_run.py --dir experiments/stress -v
-    .venv/bin/python scripts/verify_run.py --setup-only experiments/overtake_1.json
+    .venv/bin/python metrics/scripts/verify_run.py experiments/run_42.json
+    .venv/bin/python metrics/scripts/verify_run.py --dir experiments/stress -v
+    .venv/bin/python metrics/scripts/verify_run.py --setup-only experiments/overtake_1.json
 """
 from __future__ import annotations
 

@@ -31,13 +31,13 @@ Block success is reported from the recorded ``block.success`` field only
 (no geometric re-verification yet).
 
 Overtake / hard-brake runs (from ``stress_experiment.py``) are verified with
-``scripts/verify_run.py`` or included when ``--dir`` also contains stress JSON.
+``metrics/scripts/verify_run.py`` or included when ``--dir`` also contains stress JSON.
 
 Usage:
-    .venv/bin/python scripts/summarize_experiments.py
-    .venv/bin/python scripts/summarize_experiments.py --dir experiments
-    .venv/bin/python scripts/summarize_experiments.py --verbose
-    .venv/bin/python scripts/verify_run.py experiments/stress/overtake_0.json
+    .venv/bin/python metrics/scripts/summarize_experiments.py
+    .venv/bin/python metrics/scripts/summarize_experiments.py --dir experiments
+    .venv/bin/python metrics/scripts/summarize_experiments.py --verbose
+    .venv/bin/python metrics/scripts/verify_run.py experiments/stress/overtake_0.json
 """
 from __future__ import annotations
 
@@ -66,7 +66,8 @@ STRESS_SCENARIOS = ("overtake", "hard_brake")
 
 
 def _here() -> str:
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # metrics/scripts/ -> repo root
+    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def load_run(path: str) -> Optional[dict]:
@@ -215,7 +216,7 @@ def print_report(summary: Dict[str, Any], n_files: int, verbose: bool) -> None:
         label = kind.replace("_", " ")
         rate = 100.0 * st["verified"] / st["runs"]
         print(f"{label:14}  verified success: {st['verified']:4d} / {st['runs']:4d} runs  ({rate:5.1f}%)")
-        print(f"  (see docs/SCENARIOS_AND_VALIDATION.md for criteria)")
+        print(f"  (see metrics/SCENARIOS_AND_VALIDATION.md for criteria)")
 
     if verbose:
         print("\nPer-file verification:")

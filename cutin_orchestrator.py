@@ -91,7 +91,7 @@ ROLE_LABELS: Dict[str, str] = {
     ROLE_ADJACENT: "adjacent",
 }
 
-# Verifier-aligned cut-in geometry (see scripts/summarize_experiments.py)
+# Verifier-aligned cut-in geometry (see metrics/scripts/summarize_experiments.py)
 CUTIN_MAX_AHEAD_M = 10.0     # owner must finish ≤ this far ahead of ego
 CUTIN_MIN_AHEAD_M = 0.5      # must be strictly ahead
 CUTIN_ADJ_MIN_FRAC = 0.4     # adjacent-lane band (× lane_width)
