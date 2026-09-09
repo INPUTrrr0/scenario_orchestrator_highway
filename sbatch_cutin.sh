@@ -5,7 +5,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=00:30:00
-#SBATCH --output=/scratch/zwang179/traffic_orchestration/install/sbatch-cutin-%j.out
-#SBATCH --error=/scratch/zwang179/traffic_orchestration/install/sbatch-cutin-%j.err
+#SBATCH --output=%x-%j.out
+#SBATCH --error=%x-%j.err
 
-exec /scratch/zwang179/traffic_orchestration/scenario_orchestrator_highway/run_record_cutin.sh
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "${SCRIPT_DIR}/run_record_cutin.sh"

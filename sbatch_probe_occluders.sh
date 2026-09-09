@@ -5,12 +5,13 @@
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=24G
 #SBATCH --time=0:25:00
-#SBATCH --output=/scratch/zwang179/traffic_orchestration/third_party/logs/%x-%j.out
+#SBATCH --output=%x-%j.out
 set -u
-AV_ROOT="/scratch/zwang179/traffic_orchestration"
-ORCH="${AV_ROOT}/scenario_orchestrator_meta_repo/third_party/orchestrator_highway"
-source "${AV_ROOT}/install/env.sh"
-source "${AV_ROOT}/third_party/env.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=av_env.sh
+source "${SCRIPT_DIR}/av_env.sh"
+source_av_env "${SCRIPT_DIR}"
+ORCH="${SCRIPT_DIR}"
 PORT=$(( 2000 + (${SLURM_JOB_ID:-0} % 200) * 4 ))
 export AV_PORT_OVERRIDE="${PORT}"
 av_clean_python_env
@@ -26,8 +27,4 @@ for i in $(seq 1 90); do
     sleep 2
 done
 export PYTHONPATH="${ORCH}:${AV_SERVER}/PythonAPI/carla"
-for combo in "once"; do
-    :
-    :
-    "${AV_VENV}/bin/python" "${ORCH}/scripts/probe_camera_mount.py" || true
-done
+"${AV_VENV}/bin/python" "${ORCH}/scripts/probe_camera_mount.py" || true

@@ -13,7 +13,24 @@ from PIL import Image
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import carla                                                   # noqa: E402
 
-OUT = "/scratch/zwang179/traffic_orchestration/install/run_output/_probe/mounts"
+
+def _probe_out_dir() -> str:
+    env = os.environ.get("AV_INSTALL") or os.environ.get("AV_ROOT")
+    if env:
+        base = env if env.rstrip("/").endswith("install") else os.path.join(env, "install")
+        return os.path.join(base, "run_output", "_probe", "mounts")
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    d = here
+    while True:
+        if os.path.isdir(os.path.join(d, "install")):
+            return os.path.join(d, "install", "run_output", "_probe", "mounts")
+        parent = os.path.dirname(d)
+        if parent == d:
+            return os.path.join(here, "run_output", "_probe", "mounts")
+        d = parent
+
+
+OUT = _probe_out_dir()
 os.makedirs(OUT, exist_ok=True)
 PORT = int(os.environ.get("AV_PORT_OVERRIDE", "2000"))
 HERO = "vehicle.lincoln.mkz_2020"

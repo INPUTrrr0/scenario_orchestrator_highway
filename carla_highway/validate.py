@@ -22,8 +22,40 @@ import os
 import sys
 from typing import List, Optional, Tuple
 
-DEFAULT_XODR = ("/scratch/zwang179/traffic_orchestration/install/CarlaUE4/"
-                "Content/Carla/Maps/OpenDrive")
+
+def _find_av_root(start: Optional[str] = None) -> Optional[str]:
+    env = os.environ.get("AV_ROOT")
+    if env and os.path.isfile(os.path.join(env, "install", "env.sh")):
+        return env
+    d = os.path.abspath(start or os.path.dirname(__file__))
+    while True:
+        if (os.path.isfile(os.path.join(d, "install", "env.sh"))
+                and os.path.isfile(os.path.join(d, "third_party", "env.sh"))):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _default_xodr_dir() -> str:
+    """OpenDRIVE dir from AV_SERVER / CARLA_ROOT / nearest install/CarlaUE4."""
+    for root_env in ("AV_SERVER", "CARLA_ROOT"):
+        root = os.environ.get(root_env)
+        if root:
+            candidate = os.path.join(root, "Content", "Carla", "Maps", "OpenDrive")
+            if os.path.isdir(candidate):
+                return candidate
+    av = _find_av_root(os.path.join(os.path.dirname(__file__), ".."))
+    if av:
+        candidate = os.path.join(
+            av, "install", "CarlaUE4", "Content", "Carla", "Maps", "OpenDrive")
+        if os.path.isdir(candidate):
+            return candidate
+    return ""
+
+
+DEFAULT_XODR = _default_xodr_dir()
 
 _PASS, _FAIL, _SKIP = "PASS", "FAIL", "SKIP"
 

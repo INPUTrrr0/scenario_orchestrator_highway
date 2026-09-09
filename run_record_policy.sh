@@ -66,9 +66,9 @@ case "${SCENARIO}" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AV_ROOT="/scratch/zwang179/traffic_orchestration"
-source "${AV_ROOT}/install/env.sh"
-source "${AV_ROOT}/third_party/env.sh"
+# shellcheck source=av_env.sh
+source "${SCRIPT_DIR}/av_env.sh"
+source_av_env "${SCRIPT_DIR}"
 
 # ---------------------------------------------------------------- scenario
 # TAG names the run directory; it differs from SCENARIO for cutin so the

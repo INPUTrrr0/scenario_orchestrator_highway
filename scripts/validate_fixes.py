@@ -17,6 +17,39 @@ sys.path.insert(0, ROOT)
 FAILURES = []
 
 
+def _find_av_root(start=None):
+    env = os.environ.get("AV_ROOT")
+    if env and os.path.isfile(os.path.join(env, "install", "env.sh")):
+        return env
+    d = os.path.abspath(start or ROOT)
+    while True:
+        if (os.path.isfile(os.path.join(d, "install", "env.sh"))
+                and os.path.isfile(os.path.join(d, "third_party", "env.sh"))):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _policy_root(name, env_var):
+    """Policy checkout: $ENV, then <av>/policies/<name>, then repo policies/."""
+    env = os.environ.get(env_var)
+    if env and os.path.isdir(env):
+        return env
+    candidates = [os.path.join(ROOT, "policies", name)]
+    av = _find_av_root(ROOT)
+    if av:
+        candidates.extend([
+            os.path.join(av, "policies", name),
+            os.path.join(av, "scenario_orchestrator_meta_repo", "third_party", name),
+        ])
+    for cand in candidates:
+        if os.path.isdir(cand):
+            return cand
+    return env or ""
+
+
 def check(name):
     def deco(fn):
         try:
@@ -150,8 +183,7 @@ def _reference_path():
 # --------------------------------------------------------------------------- #
 @check("simlingo: prompt carries two <TARGET_POINT> tokens and a CoT question")
 def _simlingo_prompt():
-    root = os.environ.get("SIMLINGO_ROOT",
-                          "/scratch/zwang179/traffic_orchestration/policies/simlingo")
+    root = _policy_root("simlingo", "SIMLINGO_ROOT")
     path = os.path.join(root, "scenario_orchestration", "policy.py")
     if not os.path.isfile(path):
         raise _Skip(f"{path} not found")
@@ -168,8 +200,7 @@ def _simlingo_prompt():
 
 @check("simlingo: two route points come back from the port's dense route")
 def _simlingo_target_points():
-    root = os.environ.get("SIMLINGO_ROOT",
-                          "/scratch/zwang179/traffic_orchestration/policies/simlingo")
+    root = _policy_root("simlingo", "SIMLINGO_ROOT")
     path = os.path.join(root, "scenario_orchestration", "policy.py")
     if not os.path.isfile(path):
         raise _Skip(f"{path} not found")
@@ -571,8 +602,7 @@ def _sensor_retiming():
 @check("simlingo: the bonnet band is cropped exactly as agent_simlingo does")
 def _bonnet_crop():
     import numpy as np
-    root = os.environ.get("SIMLINGO_ROOT",
-                          "/scratch/zwang179/traffic_orchestration/policies/simlingo")
+    root = _policy_root("simlingo", "SIMLINGO_ROOT")
     path = os.path.join(root, "scenario_orchestration", "policy.py")
     if not os.path.isfile(path):
         raise _Skip(f"{path} not found")
@@ -609,8 +639,7 @@ def _bonnet_crop():
 
 @check("tfv6: the camera rig matches lead's own SensorRigConfig")
 def _tfv6_rig():
-    root = os.environ.get("TFV6_ROOT",
-                          "/scratch/zwang179/traffic_orchestration/policies/tfv6")
+    root = _policy_root("tfv6", "TFV6_ROOT")
     adapter = os.path.join(root, "scenario_orchestration", "policy.py")
     rig_cfg = os.path.join(root, "src", "lead", "config", "expert",
                            "sensor_rig_config.py")

@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=1:00:00
-#SBATCH --output=/scratch/zwang179/traffic_orchestration/third_party/logs/%x-%j.out
+#SBATCH --output=%x-%j.out
 # Run SimLingo through ITS OWN Bench2Drive eval, the way the paper does.
 #
 # This is the differential test for the crawl: the same checkpoint, the same
@@ -16,9 +16,10 @@
 #   sbatch sbatch_bench2drive.sh bench2drive_160
 set -u
 ROUTE_NAME="${1:-bench2drive_160}"
-AV_ROOT="/scratch/zwang179/traffic_orchestration"
-source "${AV_ROOT}/install/env.sh"
-source "${AV_ROOT}/third_party/env.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=av_env.sh
+source "${SCRIPT_DIR}/av_env.sh"
+source_av_env "${SCRIPT_DIR}"
 REPO="${SIMLINGO_ROOT}"
 CKPT="${AV_CKPT}/simlingo/simlingo/checkpoints/epoch=013.ckpt/pytorch_model.pt"
 ROUTE="${REPO}/leaderboard/data/bench2drive_split/${ROUTE_NAME}.xml"

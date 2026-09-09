@@ -5,14 +5,16 @@
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
 #SBATCH --time=0:25:00
-#SBATCH --output=/scratch/zwang179/traffic_orchestration/third_party/logs/%x-%j.out
+#SBATCH --output=%x-%j.out
 # Offline replay of a captured observation. No CARLA server.
 #   sbatch sbatch_replay.sh <simlingo|tfv6|plant2> <dump_dir> [extra args...]
 set -u
 POLICY="${1:?policy}"; DUMP="${2:?dump dir}"; shift 2
-AV_ROOT="/scratch/zwang179/traffic_orchestration"
-ORCH="${AV_ROOT}/scenario_orchestrator_meta_repo/third_party/orchestrator_highway"
-source "${AV_ROOT}/install/env.sh"; source "${AV_ROOT}/third_party/env.sh"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=av_env.sh
+source "${SCRIPT_DIR}/av_env.sh"
+source_av_env "${SCRIPT_DIR}"
+ORCH="${SCRIPT_DIR}"
 av_clean_python_env
 FF=/cvmfs/soft.computecanada.ca/gentoo/2023/x86-64-v3/usr/bin
 if [ "${POLICY}" = "simlingo" ]; then

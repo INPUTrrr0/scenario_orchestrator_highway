@@ -2,7 +2,9 @@
 # Boot CARLA and record the highway cut-in scenario (ego policy + orchestrator).
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "${SCRIPT_DIR}/../install/env.sh"
+# shellcheck source=av_env.sh
+source "${SCRIPT_DIR}/av_env.sh"
+source_av_env "${SCRIPT_DIR}"
 
 LOG="${AV_INSTALL}/carla_server_cutin.log"
 PORT="${AV_PORT}"

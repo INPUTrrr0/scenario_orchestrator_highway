@@ -4,9 +4,9 @@
 # Uses carla-venv2 for CARLA 0.9.16 + SimLingo's site-packages for torch/VLA.
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AV_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-source "${AV_ROOT}/install/env.sh"
-source "${AV_ROOT}/third_party/env.sh"
+# shellcheck source=av_env.sh
+source "${SCRIPT_DIR}/av_env.sh"
+source_av_env "${SCRIPT_DIR}"
 
 LOG="${AV_INSTALL}/carla_server_cutin_simlingo.log"
 PORT="${AV_PORT:-2000}"

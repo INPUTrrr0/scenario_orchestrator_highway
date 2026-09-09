@@ -26,9 +26,9 @@ case "${POLICY}" in
 esac
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AV_ROOT="/scratch/zwang179/traffic_orchestration"
-source "${AV_ROOT}/install/env.sh"
-source "${AV_ROOT}/third_party/env.sh"
+# shellcheck source=av_env.sh
+source "${SCRIPT_DIR}/av_env.sh"
+source_av_env "${SCRIPT_DIR}"
 
 LOG="${AV_INSTALL}/carla_server_cutin_${POLICY}.log"
 # Two of these can land on the same node, and a CARLA server is addressed by
