@@ -1,3 +1,18 @@
+# Highway scenario orchestrator
+
+Canonical remote: [`INPUTrrr0/scenario_orchestrator_highway`](https://github.com/INPUTrrr0/scenario_orchestrator_highway).
+
+## Branch model
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Simulator-only orchestrator algorithm development (pygame editor, directives, casting, verifiers). No CARLA dependency. |
+| `carla_port_highway_mobil` | `main` plus the CARLA adapter (`carla_highway/`, shared `carla_port/`, maps, ego-policy submodules, harness entrypoints). Used to run vision-based ego policies. |
+
+Algorithm work lands on `main`. CI opens a sync PR into `carla_port_highway_mobil` after simulator tests pass; merge that PR only once CARLA/offline checks still work. The experiment harness (`friedeggs/scenario_orchestration`) pins an exact CARLA-branch commit under `third_party/orchestrator_highway`.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for push rules and local checks.
+
 ## Directory Structure
 
 | Module | Role |

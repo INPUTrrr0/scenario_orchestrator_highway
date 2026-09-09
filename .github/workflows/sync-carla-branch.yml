@@ -1,0 +1,64 @@
+name: Sync main into CARLA branch
+
+# After simulator tests pass on main, open or refresh a PR that merges main
+# into carla_port_highway_mobil. The PR is left for human merge after CARLA
+# adapter validation — experimental pins must only advance to working commits.
+
+on:
+  workflow_run:
+    workflows: ["Simulator tests"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  open-sync-pr:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Create or update synchronization PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          BASE=carla_port_highway_mobil
+          HEAD=main
+          TITLE="Sync main into ${BASE}"
+          BODY="$(cat <<'EOF'
+          ## Summary
+          - Automated synchronization of simulator-only `main` into the CARLA adapter branch.
+          - Merge only after offline/CARLA smoke validation still passes.
+          - Do not advance the meta-repo submodule pin until this PR is merged and verified.
+
+          ## Test plan
+          - [ ] `python -m pytest tests/test_directives.py tests/test_collision_directive.py`
+          - [ ] `python tests/test_editor.py`
+          - [ ] `python -m carla_highway.validate` (offline, needs CARLA Python API)
+          - [ ] Optional cluster smoke: `run_record_policy.sh` with an analytic ego
+          EOF
+          )"
+
+          EXISTING="$(gh pr list --base "$BASE" --head "$HEAD" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$EXISTING" ]; then
+            echo "Refresh existing PR #${EXISTING}"
+            gh pr edit "$EXISTING" --title "$TITLE" --body "$BODY"
+          else
+            # Only open when base is behind head
+            git fetch origin "$BASE" "$HEAD"
+            if git merge-base --is-ancestor "origin/${HEAD}" "origin/${BASE}"; then
+              echo "Base already contains main; nothing to sync."
+              exit 0
+            fi
+            gh pr create --base "$BASE" --head "$HEAD" --title "$TITLE" --body "$BODY"
+          fi

@@ -4,13 +4,28 @@ __pycache__/
 outputs/
 sessions/
 .DS_Store
+*.mp4
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
-# CARLA port
+# Recorded trials / local experiment dumps (not fixtures)
+experiments/run_*.json
+!experiments/.gitkeep
+
+# CARLA port artifacts
 carla_highway/outputs/
 carla_highway/reports/
 carla_port/sessions/
 run_output/
-*.mp4
 # CARLA writes generated worlds back into its own OpenDrive dir
 OpenDriveMap.xodr
 scenario_orchestration/__pycache__/
+
+# Local environments and model caches
+actorvenv/
+**/checkpoints/
+**/.cache/
