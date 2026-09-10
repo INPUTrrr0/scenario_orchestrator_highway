@@ -673,9 +673,19 @@ class HighwayRun:
         # harness's metrics package evaluates. Opened after the settle tick so
         # the declared extents are the ones CARLA actually spawned.
         if float(self.cfg.trace_rate_hz or 0.0) > 0.0:
-            out_dir = (os.path.dirname(os.path.abspath(self.cfg.report))
-                       if self.cfg.report else os.getcwd())
-            self.trace_recorder, note = trace_recording.make_recorder(
+            # Beside whichever artifact names a run directory. Falling back
+            # to the CWD, as this did, wrote scene.json and states.jsonl into
+            # the repository root on any run without --report -- artifacts in
+            # the source tree, and a trace nothing would look for. With no run
+            # directory there is nowhere a trace belongs, so none is written.
+            named = self.cfg.report or self.cfg.verify_report or self.cfg.video
+            out_dir = os.path.dirname(os.path.abspath(named)) if named else None
+            if out_dir is None:
+                self.notes.append(
+                    "no --report, --verify-report or --video names a run "
+                    "directory, so no canonical trace was written")
+            self.trace_recorder, note = (None, None) if out_dir is None else \
+                trace_recording.make_recorder(
                 out_dir, rate_hz=float(self.cfg.trace_rate_hz),
                 context={"method": "orchestrator_highway",
                          "scenario_mode": self.cfg.scenario,
@@ -1506,6 +1516,28 @@ def summarize(rep: dict) -> str:
     return "\n".join(out)
 
 
+def _idm_policy_flags():
+    """The harness's analytic policy configs, as flag names.
+
+    Discovered rather than listed, so adding `configs/policy/idm_timid.yaml`
+    gives `--idm_timid` in every method that calls this without an edit here --
+    which is the point of `third_party/idm` being the one implementation the
+    three methods load. Returns [] when no harness is above this repository, so
+    a standalone checkout still parses; `--policy NAME` reaches the same place.
+    """
+    root = _harness_root()
+    if root is None:
+        return []
+    import glob
+    names = []
+    for path in sorted(glob.glob(os.path.join(root, "configs", "policy",
+                                              "*.yaml"))):
+        name = os.path.splitext(os.path.basename(path))[0]
+        if name.startswith("idm") or name == "mobil":
+            names.append(name)
+    return names
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="python3 -m carla_highway.runner",
@@ -1584,6 +1616,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "configs/policy/<name>.yaml (default: highway IDM)")
     p.add_argument("--policy-request", default=None,
                    help="path to policy.json (overrides --policy)")
+    # One flag per analytic policy config, so `--idm_assertive` is spelled the
+    # same as the config it selects. They set `--policy`, so there is one code
+    # path and not two: `--policy idm_assertive` and `--idm_assertive` are the
+    # same request.
+    for _name in _idm_policy_flags():
+        p.add_argument(f"--{_name}", dest="policy", action="store_const",
+                       const=_name,
+                       help=f"shorthand for --policy {_name}")
     p.add_argument("--trace-rate-hz", type=float,
                    default=trace_recording.TRACE_RATE_HZ,
                    help="per-tick canonical trace for the harness's metrics "
