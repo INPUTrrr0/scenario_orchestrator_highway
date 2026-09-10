@@ -29,3 +29,6 @@ scenario_orchestration/__pycache__/
 actorvenv/
 **/checkpoints/
 **/.cache/
+
+# Pretrained checkpoints
+pretrained
