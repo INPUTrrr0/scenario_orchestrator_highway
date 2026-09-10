@@ -278,6 +278,10 @@ class RunConfig:
     #: harness evaluates scenario success on the realized trajectory, so
     #: without this the run is only self-reported and not comparable with
     #: the other methods'. 0 disables.
+    #: Where the canonical trace goes. The harness sets this to the run's own
+    #: output directory; the direct CLI leaves it None and the trace lands
+    #: beside whichever artifact names a directory.
+    trace_dir: Optional[str] = None
     trace_rate_hz: float = trace_recording.TRACE_RATE_HZ
     # orchestration
     casting: Optional[bool] = None
@@ -678,8 +682,13 @@ class HighwayRun:
             # the repository root on any run without --report -- artifacts in
             # the source tree, and a trace nothing would look for. With no run
             # directory there is nowhere a trace belongs, so none is written.
-            named = self.cfg.report or self.cfg.verify_report or self.cfg.video
-            out_dir = os.path.dirname(os.path.abspath(named)) if named else None
+            if self.cfg.trace_dir:
+                out_dir = os.path.abspath(self.cfg.trace_dir)
+            else:
+                named = (self.cfg.report or self.cfg.verify_report
+                         or self.cfg.video)
+                out_dir = (os.path.dirname(os.path.abspath(named))
+                           if named else None)
             if out_dir is None:
                 self.notes.append(
                     "no --report, --verify-report or --video names a run "

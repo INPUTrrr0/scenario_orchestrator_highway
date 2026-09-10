@@ -241,6 +241,12 @@ def build_config(request: ScenarioRequest, settings: Settings,
         video_dir=os.path.join(output_dir, "video"),
         video_view=settings["video_view"], video_fps=settings["video_fps"],
         report=None, policy_hz=float(settings["policy_hz"]),
+        # The per-tick canonical trace the harness's metrics package
+        # evaluates. `report=None` above means no artifact names a run
+        # directory on this path, so without this the port wrote no
+        # trace at all when driven by the harness -- which is the only
+        # path that evaluates one.
+        trace_dir=output_dir,
     )
     if settings["xodr"]:
         cfg.xodr = settings["xodr"]
