@@ -101,6 +101,23 @@ class AnalyticBinding:
         return meta
 
 
+def _loadable_repository(request: PolicyRequest) -> bool:
+    """Does this request name an entry point that actually exists on disk?
+
+    Declaring one is not enough: `configs/policy/idm.yaml` names
+    `third_party/idm/scenario_orchestration/policy.py`, and if that submodule
+    is uninitialized the file is absent. Falling back to the analytic ego is
+    then strictly better than failing the run, so the check is for the FILE and
+    not for the declaration.
+    """
+    entry = getattr(request, "entry_point", None)
+    repository = getattr(request, "repository", None)
+    if not entry or not repository:
+        return False
+    path = os.path.join(str(repository), str(entry))
+    return os.path.isfile(path)
+
+
 def is_analytic(request: PolicyRequest) -> bool:
     """Whether this request is one the port realizes with its own ego.
 
@@ -108,10 +125,20 @@ def is_analytic(request: PolicyRequest) -> bool:
     `idm` but wanting sensor input or emitting trajectories is not the analytic
     ego this port has, and quietly running IDM under its name would be worse
     than reporting that it cannot be run.
+
+    A request that names a REPOSITORY it can be loaded from is not realized
+    here, even when the name is `idm`. `third_party/idm` is the shared IDM
+    implementation all three methods load, so that adding a variant there
+    reaches every method rather than needing the same law re-bound in each
+    port's own constants. The analytic path remains for a request that names no
+    repository -- a bare `idm` in a sweep, or a method run without the harness
+    -- so nothing that worked before stops working.
     """
     if request.interface != EGO_POLICY_INTERFACE:
         return False
     if request.observation_space != "state" or request.action_space != "control":
+        return False
+    if _loadable_repository(request):
         return False
     name = (request.name or "").lower()
     if name in ANALYTIC_POLICIES:

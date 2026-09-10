@@ -49,6 +49,7 @@ PHYSICS_EGO = "physics"
 EGO_MODES = (PHYSICS_EGO, BICYCLE)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+from carla_port import trace_recording
 REPO_ROOT = os.path.dirname(HERE)
 SO_DIR = os.path.join(REPO_ROOT, "scenario_orchestration")
 DEFAULT_VIDEO_DIR = os.path.join(HERE, "outputs")
@@ -110,6 +111,65 @@ def _bev_source(loaded):
     return bev_mod.build(loaded.repository)
 
 
+def _harness_root(start: str = None) -> "Optional[str]":
+    """The harness that vendored this repository, found by walking up.
+
+    Only `configs/policy/` is read from it -- a policy declaration, not code --
+    which is what makes reading it from this repository's interpreter safe. The
+    same shape as the junction port's `find_harness_root`, and overridable for
+    a checkout that does not sit under one.
+    """
+    override = os.environ.get("AV_HARNESS_ROOT")
+    if override and os.path.isdir(override):
+        return override
+    path = os.path.abspath(start or REPO_ROOT)
+    while True:
+        if os.path.isdir(os.path.join(path, "configs", "policy")):
+            return path
+        parent = os.path.dirname(path)
+        if parent == path:
+            return None
+        path = parent
+
+
+def _request_from_policy_config(name: str, PolicyRequest):
+    """Build a PolicyRequest from the harness's `configs/policy/<name>.yaml`.
+
+    `--policy` used to accept only the three shortcuts hardcoded above, so every
+    other policy the harness declares -- the analytic IDM family, anything
+    living in its own repository -- was reachable through `scenario_orchestration/run.py`
+    and not from this CLI at all. Reading the declaration means the CLI and the
+    harness agree on what a policy IS by construction, rather than by two lists
+    kept in step by hand.
+    """
+    root = _harness_root()
+    if root is None:
+        return None
+    path = os.path.join(root, "configs", "policy", f"{name}.yaml")
+    if not os.path.isfile(path):
+        return None
+    import yaml
+    spec = yaml.safe_load(open(path)) or {}
+    fields = ("name", "interface", "observation_space", "action_space",
+              "repository", "entry_point", "checkpoint", "parameters",
+              "requires", "implementation", "description")
+    kwargs = {k: spec[k] for k in fields if k in spec}
+    kwargs.setdefault("name", name)
+    # `repository` and `checkpoint` are declared relative to the harness root;
+    # this port runs from its own directory, so they have to be absolute before
+    # they leave here or they resolve against the wrong tree.
+    for key in ("repository", "checkpoint"):
+        value = kwargs.get(key)
+        if value and not os.path.isabs(str(value)):
+            kwargs[key] = os.path.join(root, str(value))
+    try:
+        return PolicyRequest(**kwargs)
+    except TypeError:
+        known = {k: v for k, v in kwargs.items() if k in
+                 getattr(PolicyRequest, "__dataclass_fields__", kwargs)}
+        return PolicyRequest(**known)
+
+
 def _load_external_ego_driver(cfg: "RunConfig", companion: HighwayEgoPolicy):
     """Load an ego_policy_v1 repository and wrap it in PolicyEgoDriver."""
     if SO_DIR not in sys.path:
@@ -129,8 +189,14 @@ def _load_external_ego_driver(cfg: "RunConfig", companion: HighwayEgoPolicy):
         req = PolicyRequest(**spec,
                             parameters={"repository_path": env_root})
     else:
-        raise ValueError(f"unknown --policy {cfg.policy!r}; "
-                         f"have {sorted(POLICY_SHORTCUTS)}")
+        req = _request_from_policy_config(cfg.policy, PolicyRequest)
+        if req is None:
+            root = _harness_root()
+            where = (f"and no configs/policy/{cfg.policy}.yaml under {root}"
+                     if root else "and no harness root was found above this "
+                     "repository (set $AV_HARNESS_ROOT)")
+            raise ValueError(f"unknown --policy {cfg.policy!r}: not one of "
+                             f"{sorted(POLICY_SHORTCUTS)}, {where}")
     loaded = pol_mod.load_policy(req, harness_root=None, repo_root=REPO_ROOT)
     driver = PolicyEgoDriver(loaded.policy, name=loaded.name, hz=cfg.policy_hz,
                              bev=_bev_source(loaded))
@@ -208,6 +274,11 @@ class RunConfig:
     policy: Optional[str] = None          # simlingo | tfv6 | None = highway IDM
     policy_request: Optional[str] = None    # path to policy.json
     policy_hz: float = 20.0
+    #: Per-tick canonical trace for the harness's metrics package. The
+    #: harness evaluates scenario success on the realized trajectory, so
+    #: without this the run is only self-reported and not comparable with
+    #: the other methods'. 0 disables.
+    trace_rate_hz: float = trace_recording.TRACE_RATE_HZ
     # orchestration
     casting: Optional[bool] = None
     #: clearance that counts as the scenario's target interaction; same
@@ -337,6 +408,7 @@ class HighwayRun:
         self.collisions = None
         self.recorder = None
         self.t_sim = 0.0
+        self.trace_recorder = None
         self.notes: List[str] = []
         self.realized: List[object] = []
         self.interactions: Dict[str, Interaction] = {}
@@ -596,6 +668,21 @@ class HighwayRun:
         self.world.tick()
         if self.recorder is not None:
             self.recorder.start()
+        # The trace recorder is a different recorder from the video one above:
+        # that writes pixels, this writes the per-tick state series the
+        # harness's metrics package evaluates. Opened after the settle tick so
+        # the declared extents are the ones CARLA actually spawned.
+        if float(self.cfg.trace_rate_hz or 0.0) > 0.0:
+            out_dir = (os.path.dirname(os.path.abspath(self.cfg.report))
+                       if self.cfg.report else os.getcwd())
+            self.trace_recorder, note = trace_recording.make_recorder(
+                out_dir, rate_hz=float(self.cfg.trace_rate_hz),
+                context={"method": "orchestrator_highway",
+                         "scenario_mode": self.cfg.scenario,
+                         "town": getattr(self.cfg, "town", None)})
+            if note:
+                self.notes.append(note)
+            trace_recording.declare_scene(self.trace_recorder, self)
 
     #: Bumper-to-bumper metres a cut-in pin should leave once real CARLA bodies
     #: are in play. Below this, contact is expected rather than a bug.
@@ -852,8 +939,10 @@ class HighwayRun:
             self.world.tick()
             self.t_sim = t_next
             # G. collect
+            trace_recording.capture(self.trace_recorder, self)
             for rc in self.collisions.drain():
                 self.realized.append(rc)
+                trace_recording.note_collision(self.trace_recorder, self, rc)
                 self._log(f"  t={self.t_sim:6.2f}  {rc}")
             self._track(states)
             self._sample_traj()
@@ -1357,6 +1446,11 @@ class HighwayRun:
                 self.recorder.close()
         except Exception as exc:
             self.notes.append(f"video finalize failed: {exc}")
+        try:
+            if self.trace_recorder is not None:
+                self.trace_recorder.close()
+        except Exception as exc:
+            self.notes.append(f"trace finalize failed: {exc}")
         for closer in (getattr(self.collisions, "destroy", None),
                        getattr(self.bindings, "destroy", None)):
             try:
@@ -1479,10 +1573,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "are longer than the 4.5 m the scenario assumes, so the "
                         "authored pin leaves ~1.5 m bumper to bumper; anything "
                         "up to 10 m still counts as a merge and still verifies")
-    p.add_argument("--policy", default=None, choices=sorted(POLICY_SHORTCUTS),
-                   help="external ego_policy_v1 policy (default: highway IDM)")
+    # No `choices=`: besides the shortcuts, this accepts any policy the harness
+    # declares in configs/policy/<name>.yaml -- the analytic IDM family and
+    # anything living in its own repository -- which argparse cannot enumerate
+    # without reading the harness. An unknown name is reported by
+    # `_request_from_policy_config`, which can say WHERE it looked.
+    p.add_argument("--policy", default=None, metavar="NAME",
+                   help="external ego_policy_v1 policy: one of "
+                        f"{sorted(POLICY_SHORTCUTS)}, or the name of a harness "
+                        "configs/policy/<name>.yaml (default: highway IDM)")
     p.add_argument("--policy-request", default=None,
                    help="path to policy.json (overrides --policy)")
+    p.add_argument("--trace-rate-hz", type=float,
+                   default=trace_recording.TRACE_RATE_HZ,
+                   help="per-tick canonical trace for the harness's metrics "
+                        "package, written beside --report; 0 disables")
     p.add_argument("--policy-hz", type=float, default=20.0,
                    help="external policy decision rate in Hz (default 20)")
     p.add_argument("--video", default=None)
@@ -1581,6 +1686,7 @@ def config_from_args(args) -> RunConfig:
         cutin_along=args.cutin_along,
         policy=args.policy, policy_request=args.policy_request,
         policy_hz=args.policy_hz,
+        trace_rate_hz=args.trace_rate_hz,
         video=args.video,
         video_dir=args.video_dir, video_view=args.video_view,
         video_size=(int(w), int(h or 540)), video_fps=args.video_fps,
