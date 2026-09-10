@@ -366,14 +366,59 @@ class PolicyEgoDriver(EgoDriver):
         except (AttributeError, RuntimeError):
             return None
 
+    #: Acceleration -> pedals, for a policy that commands an acceleration
+    #: instead of pedals. These are osc2carla's numbers
+    #: (`osc2carla_policy_bridge.ACCEL_TO_THROTTLE / ACCEL_TO_BRAKE`) and are
+    #: deliberately not new ones: `third_party/idm` returns an acceleration
+    #: precisely so that every method converts it the SAME way, and a second
+    #: curve here would make each longitudinal comparison a comparison of two
+    #: pedal curves rather than of two policies.
+    ACCEL_TO_THROTTLE = 3.0
+    ACCEL_TO_BRAKE = 5.0
+
+    def _control_from_acceleration(self, action: Dict[str, Any]):
+        """Pedals for a policy whose action is an acceleration.
+
+        `third_party/idm` returns `acceleration_mps2` and `steer` rather than
+        pedals, and says why: every method that accepts a `control` action
+        converts an acceleration with the same mapping its own built-in IDM
+        uses, so the shared policy differs from a method's native IDM in the
+        lateral term and in nothing else. Returning pedals from the policy would
+        introduce a second mapping.
+
+        That contract was only half kept -- osc2carla implemented it, this port
+        did not, and the whole cell failed with "returned no 'control' block"
+        the moment the shared IDM was genuinely loaded rather than realized
+        natively here. This is this port's half.
+        """
+        accel = None
+        for key in ("acceleration_mps2", "acceleration", "accel", "a"):
+            if key in action:
+                accel = action[key]
+                break
+        if accel is None:
+            return None
+        try:
+            accel = float(accel)
+        except (TypeError, ValueError):
+            return None
+        return {"throttle": (accel / self.ACCEL_TO_THROTTLE if accel >= 0.0
+                             else 0.0),
+                "brake": (0.0 if accel >= 0.0
+                          else -accel / self.ACCEL_TO_BRAKE),
+                "steer": action.get("steer", 0.0)}
+
     def _to_carla_control(self, action: Dict[str, Any], carla):
         control = action.get("control")
         if not isinstance(control, dict):
+            control = self._control_from_acceleration(action)
+        if not isinstance(control, dict):
             raise EgoDriverError(
-                f"ego policy {self.name!r} returned no 'control' block. This port "
-                "actuates control only (see the module docstring): a policy that "
-                "emits waypoints must also return the control its own "
-                f"lateral/longitudinal controllers produce. Action keys: "
+                f"ego policy {self.name!r} returned no 'control' block and no "
+                "acceleration. This port actuates control: a policy that emits "
+                "waypoints must also return the control its own "
+                "lateral/longitudinal controllers produce, and one that commands "
+                "an acceleration must return `acceleration_mps2`. Action keys: "
                 f"{sorted(action)}")
         steer = _unit(control.get("steer", 0.0), "steer")
         throttle = _clamp01(control.get("throttle", 0.0))
