@@ -51,12 +51,50 @@ actors:
       - {type: decelerate, duration: 1.5, curve: {v0: 13.0, accel: -6.0}}
       - {type: go_straight, duration: 5.3, curve: {v0: 4.0, accel: 0.0}}
 
-  # The one cut-in car — right lane, 20 m ahead of the ego. Holds the cutin
-  # spec at load and keeps it: there is no second candidate to recast to.
+  # The one cut-in car — right lane, ABEAM of the ego (same y, so
+  # `start_along` is 0). Holds the cutin spec at load and keeps it: there is
+  # no second candidate to recast to.
+  #
+  # Why abeam rather than ahead
+  # ---------------------------
+  # From 20 m ahead the actor has to shed 15 m before it may merge, and the
+  # recorded plant2 run spent the whole `t - at` budget doing it: it reached
+  # min_gap 5.08 m -- the pin -- at t=7.05s, one tick past the t=7.0
+  # deadline, and the run reported `abandoned` with the lateral move never
+  # completed. Spawning abeam inverts the problem: the actor needs to GAIN
+  # 5 m rather than lose 15, which the solver asks for as
+  # v = ego_v + 5/4 ~ ego_v + 1.25 m/s, and the rest of the budget is free
+  # for the lane change itself. It is also the more adversarial staging --
+  # the cut-in comes out of the ego's blind spot instead of from a car it has
+  # been watching for 3 s.
   - id: 1
     color: [210, 70, 60]
     length: 4.5
     width: 2.0
-    start: {x: 3.5, y: -30.0, heading: 90}
+    start: {x: 3.5, y: -50.0, heading: 90}
     cruise: 12.0
-    cutin: {t: 6.0, along: 6.0, lat: 0.0, lc_duration: 2.0, tail: 4.0}
+    # `at` is the EARLIEST time the cut-in may begin: the merge happens some
+    # time AFTER 3 s, not at 3 s. Ego and actor both drive nominally first,
+    # and then the merge waits for the ego to actually be there -- see
+    # `headway`. --cutin-at overrides it; --cutin-along overrides `along`.
+    #
+    # `headway` is the proximity gate, in SECONDS: the cut-in proceeds once
+    # the ego is within this much time of the actor at its current speed.
+    # Time rather than distance so the scenario stays honest across ego
+    # speeds -- 10 m is a yawn at 5 m/s and a near miss at 14 m/s. The
+    # denominator is floored at CUTIN_NEAR_SPEED_FLOOR, so a stalled ego
+    # (plant2 sits at 0 for ~2.5 s after spawn) still opens the gate at
+    # close range instead of holding it shut for ever on an infinite headway.
+    #
+    # `t` is IGNORED by the CARLA orchestrator, which runs without a merge
+    # deadline: the holder keeps the role until it merges or the run ends,
+    # and the gate decides when. It is kept here only because
+    # `load_scenario` -> `resolve_cutins` seeds a plan from it for the pygame
+    # editor, and because `float(spec["t"])` there cannot take a null. The
+    # CARLA path drops that seed and sets the deadline to None.
+    #
+    # along 5.0 centre-to-centre is ~0.5 m BUMPER to bumper against the
+    # 4.89 m leaderboard hero -- a genuine near miss rather than a
+    # comfortable merge.
+    cutin: {at: 3.0, headway: 2.0, t: 7.0, along: 5.0, lat: 0.0,
+            lc_duration: 1.5, tail: 4.0}

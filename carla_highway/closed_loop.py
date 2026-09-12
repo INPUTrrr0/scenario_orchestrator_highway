@@ -204,6 +204,15 @@ class HighwayClosedLoop:
         self._next_tick = 0.0
         self._last_msg = ""
         self.n_recasts = 0
+        #: sim time the holder started waiting, or None when it is not
+        #: waiting. Only used to note the wait once per episode of waiting.
+        self._waiting_since: Optional[float] = None
+        #: sim time the proximity gate opened -- the ego first came within
+        #: the headway limit of the holder -- or None while it is still shut.
+        #: It LATCHES: a cut-in that is genuinely underway must not be
+        #: re-gated halfway through, and latching also means the gate cannot
+        #: chatter on the headway boundary.
+        self._gate_open_at: Optional[float] = None
 
         spec = cutin_spec or cutin_spec_of(background)
         self.orch: Optional["co.CutinOrchestrator"] = None
@@ -227,15 +236,41 @@ class HighwayClosedLoop:
                     spec["along"] = float(cutin_along)
                 if cutin_at is not None:
                     spec = dict(spec)
-                    lc = float(spec.get("lc_duration", 2.0))
                     self.cutin_start = max(0.0, float(cutin_at))
-                    spec["t"] = float(cutin_at) + max(lc + 2.0, 4.0)
-                    self._next_tick = self.cutin_start
+                    spec["at"] = self.cutin_start
+                    # `at` is an EARLIEST time, not an instant. It used to
+                    # derive a deadline -- `at + max(lc+2, 4)` -- and the
+                    # merge was forced inside it from wherever the actor
+                    # happened to be, which at 20 m ahead of the ego is a
+                    # lane change on an empty road rather than a cut-in.
+                    # Now nothing is forced: the proximity gate decides when
+                    # the merge happens and there is no deadline to run out.
+                    # The verifier never read `t` (verify_proper_cutin checks
+                    # adjacency, success, a commit time, and the merge
+                    # station), so dropping it costs the metric nothing.
+                    spec["t"] = None
+                    # Orchestrate from the start; `at` gates the merge. See
+                    # `due`.
+                    self._next_tick = 0.0
                 self.orch = StickyCutinOrchestrator(spec, cruise_speed=cruise)
+                # `load_scenario` ran `resolve_cutins`, which seeded the
+                # holder with an authored merge plan seconds before the
+                # orchestrator's first tick. The orchestrator owns that plan
+                # now and the proximity gate decides when the merge happens,
+                # so the seed is dropped in favour of plain cruise: a
+                # scenario with a small authored `t` would otherwise begin
+                # its lane change before the orchestrator had even woken, and
+                # the gate would be deciding about a merge already underway.
+                for a in self.sc.actors:
+                    if getattr(a, "cutin", None):
+                        co.apply_nominal(
+                            a, se.actor_cruise_speed(a, default=cruise))
                 if cutin_at is not None:
+                    hw = float(spec.get("headway", se.CUTIN_NEAR_HEADWAY_S))
                     self._note(0.0, "cast",
-                               f"cut-in starts at t={self.cutin_start:.1f}s, "
-                               f"merge by t={spec['t']:.1f}s")
+                               f"cut-in may begin after t={self.cutin_start:.1f}s "
+                               f"and merges once the ego is within {hw:.1f}s "
+                               f"headway; no deadline")
         self.sc.simulate()
 
     # ------------------------------------------------------------------ #
@@ -248,8 +283,18 @@ class HighwayClosedLoop:
         self.atime += dt
 
     def due(self, t_sim: float) -> bool:
-        if self.cutin_at is not None and t_sim < self.cutin_start:
-            return False
+        """Whether to orchestrate this tick.
+
+        `at` deliberately does NOT appear here. It gates the MERGE, not the
+        orchestration: "the cut-in happens after 3 s" is a statement about
+        when the actor may change lanes, not about whether the orchestrator
+        is awake. Sleeping until `at` meant the holder ran its authored
+        cruise unattended, and with a learned ego that stalls at spawn it
+        drifted past 40 m ahead -- where `score_cutin_candidate` collapses to
+        0.05, below `cast_roles`'s 0.08 floor, so it was never cast at all
+        and the run recorded `holder=None`. Ticking from the start lets the
+        wait hold the actor's station until the gate opens.
+        """
         return t_sim >= self._next_tick
 
     def tick(self, ego: Ego, t_sim: float) -> bool:
@@ -263,6 +308,19 @@ class HighwayClosedLoop:
         before_holder = self.orch.cutin_id
         before_n = self.orch.n_interventions
         self._recast_if_hopeless(ego, t_sim)
+        # Nobody may plan a lane change until the gate has opened, and that
+        # has to hold on the tick the holder is FIRST CAST too. On that tick
+        # `_recast_if_hopeless` returns early for want of a holder -- it is
+        # `orch.tick` below that both casts and plans -- so the gate was
+        # never evaluated and the fresh holder planned a chase, whose
+        # lane-change burst moved the actor 0.57 m toward the ego at t=0.
+        # Every later tick planned a wait, which holds the lateral offset
+        # rather than undoing it, so the actor spent the whole run half a
+        # metre off its lane centre: a cut-in that visibly starts at t=0 and
+        # then stops. Waiting is therefore the DEFAULT while the gate is
+        # shut, not something only `_recast_if_hopeless` can switch on.
+        if self._gate_open_at is None:
+            self.orch.waiting = True
         # CutinOrchestrator.tick rebases to now, so script time restarts.
         self.sc, _ = self.orch.tick(self.sc, self.atime, ego, t_sim)
         self.atime = 0.0
@@ -322,6 +380,7 @@ class HighwayClosedLoop:
         if orch is None:
             return
         orch.sticky_id = None
+        orch.waiting = False
         if orch.committed or not orch.cutin_id:
             return
         holder = next((a for a in self.sc.actors
@@ -334,6 +393,69 @@ class HighwayClosedLoop:
         def pose_of(a):
             return a.pose_at_time(self.atime) if a.traj else a.start
 
+        # Two decisions live here and they must not share a test.
+        #
+        # (a) RECAST -- "is the holder hopeless and is somebody better
+        #     available?" -- is judged on the AUTHORED deadline, exactly as it
+        #     was before the wait existed. Judging it under the wait's grace
+        #     made the holder look feasible for ever, so nothing was ever
+        #     hopeless, the role was never handed over, and two of the repo's
+        #     own checks went red (`0 recast(s)`, `outcome=None`). Recasting to
+        #     a more suitable actor still takes priority over waiting -- the
+        #     wait is for when there IS nobody more suitable.
+        #
+        # (b) CHASE vs WAIT -- reached only once (a) has declined to recast --
+        #     is judged on the EXTENDED deadline, the same one in both
+        #     directions, with a deadband so the state settles. Using the hard
+        #     deadline to enter and the extended one to leave asked an easier
+        #     question on the way out than on the way in, and the holder
+        #     flipped state on all 17 ticks between t=3.7 and t=7.0 while the
+        #     lane change -- planned only by the chase -- was restarted and
+        #     discarded every time.
+        # (0) THE PROXIMITY GATE, ahead of everything else. Until the ego is
+        # close enough to be cut in front of, there is no cut-in to perform
+        # and no point asking whether the holder could reach the pin: it
+        # waits. The gate latches open, so a merge already underway is never
+        # re-gated and the decision cannot chatter on the headway boundary.
+        if self._gate_open_at is None:
+            earliest = se.cutin_earliest(spec)
+            after_earliest = t_sim >= earliest
+            near, gap, headway = se.cutin_near_enough(
+                pose_of(holder), ego.x, ego.y, theta, ego.v, spec)
+            if after_earliest and near:
+                self._gate_open_at = t_sim
+                limit = float(spec.get("headway", se.CUTIN_NEAR_HEADWAY_S))
+                floor = se.cutin_gate_floor(spec)
+                self._note(t_sim, "gate",
+                           f"ego is within {headway:.2f}s headway of actor "
+                           f"{holder.id} at {gap:.1f} m (limit {limit:.1f}s, "
+                           f"floor {floor:.1f} m); the cut-in may proceed",
+                           actor=str(holder.id))
+            else:
+                # Not yet. Somebody already in position is more suitable for
+                # the action than a holder the ego has not caught up to, so a
+                # recast is still allowed -- but only to an actor that is
+                # itself near enough, and only once `at` has passed.
+                # Otherwise the holder waits, which is also what keeps it
+                # from cruising out of casting range.
+                orch.sticky_id = str(orch.cutin_id)
+                limit = float(spec.get("headway", se.CUTIN_NEAR_HEADWAY_S))
+                if not after_earliest:
+                    why = (f"the cut-in may not begin before t={earliest:.1f}s "
+                           f"(now {t_sim:.1f}s)")
+                elif not self._recast_to_nearer(orch, holder, ego, t_sim,
+                                                pose_of):
+                    floor = se.cutin_gate_floor(spec)
+                    why = ((f"it is only {gap:.1f} m ahead, inside the "
+                            f"{floor:.1f} m floor — too close to turn in")
+                           if gap < floor else
+                           (f"the ego is {headway:.1f}s behind it, outside "
+                            f"the {limit:.1f}s gate"))
+                else:
+                    return                 # the role moved to a nearer actor
+                self._begin_wait(orch, holder, ego, t_sim, why)
+                return
+
         if se.live_cutin_feasible(pose_of(holder), ego.x, ego.y, theta,
                                   ego.v, spec, t_sim):
             # Still able to make the pin, so it keeps the role — even once it
@@ -341,6 +463,7 @@ class HighwayClosedLoop:
             # would score it zero and hand the part to somebody else. See
             # `StickyCutinOrchestrator`.
             orch.sticky_id = str(orch.cutin_id)
+            self._resume(orch, holder, t_sim)
             return
 
         cands = [a for a in self.sc.actors
@@ -351,8 +474,14 @@ class HighwayClosedLoop:
                     if se.live_cutin_feasible(pose_of(a), ego.x, ego.y, theta,
                                               ego.v, spec, t_sim)]
         if not feasible:
+            # Nobody else can make the pin either, so there is no more suitable
+            # actor to hand the role to. The holder WAITS rather than running
+            # the deadline out: it holds its adjacent lane and eases toward the
+            # pin until the geometry comes back or the bounded grace expires.
             orch.sticky_id = str(orch.cutin_id)
-            return                     # nobody can; the holder abandons on time
+            self._wait_or_resume(orch, holder, ego, t_sim,
+                                 "no other actor can make the pin")
+            return
 
         ego_pose = (ego.x, ego.y, math.degrees(theta))
         lw = self.sc.map.lane_width
@@ -376,8 +505,13 @@ class HighwayClosedLoop:
         # abandons on time, which is what upstream does.
         feasible = [a for a in feasible if scores[a.id] > 0.0]
         if not feasible:
+            # Others could reach the pin but none of them is *castable*
+            # (`cutin_eligible`: adjacent lane and already ahead), so again
+            # there is no more suitable actor. The holder waits.
             orch.sticky_id = str(orch.cutin_id)
-            return                     # the holder keeps it and abandons on time
+            self._wait_or_resume(orch, holder, ego, t_sim,
+                                 "no other actor is eligible for the role")
+            return
         best = max(feasible, key=lambda a: scores[a.id])
         v_req, _ = se.live_cutin_required_speed(pose_of(holder), ego.x, ego.y,
                                                 theta, ego.v, spec, t_sim)
@@ -387,8 +521,120 @@ class HighwayClosedLoop:
                    f"(score {scores[best.id]:.2f})", actor=str(best.id))
         orch.cutin_id = str(best.id)
         orch.sticky_id = str(best.id)
+        orch.waiting = False
+        self._waiting_since = None
         orch.n_interventions += 1
         self.n_recasts += 1
+
+    def _recast_to_nearer(self, orch, holder, ego: Ego, t_sim: float,
+                          pose_of) -> bool:
+        """Hand the role to an actor the ego has ALREADY caught up to.
+
+        Returns True if the role moved. While the gate is shut the question
+        "is another actor more suitable?" means "is another actor already in
+        position to be cut in front of?", which is a different test from
+        `live_cutin_feasible` -- that one asks whether an actor could reach a
+        pin, and an actor 40 m up the road can. Casting to a car the ego is
+        nowhere near is what the gate exists to prevent, so the candidates
+        are filtered on the gate itself and then ranked by the ordinary
+        casting score.
+        """
+        spec = orch.spec
+        ego_pose = (ego.x, ego.y, math.degrees(ego.theta))
+        lw = self.sc.map.lane_width
+        cands = []
+        for a in self.sc.actors:
+            if a is holder or str(a.id) == "0":
+                continue
+            if getattr(a, "autonomy", "auto") == "self" or getattr(a, "block", None):
+                continue
+            near, _, _ = se.cutin_near_enough(pose_of(a), ego.x, ego.y,
+                                              ego.theta, ego.v, spec)
+            if not near:
+                continue
+            score = co.score_cutin_candidate(pose_of(a), ego_pose, lw)
+            if score > 0.0:
+                cands.append((score, a))
+        if not cands:
+            return False
+        score, best = max(cands, key=lambda sa: sa[0])
+        self._note(t_sim, "cast",
+                   f"the ego has caught up to actor {best.id} but not to "
+                   f"actor {holder.id} — recast (score {score:.2f})",
+                   actor=str(best.id))
+        orch.cutin_id = str(best.id)
+        orch.sticky_id = str(best.id)
+        orch.waiting = False
+        self._waiting_since = None
+        orch.n_interventions += 1
+        self.n_recasts += 1
+        return True
+
+    @staticmethod
+    def _wait_grace(orch) -> float:
+        """Seconds of grace the holder waits under: the orchestrator's
+        override when set, else `spec['wait']`, else the default."""
+        if orch.wait_grace_s is not None:
+            return float(orch.wait_grace_s)
+        return float(orch.spec.get("wait", se.CUTIN_WAIT_GRACE_S))
+
+    def _resume(self, orch, holder, t_sim: float) -> None:
+        """Leave the waiting state, noting how long it lasted."""
+        if self._waiting_since is None:
+            return
+        self._note(t_sim, "wait",
+                   f"actor {holder.id} can reach the pin again after waiting "
+                   f"{t_sim - self._waiting_since:.1f}s — resumes the chase",
+                   actor=str(holder.id))
+        self._waiting_since = None
+
+    def _wait_or_resume(self, orch, holder, ego: Ego, t_sim: float,
+                        why: str) -> None:
+        """Decision (b): with nobody more suitable to hand the role to, does
+        the holder chase or wait?
+
+        Judged on the wait-extended horizon in BOTH directions, with a speed
+        deadband and a minimum dwell so the state cannot chatter at the tick
+        rate. A holder that is already waiting has to be
+        `CUTIN_WAIT_RESUME_MARGIN` inside the feasible band to go back to
+        chasing; one that is not waiting only has to be inside it.
+        """
+        grace = self._wait_grace(orch)
+        waiting_now = self._waiting_since is not None
+        dwell_ok = (not waiting_now
+                    or (t_sim - self._waiting_since) >= se.CUTIN_WAIT_MIN_DWELL_S)
+        margin = se.CUTIN_WAIT_RESUME_MARGIN if waiting_now else 0.0
+        pose = holder.pose_at_time(self.atime) if holder.traj else holder.start
+        if dwell_ok and se.live_cutin_feasible(pose, ego.x, ego.y, ego.theta,
+                                               ego.v, orch.spec, t_sim,
+                                               grace=grace, margin=margin):
+            # reachable inside the grace: chase it rather than wait
+            orch.waiting = False
+            self._resume(orch, holder, t_sim)
+            return
+        self._begin_wait(orch, holder, ego, t_sim, why)
+
+    def _begin_wait(self, orch, holder, ego: Ego, t_sim: float,
+                    why: str) -> None:
+        """Put the holder into the waiting state and note it once.
+
+        Called only from the branches of `_recast_if_hopeless` that have
+        established there is no more suitable actor for the role. The wait is
+        the orchestrator's third option next to chase and abandon: the holder
+        keeps the part and stops trying to force a merge it cannot finish.
+        """
+        orch.waiting = True
+        if self._waiting_since is not None:
+            return                     # already waiting; do not re-note
+        self._waiting_since = t_sim
+        grace = self._wait_grace(orch)
+        v_req, t_rem = se.live_cutin_required_speed(
+            holder.pose_at_time(self.atime) if holder.traj else holder.start,
+            ego.x, ego.y, ego.theta, ego.v, orch.spec, t_sim)
+        self._note(t_sim, "wait",
+                   f"actor {holder.id} can't make the pin (needs "
+                   f"{v_req:.1f} m/s, {t_rem:.1f}s left) and {why} — "
+                   f"waits, deadline +{grace:.1f}s", actor=str(holder.id))
 
     # ---- views ---- #
     @property
@@ -432,6 +678,16 @@ class HighwayClosedLoop:
                          if self.t_commit is not None else None),
             "interventions": self.n_interventions,
             "recasts": self.n_recasts,
+            # The wait: how long the holder kept the role while unable to
+            # reach the pin, and whether the merge landed only because of the
+            # grace. A merge with `merged_after_deadline` true satisfied the
+            # scenario's geometry but not its authored timing, so a metric
+            # that cares about timing has to read this rather than `outcome`.
+            "waited_s": (round(self.orch.waited_s, 3)
+                         if self.orch is not None else 0.0),
+            "waiting": bool(self.orch.waiting) if self.orch is not None else False,
+            "merged_after_deadline": (bool(self.orch.merged_after_deadline)
+                                      if self.orch is not None else False),
             "roles": self.roles,
             "scores": {k: round(v, 4) for k, v in self.scores.items()},
             "events": [{"t": round(e.t, 3), "kind": e.kind, "actor": e.actor,
@@ -441,5 +697,16 @@ class HighwayClosedLoop:
             out["cutin_at"] = round(float(self.cutin_at), 3)
             out["cutin_start"] = round(float(self.cutin_start), 3)
             if self.orch is not None:
-                out["cutin_deadline"] = round(float(self.orch.spec.get("t", 0)), 3)
+                dl = self.orch.spec.get("t", None)
+                out["cutin_deadline"] = (round(float(dl), 3)
+                                         if dl is not None else None)
+                out["cutin_headway_gate_s"] = round(float(
+                    self.orch.spec.get("headway", se.CUTIN_NEAR_HEADWAY_S)), 3)
+                out["cutin_gate_open_at"] = (round(self._gate_open_at, 3)
+                                             if self._gate_open_at is not None
+                                             else None)
+                grace = float(self.orch.spec.get("wait", se.CUTIN_WAIT_GRACE_S)
+                              if self.orch.wait_grace_s is None
+                              else self.orch.wait_grace_s)
+                out["cutin_wait_grace"] = round(grace, 3)
         return out

@@ -38,7 +38,7 @@ from carla_port.carla_sync import (HEADING_MODES, HEADING_MOTION, KINEMATIC,
                                    sample_script_state, world_states)
 
 from . import scenarios as sc_mod
-from .closed_loop import DT_TICK, HighwayClosedLoop
+from .closed_loop import DT_TICK, HighwayClosedLoop, cutin_spec_of
 from .highway_ego import (DELTA_MAX, EGO_LENGTH, EGO_WIDTH, IDM_V0,
                           IDM_V0_CUTIN, V_MAX, Ego, HighwayEgoPolicy)
 from .highway_map import FORWARD_HEADING, HighwayFrame
@@ -611,6 +611,18 @@ class HighwayRun:
         # ahead of the pin, and the run then measures nothing but the
         # orchestrator failing to find anyone who can fall back that far.
         cutin_at = cfg.cutin_at
+        if cutin_at is None:
+            # Authored in the scenario: `cutin: {at: 3.0, ...}`. The delay is a
+            # property of the SCENARIO -- it is what makes the merge something
+            # that happens rather than something underway at frame 0 -- so it
+            # belongs beside the deadline it is measured against, not only in
+            # the launcher that used to carry it. --cutin-at still wins, so a
+            # sweep can vary it without editing the file.
+            authored = (cutin_spec_of(self.scenario) or {}).get("at")
+            if authored is not None:
+                cutin_at = float(authored)
+                self._log(f"cut-in delay {cutin_at:.1f}s from the scenario "
+                          f"(`cutin.at`)")
         if cutin_at is not None and cutin_at < 0:
             cutin_at = None
         self.loop = HighwayClosedLoop(self.frame, background, spec,
@@ -618,8 +630,20 @@ class HighwayRun:
                                       cutin_at=cutin_at,
                                       cutin_along=cfg.cutin_along)
         if cutin_at is not None and self.loop.orch is not None:
-            deadline = float(self.loop.orch.spec.get("t", cutin_at))
-            self._log(f"cut-in starts at t={cutin_at:.1f}s (merge by t={deadline:.1f}s)")
+            # `cutin_at` is the EARLIEST time, not the merge instant, and the
+            # CARLA path runs without a deadline -- the proximity gate decides
+            # when the merge happens. `spec['t']` is None here, so this log
+            # line reports the gate rather than a `float(None)`.
+            spec_now = self.loop.orch.spec
+            deadline = spec_now.get("t", None)
+            if deadline is None:
+                hw = float(spec_now.get("headway", se.CUTIN_NEAR_HEADWAY_S))
+                self._log(f"cut-in may begin after t={cutin_at:.1f}s, merges "
+                          f"once the ego is within {hw:.1f}s headway "
+                          f"(no deadline)")
+            else:
+                self._log(f"cut-in starts at t={cutin_at:.1f}s "
+                          f"(merge by t={float(deadline):.1f}s)")
         self._log(f"orchestration: {self.loop.status}")
         self._check_cutin_clearance(ego_actor, background)
 

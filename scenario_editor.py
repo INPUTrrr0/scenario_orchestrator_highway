@@ -851,16 +851,101 @@ def world_to_ego_offset(ego_pose: Pose, wx: float, wy: float
 CUTIN_FEASIBLE_MIN_V = 2.0     # absolute floor for a viable chase speed
 CUTIN_FEASIBLE_EGO_FRAC = 0.6  # ...and no slower than this fraction of ego_v:
 #                                crawling far below the ego's speed to let the
-#                                pin catch up is not a cut-in — drop the role
+#                                pin catch up is not a cut-in *by itself* — but
+#                                see the wait below: an infeasible chase now
+#                                drops the role only if somebody else can take
+#                                it. Otherwise the holder waits at exactly this
+#                                kind of speed until the pin is reachable again.
+
+# How long past the authored deadline `spec.t` a WAITING holder may keep
+# trying. The wait exists because an infeasible chase is usually the ego's
+# doing -- it braked, or (with a learned policy) stalled at spawn -- and
+# dropping the only candidate turns a transient into a failed scenario. It is
+# bounded on purpose: an unbounded wait would let every cut-in eventually
+# succeed and the `merged`/`abandoned` outcome would stop measuring anything.
+# `cutin: {wait: 0}` in the scenario YAML restores the hard deadline.
+CUTIN_WAIT_GRACE_S = 4.0
+# Soft horizon the wait speed is solved against, in place of the shrinking
+# deadline. Large enough that the holder eases toward the pin rather than
+# lunging at it, small enough to still be closing.
+CUTIN_WAIT_TAU_S = 3.0
+# Hysteresis on the wait. The state is re-decided every orchestration tick
+# (10 Hz), so a holder sitting on the feasibility boundary will chatter unless
+# leaving the wait is HARDER than entering it: require the required speed to
+# be this far inside the band before resuming the chase, and hold the wait for
+# at least this long. Without the margin the holder flipped wait/chase on
+# every single tick -- 17 transitions in four seconds -- and the lane change,
+# which only the chase plans, never survived long enough to finish.
+CUTIN_WAIT_RESUME_MARGIN = 1.0     # m/s inside the feasible band
+CUTIN_WAIT_MIN_DWELL_S = 0.3       # minimum time spent waiting
+
+# --- when the cut-in may happen -------------------------------------------- #
+# `cutin: {at: N}` is an EARLIEST time, not an instant: the cut-in happens
+# some time AFTER N seconds, once the ego is close enough to be cut in front
+# of. Before this, `at` woke the orchestrator at N and it merged immediately
+# from wherever the actor happened to be -- 20 m ahead of the ego counts as a
+# lane change on an empty road, not a cut-in.
+#
+# "Close enough" is a TIME headway: the ego is this many seconds behind the
+# actor at its current speed. Time rather than distance so the same scenario
+# stays honest across ego speeds -- 10 m is a yawn at 5 m/s and a near miss
+# at 14 m/s.
+CUTIN_NEAR_HEADWAY_S = 2.0
+# ...but headway is gap/speed, which is infinite for a stopped ego, and a
+# learned ego that stalls at spawn (plant2 does, for ~2.5 s) would hold the
+# gate shut for ever. The denominator therefore has a floor, which also gives
+# the gate an absolute minimum reach of CUTIN_NEAR_HEADWAY_S * this.
+#
+# That reach has to CLEAR `CUTIN_NEAR_MIN_GAP_M`, or the two bounds meet and
+# the admissible window is empty: at 3.0 m/s the reach was 2.0 * 3.0 = 6.0 m
+# and the floor is also 6.0 m, so a slow ego could never be cut in front of
+# at all -- a single-point window. At 5.0 m/s the reach is 10 m and the
+# window is [6, 10] m. `test_gate_window_is_never_empty` pins the relation.
+CUTIN_NEAR_SPEED_FLOOR = 5.0
+# The gate needs a FLOOR as well as a ceiling. With only "within N seconds"
+# it opened on the abeam scenario at a 3.3 m centre-to-centre gap -- inside
+# the two bodies (4.89 m ego, up to 4.2 m actor), where a lane change is a
+# side-swipe rather than a cut-in. That run ended with min gap 0.0 m and
+# `no_hit-`.
+#
+# The floor is HALF THE SUM OF THE LENGTHS and nothing more. It was briefly
+# 6.0 m, and coupled as `max(along, 6.0)`, which deadlocked: the wait law
+# (`solve_cutin_wait`) has its fixed point AT the pin station, so an actor
+# waiting for a 5 m pin converges to 5 m and stops there -- below a 6 m floor
+# the gate could never open, and the abeam run waited out the whole 12.5 s
+# with `outcome: None`. The gate's opening condition has to be REACHABLE by
+# the wait that precedes it. A 6 m floor also silently vetoed the scenario's
+# own intent: `along: 5.0` is 0.45 m bumper to bumper by design, and the
+# runner prints a warning saying contact is expected there.
+CUTIN_NEAR_MIN_GAP_M = 4.6
+# ...and the gate may open slightly before the pin station so it is not a
+# knife-edge against the wait's asymptote.
+CUTIN_NEAR_PIN_TOL_M = 1.0
+# Rolling horizon the chase is solved against when the scenario has no
+# deadline (`t: null`). The deadline used to double as the chase horizon, so
+# removing it leaves the speed law -- v = ego_v + along_err/horizon -- without
+# a denominator. A fixed horizon is better behaved than a shrinking one
+# anyway: it never lunges as the clock runs out.
+CUTIN_CHASE_TAU_S = 2.0
 
 
 def live_cutin_required_speed(actor_pose: Pose, ego_x: float, ego_y: float,
                               ego_theta: float, ego_v: float,
-                              spec: dict, now: float) -> Tuple[float, float]:
+                              spec: dict, now: float,
+                              grace: Optional[float] = None
+                              ) -> Tuple[float, float]:
     """(required cruise speed, t_rem) for `actor_pose` to reach the live
     ego-relative pin by the deadline `spec.t` (same math as the chase solver:
-    the pin advances at ~ego_v, so v = ego_v + along_error / t_rem)."""
-    t_rem = closed_loop_cutin_horizon(spec, now)
+    the pin advances at ~ego_v, so v = ego_v + along_error / t_rem).
+
+    `grace` is for a holder that is already WAITING: its deadline has been
+    extended, so judging it against the hard `spec.t` would answer a question
+    nobody asked. Pass the grace it is waiting under and the horizon is the
+    extended one. Callers that are not waiting pass None and get the deadline
+    behaviour unchanged.
+    """
+    t_rem = (closed_loop_cutin_horizon(spec, now) if grace is None
+             else cutin_wait_horizon(spec, now, grace=grace))
     wx, wy = live_cutin_pin(ego_x, ego_y, ego_theta,
                             float(spec.get("along", 1.0)),
                             float(spec.get("lat", 0.0)))
@@ -871,16 +956,42 @@ def live_cutin_required_speed(actor_pose: Pose, ego_x: float, ego_y: float,
 
 def live_cutin_feasible(actor_pose: Pose, ego_x: float, ego_y: float,
                         ego_theta: float, ego_v: float,
-                        spec: dict, now: float) -> bool:
+                        spec: dict, now: float,
+                        grace: Optional[float] = None,
+                        margin: float = 0.0) -> bool:
     """Can this actor still make the cut-in?  False when the deadline is (all
     but) gone or the required speed is outside what a car would do — e.g. the
-    ego braked hard and the pin fell hopelessly far behind the actor."""
+    ego braked hard and the pin fell hopelessly far behind the actor.
+
+    `grace` extends the horizon for a holder that is entitled to wait; see
+    `live_cutin_required_speed`. Without it a waiting holder can never be
+    judged feasible again once `spec.t` has passed, so the wait becomes a
+    one-way door: the actor reaches the pin's station, is still refused the
+    lane change, and abandons from on top of the pin.
+
+    `margin` (m/s) tightens the acceptable speed band at both ends. It exists
+    so that RESUMING a chase can be made harder than entering the wait --
+    the same `grace` on both sides but a margin on the way out. Asking an
+    easier question to leave than to enter is what made the holder oscillate
+    at the tick rate.
+    """
     v_req, t_rem = live_cutin_required_speed(actor_pose, ego_x, ego_y,
-                                             ego_theta, ego_v, spec, now)
+                                             ego_theta, ego_v, spec, now,
+                                             grace=grace)
     if t_rem <= 0.3:
         return False
-    lo = max(CUTIN_FEASIBLE_MIN_V, CUTIN_FEASIBLE_EGO_FRAC * ego_v)
-    return lo <= v_req <= CUTIN_MAX_SPEED
+    lo = max(CUTIN_FEASIBLE_MIN_V, CUTIN_FEASIBLE_EGO_FRAC * ego_v) + margin
+    return lo <= v_req <= CUTIN_MAX_SPEED - margin
+
+
+def cutin_has_deadline(spec: dict) -> bool:
+    """False when the scenario declines to set a merge deadline (`t: null`).
+
+    A deadline-free cut-in keeps the role until it merges or the run ends;
+    nothing abandons it. The proximity gate, not a clock, decides when the
+    merge happens.
+    """
+    return spec.get("t", None) is not None
 
 
 def closed_loop_cutin_horizon(spec: dict, now: float) -> float:
@@ -888,9 +999,58 @@ def closed_loop_cutin_horizon(spec: dict, now: float) -> float:
 
     Returns <= 0 when the deadline has passed — callers should then abandon
     the cut-in (cruise straight) instead of chasing the pin forever.
+
+    With no deadline (`t: null`) there is nothing to run out, so this returns
+    the rolling `CUTIN_CHASE_TAU_S` instead: still a usable horizon for the
+    chase speed law, never negative, so no caller abandons on it.
     """
-    t_cut = float(spec.get("t", now))
+    if not cutin_has_deadline(spec):
+        return CUTIN_CHASE_TAU_S
+    t_cut = float(spec["t"])
     return t_cut - now
+
+
+def cutin_earliest(spec: dict) -> float:
+    """The `at` time: the cut-in may not begin before this."""
+    return max(0.0, float(spec.get("at", 0.0) or 0.0))
+
+
+def cutin_gate_floor(spec: dict) -> float:
+    """Minimum station ahead of the ego at which the merge may begin.
+
+    Never inside the two bodies (`CUTIN_NEAR_MIN_GAP_M`), and never above the
+    pin station the wait converges to -- otherwise the gate is unreachable
+    and the cut-in deadlocks. See the note on `CUTIN_NEAR_MIN_GAP_M`.
+    """
+    along = float(spec.get("along", 0.0) or 0.0)
+    return max(CUTIN_NEAR_MIN_GAP_M, along - CUTIN_NEAR_PIN_TOL_M)
+
+
+def cutin_near_enough(actor_pose: Pose, ego_x: float, ego_y: float,
+                      ego_theta: float, ego_v: float, spec: dict
+                      ) -> Tuple[bool, float, float]:
+    """Is the ego close enough behind the actor for a genuine cut-in?
+
+    Returns (near, gap_m, headway_s) where `gap_m` is the actor's station
+    ahead of the ego along the ego's heading and `headway_s` is that gap in
+    seconds at the ego's current speed (floored — see
+    `CUTIN_NEAR_SPEED_FLOOR`).
+
+    An actor BEHIND the ego is not near-enough-to-cut-in in any useful sense:
+    it has to get ahead first, which is the chase's job, so a negative gap
+    reports not-near with its real (negative) numbers for the log.
+    """
+    fx, fy = math.cos(ego_theta), math.sin(ego_theta)
+    gap = (actor_pose[0] - ego_x) * fx + (actor_pose[1] - ego_y) * fy
+    v = max(float(ego_v), CUTIN_NEAR_SPEED_FLOOR)
+    headway = gap / v
+    limit = float(spec.get("headway", CUTIN_NEAR_HEADWAY_S))
+    # Far enough ahead to turn in without hitting the ego, and close enough
+    # in time to be a cut-in. The floor tracks the pin but stays strictly
+    # below it, so the wait -- whose fixed point IS the pin station -- can
+    # actually reach it.
+    near = gap >= cutin_gate_floor(spec) and headway <= limit
+    return near, gap, headway
 
 
 NOMINAL_CRUISE_T = 8.0     # scripted-playback length of a generated cruise plan
@@ -959,6 +1119,48 @@ def solve_closed_loop_cutin(start: Pose, pin_x: float, pin_y: float,
     plan.append(Maneuver(type="go_straight", duration=float(tail),
                          intercept=max(v, ego_v)))
     return plan
+
+
+def solve_cutin_wait(start: Pose, pin_x: float, pin_y: float,
+                     ego_v: float, tail: float = 30.0) -> List[Maneuver]:
+    """Plan for a holder that cannot reach the pin yet but keeps the role.
+
+    Same longitudinal law as `solve_closed_loop_cutin` -- the pin advances at
+    ~ego_v, so v = ego_v + along_error / horizon -- with two differences that
+    are the whole point of waiting:
+
+      * the horizon is the soft `CUTIN_WAIT_TAU_S` rather than the time left
+        on the deadline, so the speed does not blow up as the deadline runs
+        out; and
+      * NO lane change is planned. The actor stays in its adjacent lane. A
+        cut-in is only allowed to start when it can be finished, and merging
+        alongside an ego that is about to be somewhere else is how the actor
+        ends up beside the ego rather than ahead of it.
+
+    The returned speed is deliberately *not* clamped into the feasible band
+    (`live_cutin_feasible`): dropping below 0.6*ego_v to let the pin catch up
+    is exactly what waiting is for.
+    """
+    sx, sy, sh = start
+    h = math.radians(sh)
+    fx, fy = math.cos(h), math.sin(h)
+    along_err = (pin_x - sx) * fx + (pin_y - sy) * fy
+    v = clamp(ego_v + along_err / CUTIN_WAIT_TAU_S,
+              CUTIN_MIN_SPEED, CUTIN_MAX_SPEED)
+    return [Maneuver(type="go_straight", duration=float(tail), intercept=v)]
+
+
+def cutin_wait_horizon(spec: dict, now: float, grace: Optional[float] = None
+                       ) -> float:
+    """`closed_loop_cutin_horizon` plus the wait grace the spec allows.
+
+    The authored `spec.t` is never mutated -- the report and the verifier keep
+    reading the deadline the scenario asked for -- so the extension lives here
+    and callers that do not wait are unaffected.
+    """
+    g = (float(spec.get("wait", CUTIN_WAIT_GRACE_S))
+         if grace is None else float(grace))
+    return closed_loop_cutin_horizon(spec, now) + max(0.0, g)
 
 
 def solve_cutin_maneuvers(start: Pose, wx: float, wy: float, t_arr: float,

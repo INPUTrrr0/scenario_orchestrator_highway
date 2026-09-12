@@ -84,11 +84,17 @@ case "${SCENARIO}" in
         # HAPPENS rather than something already underway at frame 0. The
         # authored deadline (`cutin: {t: 6.0}`) is unchanged, so the actor has
         # three seconds to make the pin.
+        # AV_CUTIN_BASE points the run at a variant of the scenario without
+        # editing the tracked one -- used to re-run a staging that the
+        # committed file no longer describes (e.g. the 20 m-ahead spawn the
+        # abeam version replaced), and for sweeps.
         SCEN_ARGS=(--scenario cutin
-                   --base "${SCRIPT_DIR}/scenarios/scenario_cutin_single.yaml"
+                   --base "${AV_CUTIN_BASE:-${SCRIPT_DIR}/scenarios/scenario_cutin_single.yaml}"
                    --town Town04
-                   --cutin-at 3
-                   --cutin-along 9
+                   # No --cutin-at: the delay is authored in the scenario
+                   # (`cutin: {at: 3.0}`), which is where it belongs. Pass
+                   # --cutin-at to override it for a sweep.
+                   --cutin-along 5
                    --along-offset 110)
         ;;
     hard_brake)
