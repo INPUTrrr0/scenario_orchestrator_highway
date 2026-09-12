@@ -45,7 +45,7 @@ actors:
     width: 2.0
     start: {x: 1.75, y: -60.0, heading: 90}
     maneuvers:
-      - {type: go_straight, duration: 40.0, curve: {v0: 12.0, accel: 0.0}}
+      - {type: go_straight, duration: 40.0, curve: {v0: 14.0, accel: 0.0}}
 
   # Slow lead — ego's lane, 18 m ahead. Nominal at 11 m/s for three seconds,
   # then brakes to 4 m/s and stays there.
@@ -53,13 +53,31 @@ actors:
     color: [210, 70, 60]
     length: 4.5
     width: 2.0
-    start: {x: 1.75, y: -42.0, heading: 90}
+    # 23 m ahead of the ego, which is IDM's EQUILIBRIUM gap at 14 m/s
+    # (s0 + v*T = 2 + 14*1.5). Spawn closer and the follower spends the
+    # opening seconds braking to open the gap instead of holding station:
+    # at 11 m the ego dropped 14 -> 6 m/s before the lead ever braked, and
+    # the brake then landed 28 m away from an ego still recovering. The
+    # scenario has to respect the follower's own headway to be a hard
+    # brake rather than a spawn transient.
+    start: {x: 1.75, y: -37.0, heading: 90}
     role: slow
     autonomy: self
     maneuvers:
-      - {type: go_straight, duration: 3.0, curve: {v0: 11.0, accel: 0.0}}
-      - {type: decelerate, duration: 1.75, curve: {v0: 11.0, accel: -4.0}}
-      - {type: go_straight, duration: 40.0, curve: {v0: 4.0, accel: 0.0}}
+      # Matches the ego's 13 m/s, so the ~6 m bumper gap holds steady and the
+      # brake is the only thing that changes. Then -8 m/s^2 for 1.5 s: 13 m/s
+      # down to 1, an unambiguous emergency stop rather than a drift to a slow
+      # cruise. HARD_BRAKE_TRIGGER_GAP_M is 6 m and the staging check wants the
+      # brake to start inside it, which is why the lead sits this close.
+      # 14 m/s matches configs/policy/idm_highway.yaml's desired_speed_mps.
+      # Under an external policy the EGO's authored maneuver is not what
+      # drives it -- the policy is -- so a lead cruising faster than the
+      # policy's target pulls away and brakes far from the ego. With plain
+      # `idm` (8 m/s) the gap at brake onset was 28 m, not the ~6 m the
+      # trigger window wants. Run this family with idm_highway or mobil.
+      - {type: go_straight, duration: 4.0, curve: {v0: 14.0, accel: 0.0}}
+      - {type: decelerate, duration: 1.6, curve: {v0: 14.0, accel: -8.0}}
+      - {type: go_straight, duration: 40.0, curve: {v0: 1.0, accel: 0.0}}
 
   # Normal-speed lead — adjacent lane, 12 m ahead, 10.5 m/s: squeezes the
   # merge gap during the overtake. Unchanged from the authored scenario.
