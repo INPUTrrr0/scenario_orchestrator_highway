@@ -57,7 +57,9 @@ set -u
 POLICY="${1:-}"
 SCENARIO="${2:-cutin}"
 case "${POLICY}" in
-    simlingo|tfv6|plant2) ;;
+    # Any name --policy accepts: the three learned shortcuts, or a harness
+    # configs/policy/<name>.yaml (idm, idm_mobil, mobil, ...).
+    *) ;;
     *) echo "usage: $0 <simlingo|tfv6|plant2> <cutin|hard_brake|overtake>" >&2; exit 64 ;;
 esac
 case "${SCENARIO}" in
@@ -147,10 +149,22 @@ else
     export PATH="${FFMPEG_DIR}:${PATH}"
     VENV_VAR="$(echo "${POLICY}" | tr 'a-z' 'A-Z')_VENV"
     ROOT_VAR="$(echo "${POLICY}" | tr 'a-z' 'A-Z')_ROOT"
-    source "${!VENV_VAR}/bin/activate"
-    PY="${!VENV_VAR}/bin/python"
-    POLICY_ROOT="${!ROOT_VAR}"
-    EXTRA_PATH="${POLICY_ROOT}"
+    # An analytic policy -- idm, idm_mobil, mobil -- has no inference stack and
+    # so no <NAME>_VENV or <NAME>_ROOT. It runs in whatever interpreter the port
+    # itself needs (carla, pygame, numpy), which is why the fallback is a venv
+    # and not an error: `${!VENV_VAR}` under `set -u` aborted the run with
+    # "VENV_VAR: unbound variable" the moment --policy took a config name.
+    if [ -z "${!VENV_VAR:-}" ]; then
+        VENV="${AV_PORT_VENV:-${TFV6_VENV}}"
+        POLICY_ROOT="${SCRIPT_DIR}"
+        EXTRA_PATH=""
+    else
+        VENV="${!VENV_VAR}"
+        POLICY_ROOT="${!ROOT_VAR}"
+        EXTRA_PATH="${POLICY_ROOT}"
+    fi
+    source "${VENV}/bin/activate"
+    PY="${VENV}/bin/python"
     if [ "${POLICY}" = "tfv6" ]; then
         # The adapter's controller subclasses TransfuserAgent to reuse its
         # control selection, and that class descends from the CARLA leaderboard's
