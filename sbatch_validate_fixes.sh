@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH --job-name=av-validate-fixes
-#SBATCH --account=aip-cmaddis
+#SBATCH --account=aip-six
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=0:20:00

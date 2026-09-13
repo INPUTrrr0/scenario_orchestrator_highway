@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH --job-name=av-cpu-probe
-#SBATCH --account=aip-cmaddis
+#SBATCH --account=aip-six
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=8G
 #SBATCH --time=0:10:00

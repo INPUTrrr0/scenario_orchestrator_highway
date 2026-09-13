@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH --job-name=av-validate-scenarios
-#SBATCH --account=aip-cmaddis
+#SBATCH --account=aip-six
 #SBATCH --cpus-per-task=2
 #SBATCH --mem=4G
 #SBATCH --time=0:10:00

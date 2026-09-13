@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH --job-name=av-probe-sl
-#SBATCH --account=aip-cmaddis
+#SBATCH --account=aip-six
 #SBATCH --gres=gpu:l40s:1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem=32G
