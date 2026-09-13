@@ -13,6 +13,7 @@ directives_script.py can build/verify trial worlds without a circular import.
 from __future__ import annotations
 
 import copy
+import math
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
@@ -52,11 +53,15 @@ def _truncate_maneuver(m: se.Maneuver, t_i: float) -> se.Maneuver:
     if m.type == "stop":
         return se.Maneuver(type="stop", duration=rem)
     if m.type == "lane_change":
+        # Continue the same lateral curve from where it is, instead of
+        # restarting a fresh smoothstep over the remaining offset: the old
+        # form reset the lateral velocity to zero at every re-base.
         frac = t_i / max(1e-6, m.duration)
-        s_lat = frac * frac * (3.0 - 2.0 * frac)
+        u_now = m.lat_u0 + (m.lat_u1 - m.lat_u0) * frac
         return se.Maneuver(type="lane_change", duration=rem,
                            intercept=m.velocity_at(t_i), slope=m.slope,
-                           lateral_offset=m.lateral_offset * (1.0 - s_lat))
+                           lateral_offset=m.lateral_offset,
+                           lat_u0=u_now, lat_u1=m.lat_u1)
     return se.Maneuver(type=m.type, intercept=m.velocity_at(t_i),
                        slope=m.slope, duration=rem)
 
@@ -79,6 +84,15 @@ def rebase_actor(a: se.Actor, tau: float) -> se.Actor:
         i = a.active_index(tau)
         t_i = tau - a.cum[i]
         head = segs[i]
+        if isinstance(head, se.Maneuver) and head.type == "lane_change":
+            # the trajectory pose carries the lane change's temporary yaw;
+            # the continuation adds yaw(u) itself, so start from the plan
+            # heading or the yaw is counted twice
+            frac = t_i / max(1e-6, head.duration)
+            u_now = head.lat_u0 + (head.lat_u1 - head.lat_u0) * frac
+            yaw = ((12.0 if head.lateral_offset >= 0 else -12.0)
+                   * math.sin(math.pi * u_now))
+            pose = (pose[0], pose[1], pose[2] - yaw)
         tail = ([_truncate_maneuver(head, t_i)] if isinstance(head, se.Maneuver)
                 else [copy.deepcopy(head)])
         new_segs = tail + [copy.deepcopy(s) for s in segs[i + 1:]]

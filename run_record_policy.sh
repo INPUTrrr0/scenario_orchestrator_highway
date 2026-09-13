@@ -79,23 +79,16 @@ SCEN_ARGS=()
 case "${SCENARIO}" in
     cutin)
         TAG="cutin_single"
-        # --cutin-at 3: the orchestrator stays asleep until t=3, so ego and
-        # actor both drive nominally first and the merge is something that
-        # HAPPENS rather than something already underway at frame 0. The
-        # authored deadline (`cutin: {t: 6.0}`) is unchanged, so the actor has
-        # three seconds to make the pin.
         # AV_CUTIN_BASE points the run at a variant of the scenario without
-        # editing the tracked one -- used to re-run a staging that the
-        # committed file no longer describes (e.g. the 20 m-ahead spawn the
-        # abeam version replaced), and for sweeps.
+        # editing the tracked one. The cut-in itself (trigger, gap, relative
+        # speed, mode, actors) is authored in the YAML; extra flags for a sweep
+        # go through AV_CUTIN_ARGS, e.g. "--re-aim --rel-speed 3 --spawn-seed 4".
+        # shellcheck disable=SC2206
         SCEN_ARGS=(--scenario cutin
                    --base "${AV_CUTIN_BASE:-${SCRIPT_DIR}/scenarios/scenario_cutin_single.yaml}"
                    --town Town04
-                   # No --cutin-at: the delay is authored in the scenario
-                   # (`cutin: {at: 3.0}`), which is where it belongs. Pass
-                   # --cutin-at to override it for a sweep.
-                   --cutin-along 5
-                   --along-offset 110)
+                   --along-offset 110
+                   ${AV_CUTIN_ARGS:-})
         ;;
     hard_brake)
         TAG="hard_brake"

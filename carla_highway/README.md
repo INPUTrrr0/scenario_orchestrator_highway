@@ -22,7 +22,7 @@ Three scenarios, the ones the upstream repo ships as its stress tests:
 
 | mode | road it needs | what happens |
 |---|---|---|
-| `cutin` | 3 same-direction lanes, 120 m | the orchestrator **casts** one of four actors as the cut-in and replans it against the live ego every 0.1 s; it recasts when the holder becomes hopeless |
+| `cutin` | 3 same-direction lanes, 120 m | `cutin_director.py` positions one actor (the holder) so that, once the trigger fires, it enters the ego's lane at a requested bumper gap and relative speed; the rest are traffic that yields to it |
 | `hard_brake` | 2 same-direction lanes, 160 m | a 4 m/s lead in the ego's lane, a 10.5 m/s lead in the next one squeezing the merge gap |
 | `overtake` | 2 lanes, **two-way**, 160 m | a blocker brakes to a stop in the ego's lane; the only way past is the **oncoming** lane, with a car coming |
 
@@ -342,67 +342,49 @@ F. world.tick()
 G. collect collisions, grade, capture a video frame
 ```
 
-`CutinOrchestrator.tick` returns a scenario rebased to *now*, so script-local
+`CutinDirector.tick` re-bases the background scenario to *now*, so script-local
 time restarts at zero on every orchestration tick; `closed_loop.py` resets its
-clock accordingly. That is the same contract `carla_sync.py` describes for
-`Orchestrator._rebase_here`, reached by a different route.
+clock accordingly. Every simulation step the runner also hands the director the
+vehicles as CARLA simulated them (`HighwayClosedLoop.observe`), which is where
+the cut-in instant is detected and measured.
 
 Only `cutin` is orchestrated. `hard_brake` and `overtake` are ego-policy stress
-tests whose actors are fully scripted **on purpose** — cast roles or yields
-would change the very timings they were tuned around. `--casting` overrides it.
+tests whose actors are fully scripted **on purpose**. `--casting` overrides it.
 
-### Recasting, which does not come for free
+### The cut-in
 
-`CutinOrchestrator.cast` is sticky on *identity*: once `cutin_id` is set it
-re-locks the same actor every tick until the cut-in commits. The rule that moves
-the role lives one level up, in `scenario_editor.py`'s `cast_cutin_roles`, which
-the pygame editor calls and a headless port does not. Without it the first pick
-holds the role forever — on `scenario_cutin` the opening tie went to actor 2,
-which stayed cast at a candidate score of **0.016** while actor 4 sat at
-**0.64** and the cut-in ran out its deadline.
+The orchestrator lives in [`../cutin_director.py`](../cutin_director.py) and is
+shared with the pygame editor's Drive mode, so a cut-in behaves the same whether
+you steer the ego or a policy drives it here. Its parameters come from the
+scenario YAML (top-level `cutin:` and `spawn:` blocks, see
+`scenarios/scenario_cutin_single.yaml`) and can be overridden on the command
+line:
 
-`closed_loop.py` ports that rule, with upstream's own predicates
-(`live_cutin_feasible`, `live_cutin_required_speed`). The important half of it is
-easy to get backwards:
+| flag | meaning |
+|---|---|
+| `--trigger-time S`, `--trigger-ego-speed V` | the cut-in is **allowed** once every given condition holds; a speed condition must hold continuously for longer than `--trigger-speed-hold` (default 1 s) |
+| `--gap M` | ego front bumper to actor rear bumper at the **cut-in instant** (default 0.5) |
+| `--rel-speed DV` | actor speed minus ego speed at that instant |
+| `--static_commit` / `--re-aim` | commit to the plan solved when the lane change starts, or keep re-aiming at the ego's bumper until the actor enters the lane |
+| `--lc-duration S` | lane change duration |
+| `--num-actors N`, `--spawn-seed SEED` | how many actors, and the seed for drawing their spawns |
+| `--trajectories PATH` | every vehicle's driven trajectory, JSON (default: beside `--report`) |
 
-> stickiness is on **feasibility**, not score.
-
-Mid-chase the holder drifts toward the ego's lane, which tanks its *candidate*
-score — that is progress, not failure. So the role moves only when the holder
-can no longer reach the pin by the deadline, and then it goes to the best-scoring
-actor that still can.
-
-Getting that rule *half* right is worse than not having it, and the first CARLA
-cut-in runs found both halves the hard way. Every run — the MOBIL ego, the
-lane-keeping ego, and the scripted ego reproducing upstream's own conditions —
-reported `abandoned`, without exception.
-
-**Feasibility and eligibility are different tests, and the recast has to respect
-both.** `live_cutin_feasible` asks whether an actor could still reach the pin by
-the deadline; a car coming up from behind can. But `cast_roles` will only cast
-an actor that is `cutin_eligible` — adjacent lane **and already ahead** — and
-only honours a lock whose score is above zero. Handing the role to a feasible
-but ineligible actor produces a two-tick oscillation at 10 Hz: the recast sets
-`cutin_id`, the next `cast` refuses the lock and falls to "no viable candidate",
-the tick after re-picks the same hopeless holder. That was **51–57 interventions
-inside four seconds**, never committing. `_recast_if_hopeless` now requires a
-non-zero score of its replacement, and otherwise leaves the holder to abandon on
-time — which is what upstream does.
-
-**A merging holder scores zero, and `cast_roles` will take the role off it on
-the very tick the merge becomes detectable.** `cutin_is_merged` needs the actor
-within 0.5 m of a pin whose lateral offset is 0 — on the ego's own line;
-`cutin_adjacent` needs it at least 0.4 lane widths away from that line. The two
-cannot hold at once, `tick` casts before it plans, and so
-`apply_closed_loop_cutin` — the only thing that can ever return `"merged"` — is
-never called for the actor that just merged. `scenario_editor.py`'s casting does
-not have this problem because it identifies the holder by *which actor carries
-the spec*. [`StickyCutinOrchestrator`](closed_loop.py) applies the same rule to
-`CutinOrchestrator` by overriding `cast` alone: the holder keeps the role while
-`_recast_if_hopeless` judges it still able to make the pin, and everything else
-is cast exactly as before. With it, all three egos merge.
-
----
+The **cut-in instant** is the first moment any corner of the actor's body is
+inside the ego's lane; gap, relative speed and TTC are measured there from the
+simulated states. The trigger is permission, not a command: the holder starts
+its lane change at the first tick after it from which the geometry is
+reachable within 85% of its limits (4 m/s² accelerating, 7 m/s² braking), and
+until then keeps getting ready for the earliest start that is. It gets there
+with a two-phase acceleration profile (switch time chosen to minimise peak
+acceleration), re-solved every tick against the ego's current state; it never
+matches the ego's speed to wait. If no start within 15 s is reachable it closes
+on the spot and keeps looking, and another actor that can make it takes the
+role. The report records when the trigger fired, when the lane change started,
+and the measured miss. Traffic yields to the
+holder through the existing collision directive. The report's `orchestration`
+block carries the request, the measurement, the per-actor score table and every
+event.
 
 ## 6. Grading
 
@@ -411,7 +393,7 @@ HUD, the summary line and the JSON report:
 
 | mode | success |
 |---|---|
-| `cutin` | the cut-in **merged** (not abandoned) and nothing hit the ego |
+| `cutin` | the cut-in was **staged as asked**: the actor entered the ego's lane within 0.5 m of the requested gap and 1.0 m/s of the requested relative speed. What the ego then did is reported beside it as `collision`, `near_miss` (TTC after the cut-in below 1.5 s) or `safe` |
 | `hard_brake` | the ego got **past the slow lead** without a collision |
 | `overtake` | the ego got **past the blocker**, **returned to its lane**, and hit nothing |
 

@@ -534,34 +534,15 @@ def cast_roles(actors: List[se.Actor], ego_pose: se.Pose, lane_width: float,
 # Closed-loop cut-in (moved from drive.orchestrate_cutin)
 # --------------------------------------------------------------------------- #
 def apply_closed_loop_cutin(actor: se.Actor, ego: Ego, spec: dict,
-                            clock_t: float, heading_deg: Optional[float] = None,
-                            waiting: bool = False,
-                            wait_grace: Optional[float] = None,
-                            grace_active: Optional[bool] = None
+                            clock_t: float, heading_deg: Optional[float] = None
                             ) -> Tuple[str, str]:
     """Replan `actor` toward the live ego-relative pin.
 
     Returns (status, message) where status is one of:
-      'chasing' | 'waiting' | 'merged' | 'abandoned'
+      'chasing' | 'merged' | 'abandoned'
     Mutates actor.start / actor.maneuvers in place.  A merged actor returns to
     its own nominal cruise speed (verifier rule 4); an unsuccessful cut-in
     does the same and keeps driving straight.
-
-    `waiting` is set by the caller when it has decided this actor cannot reach
-    the pin right now AND no other actor is a better candidate for the role
-    (`HighwayClosedLoop._recast_if_hopeless`). The actor then holds its
-    adjacent lane at a wait speed instead of chasing. A waiting actor keeps
-    the role: only 'merged' and 'abandoned' are terminal, so callers that do
-    not pass `waiting` behave exactly as before.
-
-    `grace_active` says whether the extended deadline is in force, and it is
-    deliberately SEPARATE from `waiting`: the grace is earned by having waited
-    and then kept for the rest of the attempt. Tying it to `waiting` alone
-    made the wait self-defeating -- a holder that waited 1.8s, resumed the
-    chase at t=6.65 with the pin finally in reach, and was abandoned at the
-    authored t=7.0 anyway, 0.35s later. Time spent waiting has to be credited
-    to the attempt, not deducted from it. Defaults to `waiting` when None so
-    the older two-argument call still behaves sensibly.
     """
     along = float(spec.get("along", 1.0))
     # keep the merge station inside the verifier's 10 m ahead window
@@ -582,35 +563,13 @@ def apply_closed_loop_cutin(actor: se.Actor, ego: Ego, spec: dict,
                 f"cut-in merged — back to cruise {v_nom:.1f} m/s")
 
     t_rem = se.closed_loop_cutin_horizon(spec, clock_t)
-    # A holder that has waited is allowed past the authored deadline, by the
-    # bounded grace and no further -- whether it is waiting at this instant or
-    # back to chasing. `spec['t']` itself is never touched, so the report and
-    # the verifier still see the deadline the scenario asked for.
-    if (waiting if grace_active is None else grace_active):
-        t_rem = se.cutin_wait_horizon(spec, clock_t, grace=wait_grace)
     if t_rem <= 0.0:
         v_nom = se.actor_cruise_speed(actor)
         actor.start = start
         actor.maneuvers = se.cruise_plan(start, v_nom)
-        waited = (" after waiting" if waiting else "")
-        # Unreachable without a deadline -- `closed_loop_cutin_horizon`
-        # returns the rolling chase horizon when `t` is None -- but the
-        # message must not crash if a caller gets here another way.
-        dl = spec.get("t", None)
-        when = f" — past t={float(dl):.1f}s" if dl is not None else ""
         return ("abandoned",
-                f"cut-in abandoned{waited}{when}, "
+                f"cut-in abandoned — past t={float(spec['t']):.1f}s, "
                 f"back to cruise {v_nom:.1f} m/s")
-
-    if waiting:
-        # Hold the adjacent lane and ease toward the pin. No lane change: the
-        # merge starts only once it can be finished.
-        actor.start = start
-        actor.maneuvers = se.solve_cutin_wait(start, wx, wy, ego.v, tail=30.0)
-        v_wait = actor.maneuvers[0].intercept
-        return ("waiting",
-                f"actor {actor.id} waits for the pin @ t={clock_t:.1f}s "
-                f"-> {v_wait:.1f} m/s (holds the role)")
 
     actor.start = start
     actor.maneuvers = se.solve_closed_loop_cutin(
@@ -655,23 +614,6 @@ class CutinOrchestrator:
         self.msg = "role casting…"
         self.n_interventions = 0
         self.flash = 0
-        #: set by the caller when the holder cannot reach the pin now and no
-        #: other actor is a better candidate — it then waits instead of
-        #: abandoning. See `apply_closed_loop_cutin`.
-        self.waiting = False
-        #: seconds past `spec.t` a waiting holder may keep trying; None takes
-        #: `spec['wait']`, which defaults to `se.CUTIN_WAIT_GRACE_S`.
-        self.wait_grace_s: Optional[float] = None
-        #: cumulative time spent waiting, and whether the merge landed only
-        #: because of the grace. Both are reported so a metric can tell a
-        #: merge-on-time from a merge-after-a-wait.
-        self.waited_s = 0.0
-        self.merged_after_deadline = False
-        #: True once the holder has waited at all. The grace stays in force
-        #: for the rest of the attempt, so waiting cannot cost the holder the
-        #: deadline it waited for.
-        self.wait_used = False
-        self._wait_since: Optional[float] = None
 
     def cast(self, actors: List[se.Actor], ego: Ego, lane_width: float,
              sticky: bool = True) -> List[Casting]:
@@ -707,35 +649,14 @@ class CutinOrchestrator:
                 a.id, a.start[2] if len(a.start) > 2 else 90.0)
             role = self.roles.get(a.id, ROLE_NOMINAL)
             if role == ROLE_CUTIN and not self.committed:
-                status, msg = apply_closed_loop_cutin(
-                    a, ego, self.spec, clock_t, heading_deg=hd,
-                    waiting=self.waiting, wait_grace=self.wait_grace_s,
-                    grace_active=(self.waiting or self.wait_used))
+                status, msg = apply_closed_loop_cutin(a, ego, self.spec,
+                                                      clock_t, heading_deg=hd)
                 self.msg = msg
-                if status == "waiting":
-                    self.wait_used = True
-                    if self._wait_since is None:
-                        self._wait_since = clock_t
-                        self.n_interventions += 1
-                        self.flash = 8
-                    self.waited_s = max(0.0, clock_t - self._wait_since)
-                elif self._wait_since is not None:
-                    # stopped waiting: either the pin came back within reach
-                    # or the run is over. Keep the total either way.
-                    self.waited_s = max(self.waited_s,
-                                        clock_t - self._wait_since)
-                    self._wait_since = None
                 if status in ("merged", "abandoned"):
                     self.committed = True
                     self.outcome = status
                     self.flash = 10
                     self.n_interventions += 1
-                    if (status == "merged"
-                            and se.closed_loop_cutin_horizon(self.spec,
-                                                             clock_t) <= 0.0):
-                        # merged only because the wait bought it time; the
-                        # authored deadline had already passed
-                        self.merged_after_deadline = True
             else:
                 # committed cut-in actor (or never cast) → cruise. Only a
                 # *merged* actor matches the ego; everyone else (including an

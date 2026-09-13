@@ -21,6 +21,7 @@ The loop, per step:
 from __future__ import annotations
 
 import argparse
+import copy
 import datetime as _dt
 import json
 import math
@@ -38,11 +39,19 @@ from carla_port.carla_sync import (HEADING_MODES, HEADING_MOTION, KINEMATIC,
                                    sample_script_state, world_states)
 
 from . import scenarios as sc_mod
-from .closed_loop import DT_TICK, HighwayClosedLoop, cutin_spec_of
+from .closed_loop import DT_TICK, HighwayClosedLoop
+
+#: How close the measured cut-in must come to the request to count as staged.
+CUTIN_GAP_TOL_M = 0.5
+CUTIN_REL_SPEED_TOL_MPS = 1.0
+#: Minimum TTC after the cut-in below which the ego's outcome is a near miss.
+CUTIN_NEAR_MISS_TTC_S = 1.5
 from .highway_ego import (DELTA_MAX, EGO_LENGTH, EGO_WIDTH, IDM_V0,
                           IDM_V0_CUTIN, V_MAX, Ego, HighwayEgoPolicy)
 from .highway_map import FORWARD_HEADING, HighwayFrame
 from .script_bridge import DT, se
+
+import cutin_director as cd                    # noqa: E402  (after the script layer)
 
 BICYCLE = "bicycle"
 PHYSICS_EGO = "physics"
@@ -292,8 +301,13 @@ class RunConfig:
     #: deciding a conflict happened (IDM_LANE_TOL's role, one lane wide)
     lane_conflict_m: float = 2.2
     cruise: float = 12.0
-    cutin_at: Optional[float] = None   # hold the cut-in off until this time
-    cutin_along: Optional[float] = None  # override the pin distance, m ahead
+    cutin_at: Optional[float] = None     # deprecated: --trigger-time
+    cutin_along: Optional[float] = None  # deprecated: --gap (centre-to-centre)
+    #: cut-in parameters from the command line (trigger, gap, relative speed,
+    #: mode, actors, spawn seed); see cutin_director.add_cli_arguments
+    cutin_overrides: Optional[object] = None
+    #: where to write every vehicle's driven trajectory; default beside --report
+    trajectories: Optional[str] = None
     # outputs
     video: Optional[str] = None
     video_dir: str = DEFAULT_VIDEO_DIR
@@ -546,6 +560,23 @@ class HighwayRun:
         self.notes.extend(notes)
         for n in notes:
             self._log(f"  ! {n}")
+        self.director = None
+        want_cast = (spec.casting if cfg.casting is None else bool(cfg.casting))
+        if cfg.scenario == sc_mod.CUTIN and want_cast:
+            ov = copy.deepcopy(cfg.cutin_overrides) or cd.CutinOverrides()
+            if cfg.cutin_at is not None and cfg.cutin_at >= 0 and ov.trigger_time is None:
+                ov.trigger_time = float(cfg.cutin_at)
+                self.notes.append("--cutin-at is deprecated; read as --trigger-time")
+            if cfg.cutin_along is not None and ov.gap_m is None:
+                ov.gap_m = max(0.2, float(cfg.cutin_along) - 4.5)
+                self.notes.append("--cutin-along is deprecated; read as --gap "
+                                  f"{ov.gap_m:.2f} m bumper to bumper")
+            path = cfg.base or sc_mod.scenario_path(cfg.scenario)
+            # CARLA draws background headings from their motion, not the
+            # script's yaw profile (carla_port/carla_sync.py)
+            self.director = cd.load_director(path, self.scenario, ov,
+                                             ego_id=str(cfg.ego),
+                                             heading=cd.HEADING_MOTION)
         ego_actor, background = sc_mod.split_ego(self.scenario, cfg.ego)
         self.ego_actor = ego_actor
         self._ego_start_y = ego_actor.start[1]
@@ -598,52 +629,23 @@ class HighwayRun:
         # into the script actors, so this is the geometry that collides.
         self._extents = {str(a.id): (float(a.length), float(a.width))
                          for a in self.scenario.actors}
+        if self.director is not None:
+            self.director.dims.update(self._extents)
 
         self.collisions = CollisionMonitor(self.world, self.bindings)
         self._log(f"attached {self.collisions.attach()} collision sensors")
 
         # ---- orchestration ---- #
-        # A negative --cutin-at means "no delay": run the scenario on its own
-        # authored deadline. That is the default, and it has to be, because
-        # holding the cut-in off is not free. The actors cruise nominally while
-        # the orchestrator is asleep, and on `scenario_cutin` they are faster
-        # than the ego — so six seconds of silence puts every candidate 30-50 m
-        # ahead of the pin, and the run then measures nothing but the
-        # orchestrator failing to find anyone who can fall back that far.
-        cutin_at = cfg.cutin_at
-        if cutin_at is None:
-            # Authored in the scenario: `cutin: {at: 3.0, ...}`. The delay is a
-            # property of the SCENARIO -- it is what makes the merge something
-            # that happens rather than something underway at frame 0 -- so it
-            # belongs beside the deadline it is measured against, not only in
-            # the launcher that used to carry it. --cutin-at still wins, so a
-            # sweep can vary it without editing the file.
-            authored = (cutin_spec_of(self.scenario) or {}).get("at")
-            if authored is not None:
-                cutin_at = float(authored)
-                self._log(f"cut-in delay {cutin_at:.1f}s from the scenario "
-                          f"(`cutin.at`)")
-        if cutin_at is not None and cutin_at < 0:
-            cutin_at = None
+        ego_dims = self._extents.get(str(cfg.ego), (EGO_LENGTH, 2.0))
         self.loop = HighwayClosedLoop(self.frame, background, spec,
-                                      casting=cfg.casting, cruise=cfg.cruise,
-                                      cutin_at=cutin_at,
-                                      cutin_along=cfg.cutin_along)
-        if cutin_at is not None and self.loop.orch is not None:
-            # `cutin_at` is the EARLIEST time, not the merge instant, and the
-            # CARLA path runs without a deadline -- the proximity gate decides
-            # when the merge happens. `spec['t']` is None here, so this log
-            # line reports the gate rather than a `float(None)`.
-            spec_now = self.loop.orch.spec
-            deadline = spec_now.get("t", None)
-            if deadline is None:
-                hw = float(spec_now.get("headway", se.CUTIN_NEAR_HEADWAY_S))
-                self._log(f"cut-in may begin after t={cutin_at:.1f}s, merges "
-                          f"once the ego is within {hw:.1f}s headway "
-                          f"(no deadline)")
-            else:
-                self._log(f"cut-in starts at t={cutin_at:.1f}s "
-                          f"(merge by t={float(deadline):.1f}s)")
+                                      casting=cfg.casting,
+                                      director=self.director,
+                                      ego_dims=ego_dims)
+        self.trajlog = cd.TrajectoryLog(self.scenario.map,
+                                        rate_hz=1.0 / max(cfg.traj_dt, 1e-3))
+        if self.director is not None:
+            for ev in self.director.events:
+                self._log(f"  {ev['text']}")
         self._log(f"orchestration: {self.loop.status}")
         self._check_cutin_clearance(ego_actor, background)
 
@@ -736,46 +738,23 @@ class HighwayRun:
     #: the corner of the merging car passes closer than the straight-line
     #: bumper gap suggests; the threshold has to sit above the clearance that
     #: was observed to fail.
-    CUTIN_TIGHT_CLEARANCE = 2.5
+    CUTIN_TIGHT_CLEARANCE = 1.0
 
     def _check_cutin_clearance(self, ego_actor, background) -> None:
-        """Say up front how much room the authored cut-in pin actually leaves.
+        """Say up front what the requested cut-in leaves for the ego.
 
-        `cutin: {along: 6.0}` places the merging car 6 m ahead of the ego
-        CENTRE TO CENTRE. In the script world the bodies are a nominal
-        4.5 x 2.0 m and nothing enforces contact anyway — pygame has no physics,
-        so a pin that overlaps is simply drawn overlapping. Here
-        `spawn_bindings(adopt_carla_extents=True)` replaces those numbers with
-        the spawned vehicle's real bounding box, and CARLA's collision sensors
-        do enforce it. A pin that was comfortable on screen can then leave
-        about a metre of bumper gap, and the merge grazes the ego.
-
-        That is a property of the scenario meeting real geometry, not a fault
-        in the port or the ego policy — the scripted ego from the authored YAML
-        touches too. It is worth saying out loud, because otherwise the run
-        looks like the ego policy failed.
+        `gap_m` is already bumper to bumper, measured against the spawned
+        vehicles' real extents, so a small gap is the scenario asking for a
+        near miss -- worth saying, so a collision is not read as a port fault.
         """
-        if self.loop.orch is None:
+        d = self.director
+        if d is None:
             return
-        spec = getattr(self.loop.orch, "spec", None) or {}
-        along = abs(float(spec.get("along", 0.0)))
-        lat = abs(float(spec.get("lat", 0.0)))
-        if lat > 0.5 * self.frame.lane_width:
-            return                     # the pin is not in the ego's lane
-        ego_len = float(getattr(ego_actor, "length", EGO_LENGTH))
-        # the role can be cast to any of them, so take the worst case
-        others = [float(getattr(a, "length", 4.5)) for a in background.actors]
-        longest = max(others) if others else 4.5
-        clearance = along - (ego_len + longest) / 2.0
-        msg = (f"cut-in pin is along={along:.1f} m centre-to-centre; with the "
-               f"spawned bodies ({ego_len:.1f} m ego, up to {longest:.1f} m "
-               f"actor) that is {clearance:.2f} m bumper to bumper")
-        if clearance < self.CUTIN_TIGHT_CLEARANCE:
-            self.notes.append(
-                msg + " — contact during the merge is expected here, and is "
-                "the scenario's geometry meeting real vehicle extents, not "
-                "the ego policy failing. Widen `along` in the scenario YAML "
-                "to give the merge room.")
+        msg = (f"cut-in asks for {d.spec.gap_m:.2f} m bumper to bumper at "
+               f"{d.spec.rel_speed_mps:+.1f} m/s relative speed")
+        if d.spec.gap_m < self.CUTIN_TIGHT_CLEARANCE:
+            self.notes.append(msg + " -- contact is a plausible outcome by "
+                              "design, not a port fault")
         self._log(f"  {msg}")
 
     def _build_ego(self, ego_actor) -> None:
@@ -989,6 +968,7 @@ class HighwayRun:
                 self._log(f"  t={self.t_sim:6.2f}  {rc}")
             self._track(states)
             self._sample_traj()
+            self._observe_cutin()
             if self.recorder is not None and self.cfg.verbose:
                 self._log_follow()
             if self.recorder is not None:
@@ -997,6 +977,36 @@ class HighwayRun:
                     vision=(self.ego_driver.vision()
                             if self.ego_driver is not None else None))
         return self.report()
+
+    def _observe_cutin(self) -> None:
+        """Every step: the vehicles as CARLA simulated them, to the director
+        (which detects the cut-in instant) and to the trajectory log."""
+        if self.bindings is None:
+            return
+        states: Dict[str, Tuple[float, float, float, float]] = {}
+        for b in self.bindings:
+            aid = str(b.script_actor_id)
+            try:
+                st = carla_actor_to_script_state(aid, b.carla_actor, self.frame)
+            except RuntimeError:
+                continue
+            states[aid] = (st.x, st.y, st.heading % 360.0, st.speed)
+        ego_id = str(self.cfg.ego)
+        if ego_id not in states and self._ego_xyv is not None:
+            ex, ey, ev = self._ego_xyv
+            hd = (self.policy.heading_deg if self.policy is not None
+                  else FORWARD_HEADING)
+            states[ego_id] = (ex, ey, hd, ev)
+        if ego_id not in states:
+            return
+        ex, ey, eh, ev = states[ego_id]
+        others = {k: v for k, v in states.items() if k != ego_id}
+        self.loop.observe(Ego(x=ex, y=ey, theta=math.radians(eh), v=ev),
+                          self.t_sim, others)
+        d = self.director
+        roles = {k: (d.role_of(k) if d is not None else "traffic") for k in others}
+        roles[ego_id] = "ego"
+        self.trajlog.record(self.t_sim, states, roles, self._extents)
 
     def _read_ego(self) -> None:
         """Publish where the ego is this step, whoever is driving it.
@@ -1264,7 +1274,7 @@ class HighwayRun:
             # re-deriving the merge from the trajectories.
             out["cutin"] = {
                 "performer": (str(holder) if holder is not None else None),
-                "success": self.loop.outcome == "merged",
+                "success": self.loop.merged,
                 "outcome": self.loop.outcome,
                 "t_commit": (round(self.loop.t_commit, 3)
                              if self.loop.t_commit is not None else None),
@@ -1376,10 +1386,35 @@ class HighwayRun:
         hit = bool(self.ego_collisions())
         checks: Dict[str, bool] = {"no_hit": not hit}
         if mode == sc_mod.CUTIN:
-            out = self.loop.outcome
-            checks["merged"] = (out == "merged")
-            success = (out == "merged") and not hit
-            detail = f"cut-in {out or 'undecided'}"
+            # Success is the STAGING: did the cut-in happen at the requested
+            # gap and relative speed. What the ego then did -- collide, near
+            # miss, or stay safe -- is the outcome under test, reported beside
+            # it, not folded into it.
+            d = self.director
+            c = d.crossing if d is not None else None
+            checks["triggered"] = bool(d is not None and d.t_trigger is not None)
+            checks["cut_in"] = c is not None
+            checks["gap_on_target"] = bool(
+                c and abs(c["gap_error_m"]) <= CUTIN_GAP_TOL_M)
+            checks["rel_speed_on_target"] = bool(
+                c and abs(c["rel_speed_error_mps"]) <= CUTIN_REL_SPEED_TOL_MPS)
+            success = (checks["cut_in"] and checks["gap_on_target"]
+                       and checks["rel_speed_on_target"])
+            post = d.post if d is not None else {}
+            ego_outcome = ("collision" if hit else
+                           ("near_miss" if (post.get("min_ttc_s") is not None
+                                            and post["min_ttc_s"] < CUTIN_NEAR_MISS_TTC_S)
+                            else "safe"))
+            if c is None:
+                detail = f"cut-in {d.outcome if d is not None else 'not cast'}"
+            else:
+                waited = d.summary().get("ready_wait_s")
+                detail = (f"cut-in at gap {c['gap_m']:.2f} m (asked "
+                          f"{d.spec.gap_m:g}), rel speed {c['rel_speed_mps']:+.2f} "
+                          f"m/s (asked {d.spec.rel_speed_mps:+g})"
+                          + (f", lane change {waited:.2f} s after the trigger"
+                             if waited else "")
+                          + f"; ego outcome: {ego_outcome}")
         elif mode == sc_mod.HARD_BRAKE:
             lead = self.interactions.get("1")
             passed = bool(lead and lead.passed)
@@ -1477,6 +1512,13 @@ class HighwayRun:
         if self.ego_driver is not None:
             rep["ego_driver"] = self.ego_driver.metadata()
         return rep
+
+    def write_trajectories(self, path: str) -> None:
+        trajlog = getattr(self, "trajlog", None)
+        if trajlog is None:
+            return
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        trajlog.write(path, self.director, source="carla_highway")
 
     def teardown(self) -> None:
         if self.ego_driver is not None:
@@ -1628,16 +1670,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="force cut-in role casting off")
     p.add_argument("--cruise", type=float, default=12.0)
     p.add_argument("--cutin-at", type=float, default=None, dest="cutin_at",
-                   help="hold cut-in orchestration off until this sim time, "
-                        "moving the merge deadline ~lc_duration later. Default "
-                        "and any negative value: no delay, use the deadline "
-                        "the scenario YAML authored")
+                   help="deprecated: use --trigger-time")
     p.add_argument("--cutin-along", type=float, default=None, dest="cutin_along",
-                   help="override the cut-in pin distance, m ahead of the ego "
-                        "centre-to-centre (YAML default 6.0). Real CARLA bodies "
-                        "are longer than the 4.5 m the scenario assumes, so the "
-                        "authored pin leaves ~1.5 m bumper to bumper; anything "
-                        "up to 10 m still counts as a merge and still verifies")
+                   help="deprecated: use --gap (this one is centre to centre)")
+    cd.add_cli_arguments(p)
+    p.add_argument("--trajectories", default=None,
+                   help="write every vehicle's driven trajectory here (JSON); "
+                        "default: trajectories.json beside --report")
     # No `choices=`: besides the shortcuts, this accepts any policy the harness
     # declares in configs/policy/<name>.yaml -- the analytic IDM family and
     # anything living in its own repository -- which argparse cannot enumerate
@@ -1757,6 +1796,8 @@ def config_from_args(args) -> RunConfig:
         lane_change=args.lane_change,
         casting=args.casting, cruise=args.cruise, cutin_at=args.cutin_at,
         cutin_along=args.cutin_along,
+        cutin_overrides=cd.overrides_from_args(args),
+        trajectories=args.trajectories,
         policy=args.policy, policy_request=args.policy_request,
         policy_hz=args.policy_hz,
         trace_rate_hz=args.trace_rate_hz,
@@ -1783,6 +1824,12 @@ def main(argv=None) -> int:
     finally:
         run.teardown()
     print(summarize(rep))
+    tpath = cfg.trajectories or (
+        os.path.join(os.path.dirname(os.path.abspath(cfg.report)), "trajectories.json")
+        if cfg.report else None)
+    if tpath:
+        run.write_trajectories(tpath)
+        print(f"  trajectories {tpath}")
     if cfg.report:
         os.makedirs(os.path.dirname(os.path.abspath(cfg.report)) or ".",
                     exist_ok=True)

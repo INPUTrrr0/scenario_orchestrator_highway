@@ -100,6 +100,12 @@ def map_point_coords(name: str, lane_width: float) -> Tuple[float, float]:
             "cross_SE": (d, -d), "cross_SW": (-d, -d)}[name]
 
 
+def _smoothstep(u: float) -> float:
+    """3u^2 - 2u^3 on [0, 1]: the lateral profile of every lane change."""
+    u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+    return u * u * (3.0 - 2.0 * u)
+
+
 def clamp(v: float, lo: float, hi: float) -> float:
     return lo if v < lo else hi if v > hi else v
 
@@ -125,6 +131,15 @@ class Maneuver:
     angle: float = 90.0
     # lane_change: lateral displacement in meters (+left / −right of heading)
     lateral_offset: float = 3.5
+    # lane_change: which slice of the lateral smoothstep this maneuver covers.
+    # `lateral_offset` is the FULL lane change; the maneuver moves the actor
+    # from smoothstep(lat_u0) to smoothstep(lat_u1) of it. The defaults (0, 1)
+    # are one whole lane change, exactly as before. A plan re-based partway
+    # through a lane change continues the SAME curve with (u_now, 1) instead
+    # of restarting a fresh smoothstep from zero lateral velocity, which is
+    # what made re-planned lane changes crawl.
+    lat_u0: float = 0.0
+    lat_u1: float = 1.0
 
     @property
     def curve_kind(self) -> str:
@@ -161,11 +176,12 @@ class Maneuver:
             return (sx + s * math.cos(h), sy + s * math.sin(h), sh)
         if self.type == "lane_change":
             frac = clamp(t / max(1e-6, self.duration), 0.0, 1.0)
-            s_lat = frac * frac * (3.0 - 2.0 * frac)
+            u = self.lat_u0 + (self.lat_u1 - self.lat_u0) * frac
+            s_lat = _smoothstep(u) - _smoothstep(self.lat_u0)
             along = self.distance(t)
             lat = self.lateral_offset * s_lat
             nx, ny = -math.sin(h), math.cos(h)
-            yaw = (12.0 if self.lateral_offset >= 0 else -12.0) * math.sin(math.pi * frac)
+            yaw = (12.0 if self.lateral_offset >= 0 else -12.0) * math.sin(math.pi * u)
             return (sx + along * math.cos(h) + lat * nx,
                     sy + along * math.sin(h) + lat * ny,
                     sh + yaw)
@@ -185,7 +201,15 @@ class Maneuver:
         return (sx, sy, sh)
 
     def end_pose(self, start: Pose) -> Pose:
-        return self.pose_at(start, self.duration)
+        p = self.pose_at(start, self.duration)
+        if self.type == "lane_change":
+            # Hand the NEXT segment the plan heading, not the temporary yaw.
+            # A whole lane change ends at u=1 where the yaw is zero, so this
+            # changes nothing for it; a slice ending mid-change (lat_u1 < 1)
+            # would otherwise rotate the following segment's frame by the
+            # yaw and misplace every metre it drives.
+            return (p[0], p[1], start[2])
+        return p
 
     def exit_speed(self) -> float:
         return self.velocity_at(self.duration)
@@ -196,6 +220,9 @@ class Maneuver:
             d["curve"] = {"v0": round(self.intercept, 4), "accel": round(self.slope, 4)}
             if self.type == "lane_change":
                 d["lateral_offset"] = round(self.lateral_offset, 4)
+                if self.lat_u0 != 0.0 or self.lat_u1 != 1.0:
+                    d["lat_u0"] = round(self.lat_u0, 6)
+                    d["lat_u1"] = round(self.lat_u1, 6)
         elif self.type in TURN_TYPES:
             d["radius"] = round(self.radius, 4)
             d["angle"] = round(self.angle, 4)
@@ -663,11 +690,17 @@ class Scenario:
         st.last_v = v
         return pose, v
 
-    def simulate(self) -> None:
+    def simulate(self, horizon: Optional[float] = None) -> None:
+        """Cache every actor's trajectory. `horizon` caps how many seconds are
+        simulated: a closed-loop host re-plans every tick and only samples the
+        next moments, and integrating a minute of plan tail twice per tick was
+        most of the cut-in director's cost."""
         for a in self.actors:
             a.compute_schedule()
             a.traj, a.speeds = [], []
         period = self.period
+        if horizon is not None:
+            period = min(period, max(DT, horizon))
         n = int(math.ceil(period / DT)) + 1
         states = [_SimState(a) for a in self.actors]
         # initial snapshot (tick 0 observations = initial world state)
@@ -733,6 +766,8 @@ def _parse_segment(md: dict, default_lane_width: float = 3.5) -> Segment:
         radius=float(md.get("radius", 5.0)),
         angle=float(md.get("angle", 90.0)),
         lateral_offset=float(md.get("lateral_offset", default_lane_width)),
+        lat_u0=float(md.get("lat_u0", 0.0)),
+        lat_u1=float(md.get("lat_u1", 1.0)),
     )
 
 
@@ -851,101 +886,16 @@ def world_to_ego_offset(ego_pose: Pose, wx: float, wy: float
 CUTIN_FEASIBLE_MIN_V = 2.0     # absolute floor for a viable chase speed
 CUTIN_FEASIBLE_EGO_FRAC = 0.6  # ...and no slower than this fraction of ego_v:
 #                                crawling far below the ego's speed to let the
-#                                pin catch up is not a cut-in *by itself* — but
-#                                see the wait below: an infeasible chase now
-#                                drops the role only if somebody else can take
-#                                it. Otherwise the holder waits at exactly this
-#                                kind of speed until the pin is reachable again.
-
-# How long past the authored deadline `spec.t` a WAITING holder may keep
-# trying. The wait exists because an infeasible chase is usually the ego's
-# doing -- it braked, or (with a learned policy) stalled at spawn -- and
-# dropping the only candidate turns a transient into a failed scenario. It is
-# bounded on purpose: an unbounded wait would let every cut-in eventually
-# succeed and the `merged`/`abandoned` outcome would stop measuring anything.
-# `cutin: {wait: 0}` in the scenario YAML restores the hard deadline.
-CUTIN_WAIT_GRACE_S = 4.0
-# Soft horizon the wait speed is solved against, in place of the shrinking
-# deadline. Large enough that the holder eases toward the pin rather than
-# lunging at it, small enough to still be closing.
-CUTIN_WAIT_TAU_S = 3.0
-# Hysteresis on the wait. The state is re-decided every orchestration tick
-# (10 Hz), so a holder sitting on the feasibility boundary will chatter unless
-# leaving the wait is HARDER than entering it: require the required speed to
-# be this far inside the band before resuming the chase, and hold the wait for
-# at least this long. Without the margin the holder flipped wait/chase on
-# every single tick -- 17 transitions in four seconds -- and the lane change,
-# which only the chase plans, never survived long enough to finish.
-CUTIN_WAIT_RESUME_MARGIN = 1.0     # m/s inside the feasible band
-CUTIN_WAIT_MIN_DWELL_S = 0.3       # minimum time spent waiting
-
-# --- when the cut-in may happen -------------------------------------------- #
-# `cutin: {at: N}` is an EARLIEST time, not an instant: the cut-in happens
-# some time AFTER N seconds, once the ego is close enough to be cut in front
-# of. Before this, `at` woke the orchestrator at N and it merged immediately
-# from wherever the actor happened to be -- 20 m ahead of the ego counts as a
-# lane change on an empty road, not a cut-in.
-#
-# "Close enough" is a TIME headway: the ego is this many seconds behind the
-# actor at its current speed. Time rather than distance so the same scenario
-# stays honest across ego speeds -- 10 m is a yawn at 5 m/s and a near miss
-# at 14 m/s.
-CUTIN_NEAR_HEADWAY_S = 2.0
-# ...but headway is gap/speed, which is infinite for a stopped ego, and a
-# learned ego that stalls at spawn (plant2 does, for ~2.5 s) would hold the
-# gate shut for ever. The denominator therefore has a floor, which also gives
-# the gate an absolute minimum reach of CUTIN_NEAR_HEADWAY_S * this.
-#
-# That reach has to CLEAR `CUTIN_NEAR_MIN_GAP_M`, or the two bounds meet and
-# the admissible window is empty: at 3.0 m/s the reach was 2.0 * 3.0 = 6.0 m
-# and the floor is also 6.0 m, so a slow ego could never be cut in front of
-# at all -- a single-point window. At 5.0 m/s the reach is 10 m and the
-# window is [6, 10] m. `test_gate_window_is_never_empty` pins the relation.
-CUTIN_NEAR_SPEED_FLOOR = 5.0
-# The gate needs a FLOOR as well as a ceiling. With only "within N seconds"
-# it opened on the abeam scenario at a 3.3 m centre-to-centre gap -- inside
-# the two bodies (4.89 m ego, up to 4.2 m actor), where a lane change is a
-# side-swipe rather than a cut-in. That run ended with min gap 0.0 m and
-# `no_hit-`.
-#
-# The floor is HALF THE SUM OF THE LENGTHS and nothing more. It was briefly
-# 6.0 m, and coupled as `max(along, 6.0)`, which deadlocked: the wait law
-# (`solve_cutin_wait`) has its fixed point AT the pin station, so an actor
-# waiting for a 5 m pin converges to 5 m and stops there -- below a 6 m floor
-# the gate could never open, and the abeam run waited out the whole 12.5 s
-# with `outcome: None`. The gate's opening condition has to be REACHABLE by
-# the wait that precedes it. A 6 m floor also silently vetoed the scenario's
-# own intent: `along: 5.0` is 0.45 m bumper to bumper by design, and the
-# runner prints a warning saying contact is expected there.
-CUTIN_NEAR_MIN_GAP_M = 4.6
-# ...and the gate may open slightly before the pin station so it is not a
-# knife-edge against the wait's asymptote.
-CUTIN_NEAR_PIN_TOL_M = 1.0
-# Rolling horizon the chase is solved against when the scenario has no
-# deadline (`t: null`). The deadline used to double as the chase horizon, so
-# removing it leaves the speed law -- v = ego_v + along_err/horizon -- without
-# a denominator. A fixed horizon is better behaved than a shrinking one
-# anyway: it never lunges as the clock runs out.
-CUTIN_CHASE_TAU_S = 2.0
+#                                pin catch up is not a cut-in — drop the role
 
 
 def live_cutin_required_speed(actor_pose: Pose, ego_x: float, ego_y: float,
                               ego_theta: float, ego_v: float,
-                              spec: dict, now: float,
-                              grace: Optional[float] = None
-                              ) -> Tuple[float, float]:
+                              spec: dict, now: float) -> Tuple[float, float]:
     """(required cruise speed, t_rem) for `actor_pose` to reach the live
     ego-relative pin by the deadline `spec.t` (same math as the chase solver:
-    the pin advances at ~ego_v, so v = ego_v + along_error / t_rem).
-
-    `grace` is for a holder that is already WAITING: its deadline has been
-    extended, so judging it against the hard `spec.t` would answer a question
-    nobody asked. Pass the grace it is waiting under and the horizon is the
-    extended one. Callers that are not waiting pass None and get the deadline
-    behaviour unchanged.
-    """
-    t_rem = (closed_loop_cutin_horizon(spec, now) if grace is None
-             else cutin_wait_horizon(spec, now, grace=grace))
+    the pin advances at ~ego_v, so v = ego_v + along_error / t_rem)."""
+    t_rem = closed_loop_cutin_horizon(spec, now)
     wx, wy = live_cutin_pin(ego_x, ego_y, ego_theta,
                             float(spec.get("along", 1.0)),
                             float(spec.get("lat", 0.0)))
@@ -956,42 +906,16 @@ def live_cutin_required_speed(actor_pose: Pose, ego_x: float, ego_y: float,
 
 def live_cutin_feasible(actor_pose: Pose, ego_x: float, ego_y: float,
                         ego_theta: float, ego_v: float,
-                        spec: dict, now: float,
-                        grace: Optional[float] = None,
-                        margin: float = 0.0) -> bool:
+                        spec: dict, now: float) -> bool:
     """Can this actor still make the cut-in?  False when the deadline is (all
     but) gone or the required speed is outside what a car would do — e.g. the
-    ego braked hard and the pin fell hopelessly far behind the actor.
-
-    `grace` extends the horizon for a holder that is entitled to wait; see
-    `live_cutin_required_speed`. Without it a waiting holder can never be
-    judged feasible again once `spec.t` has passed, so the wait becomes a
-    one-way door: the actor reaches the pin's station, is still refused the
-    lane change, and abandons from on top of the pin.
-
-    `margin` (m/s) tightens the acceptable speed band at both ends. It exists
-    so that RESUMING a chase can be made harder than entering the wait --
-    the same `grace` on both sides but a margin on the way out. Asking an
-    easier question to leave than to enter is what made the holder oscillate
-    at the tick rate.
-    """
+    ego braked hard and the pin fell hopelessly far behind the actor."""
     v_req, t_rem = live_cutin_required_speed(actor_pose, ego_x, ego_y,
-                                             ego_theta, ego_v, spec, now,
-                                             grace=grace)
+                                             ego_theta, ego_v, spec, now)
     if t_rem <= 0.3:
         return False
-    lo = max(CUTIN_FEASIBLE_MIN_V, CUTIN_FEASIBLE_EGO_FRAC * ego_v) + margin
-    return lo <= v_req <= CUTIN_MAX_SPEED - margin
-
-
-def cutin_has_deadline(spec: dict) -> bool:
-    """False when the scenario declines to set a merge deadline (`t: null`).
-
-    A deadline-free cut-in keeps the role until it merges or the run ends;
-    nothing abandons it. The proximity gate, not a clock, decides when the
-    merge happens.
-    """
-    return spec.get("t", None) is not None
+    lo = max(CUTIN_FEASIBLE_MIN_V, CUTIN_FEASIBLE_EGO_FRAC * ego_v)
+    return lo <= v_req <= CUTIN_MAX_SPEED
 
 
 def closed_loop_cutin_horizon(spec: dict, now: float) -> float:
@@ -999,58 +923,9 @@ def closed_loop_cutin_horizon(spec: dict, now: float) -> float:
 
     Returns <= 0 when the deadline has passed — callers should then abandon
     the cut-in (cruise straight) instead of chasing the pin forever.
-
-    With no deadline (`t: null`) there is nothing to run out, so this returns
-    the rolling `CUTIN_CHASE_TAU_S` instead: still a usable horizon for the
-    chase speed law, never negative, so no caller abandons on it.
     """
-    if not cutin_has_deadline(spec):
-        return CUTIN_CHASE_TAU_S
-    t_cut = float(spec["t"])
+    t_cut = float(spec.get("t", now))
     return t_cut - now
-
-
-def cutin_earliest(spec: dict) -> float:
-    """The `at` time: the cut-in may not begin before this."""
-    return max(0.0, float(spec.get("at", 0.0) or 0.0))
-
-
-def cutin_gate_floor(spec: dict) -> float:
-    """Minimum station ahead of the ego at which the merge may begin.
-
-    Never inside the two bodies (`CUTIN_NEAR_MIN_GAP_M`), and never above the
-    pin station the wait converges to -- otherwise the gate is unreachable
-    and the cut-in deadlocks. See the note on `CUTIN_NEAR_MIN_GAP_M`.
-    """
-    along = float(spec.get("along", 0.0) or 0.0)
-    return max(CUTIN_NEAR_MIN_GAP_M, along - CUTIN_NEAR_PIN_TOL_M)
-
-
-def cutin_near_enough(actor_pose: Pose, ego_x: float, ego_y: float,
-                      ego_theta: float, ego_v: float, spec: dict
-                      ) -> Tuple[bool, float, float]:
-    """Is the ego close enough behind the actor for a genuine cut-in?
-
-    Returns (near, gap_m, headway_s) where `gap_m` is the actor's station
-    ahead of the ego along the ego's heading and `headway_s` is that gap in
-    seconds at the ego's current speed (floored — see
-    `CUTIN_NEAR_SPEED_FLOOR`).
-
-    An actor BEHIND the ego is not near-enough-to-cut-in in any useful sense:
-    it has to get ahead first, which is the chase's job, so a negative gap
-    reports not-near with its real (negative) numbers for the log.
-    """
-    fx, fy = math.cos(ego_theta), math.sin(ego_theta)
-    gap = (actor_pose[0] - ego_x) * fx + (actor_pose[1] - ego_y) * fy
-    v = max(float(ego_v), CUTIN_NEAR_SPEED_FLOOR)
-    headway = gap / v
-    limit = float(spec.get("headway", CUTIN_NEAR_HEADWAY_S))
-    # Far enough ahead to turn in without hitting the ego, and close enough
-    # in time to be a cut-in. The floor tracks the pin but stays strictly
-    # below it, so the wait -- whose fixed point IS the pin station -- can
-    # actually reach it.
-    near = gap >= cutin_gate_floor(spec) and headway <= limit
-    return near, gap, headway
 
 
 NOMINAL_CRUISE_T = 8.0     # scripted-playback length of a generated cruise plan
@@ -1119,48 +994,6 @@ def solve_closed_loop_cutin(start: Pose, pin_x: float, pin_y: float,
     plan.append(Maneuver(type="go_straight", duration=float(tail),
                          intercept=max(v, ego_v)))
     return plan
-
-
-def solve_cutin_wait(start: Pose, pin_x: float, pin_y: float,
-                     ego_v: float, tail: float = 30.0) -> List[Maneuver]:
-    """Plan for a holder that cannot reach the pin yet but keeps the role.
-
-    Same longitudinal law as `solve_closed_loop_cutin` -- the pin advances at
-    ~ego_v, so v = ego_v + along_error / horizon -- with two differences that
-    are the whole point of waiting:
-
-      * the horizon is the soft `CUTIN_WAIT_TAU_S` rather than the time left
-        on the deadline, so the speed does not blow up as the deadline runs
-        out; and
-      * NO lane change is planned. The actor stays in its adjacent lane. A
-        cut-in is only allowed to start when it can be finished, and merging
-        alongside an ego that is about to be somewhere else is how the actor
-        ends up beside the ego rather than ahead of it.
-
-    The returned speed is deliberately *not* clamped into the feasible band
-    (`live_cutin_feasible`): dropping below 0.6*ego_v to let the pin catch up
-    is exactly what waiting is for.
-    """
-    sx, sy, sh = start
-    h = math.radians(sh)
-    fx, fy = math.cos(h), math.sin(h)
-    along_err = (pin_x - sx) * fx + (pin_y - sy) * fy
-    v = clamp(ego_v + along_err / CUTIN_WAIT_TAU_S,
-              CUTIN_MIN_SPEED, CUTIN_MAX_SPEED)
-    return [Maneuver(type="go_straight", duration=float(tail), intercept=v)]
-
-
-def cutin_wait_horizon(spec: dict, now: float, grace: Optional[float] = None
-                       ) -> float:
-    """`closed_loop_cutin_horizon` plus the wait grace the spec allows.
-
-    The authored `spec.t` is never mutated -- the report and the verifier keep
-    reading the deadline the scenario asked for -- so the extension lives here
-    and callers that do not wait are unaffected.
-    """
-    g = (float(spec.get("wait", CUTIN_WAIT_GRACE_S))
-         if grace is None else float(grace))
-    return closed_loop_cutin_horizon(spec, now) + max(0.0, g)
 
 
 def solve_cutin_maneuvers(start: Pose, wx: float, wy: float, t_arr: float,
@@ -1530,7 +1363,9 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             capture: Optional[str] = None, fps: int = 30, loops: int = 1,
             snapshot: Optional[str] = None, select_id: Optional[str] = None,
             at_time: float = 0.0, auto_drive: bool = False,
-            on_frame: Optional[callable] = None) -> None:
+            on_frame: Optional[callable] = None,
+            director_factory: Optional[callable] = None,
+            traj_out: Optional[str] = None) -> None:
     """Interactive editor; `capture` records an MP4 headlessly; `snapshot`
     renders one paused frame (optionally with an actor selected) to a PNG.
 
@@ -1538,7 +1373,14 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
       * auto_drive — enter Drive mode immediately on startup.
       * on_frame(snapshot) — called every driving frame with a dict of the
         live state (clock, ego pose+speed, per-actor displayed poses, cut-in /
-        block holders + outcomes).  Return False to end the run."""
+        block holders + outcomes).  Return False to end the run.
+
+    Cut-in orchestration in Drive mode:
+      * director_factory(scenario) -> cutin_director.CutinDirector, built
+        fresh every time Drive is entered. When given, the director owns every
+        non-ego actor while driving -- the same kernel the CARLA runner uses.
+      * traj_out — write every vehicle's driven trajectory there when Drive
+        ends (Esc / F / closing the window)."""
     import pygame
 
     import cutin_orchestrator as co   # role casting: scoring + panel drawing
@@ -1601,6 +1443,9 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
     # "blocked" | "breached" once committed at window end
     block_outcome: Optional[str] = None
     cutin_phase = 0.0                    # time into replanned actors' current plan
+    director = None                      # cutin_director.CutinDirector while driving
+    trajlog = None                       # cutin_director.TrajectoryLog while driving
+    director_msg = ""
     # canonical spawn poses — closed-loop drive mutates Actor.start, so Reset
     # / re-enter Drive must restore from this snapshot (updated on spawn edits)
     spawn_poses: Dict[str, Pose] = {a.id: a.start for a in scenario.actors}
@@ -1981,12 +1826,72 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         # scripted sudden slowdown plays out even in Drive); keys override
         scenario.simulate()
         drive_profile = list(ego.speeds) if ego.speeds else None
+        start_director()
         set_status("DRIVE ON — ego follows its script; WASD/arrows override")
+
+    def start_director() -> None:
+        nonlocal director, trajlog, live_rebase, director_msg
+        director, trajlog, director_msg = None, None, ""
+        if director_factory is None:
+            return
+        import cutin_director as cd
+        for a in scenario.actors:
+            if a.id == "0":
+                continue
+            a.cutin = None
+            a.maneuvers = [Maneuver(type="go_straight", duration=cd.TAIL_S,
+                                    intercept=actor_cruise_speed(a))]
+        live_rebase = {a.id for a in scenario.actors if a.id != "0"}
+        scenario.simulate()
+        director = director_factory(scenario)
+        trajlog = cd.TrajectoryLog(scenario.map, rate_hz=20.0)
+
+    def director_ego():
+        import cutin_director as cd
+        e, ego = live_ego, ego_actor()
+        return cd.EgoState(e["x"], e["y"], math.degrees(e["theta"]) % 360.0,
+                           e["v"], ego.length if ego else 4.5,
+                           ego.width if ego else 2.0)
+
+    def observe_director() -> None:
+        if director is None or live_ego is None:
+            return
+        states = {}
+        for a in scenario.actors:
+            if a.id == "0":
+                continue
+            x, y, h = a.pose_at_time(cutin_phase)
+            k = max(0, min(int(round(cutin_phase / DT)), len(a.speeds) - 1))
+            states[a.id] = (x, y, h, a.speeds[k] if a.speeds else 0.0)
+        es = director_ego()
+        director.observe(T, es, states)
+        allst = dict(states)
+        allst["0"] = (es.x, es.y, es.heading_deg, es.v)
+        trajlog.record(T, allst, {aid: director.role_of(aid) for aid in allst},
+                       director.dims)
+
+    def finish_director() -> None:
+        nonlocal director, trajlog
+        if director is None:
+            return
+        s_ = director.summary()
+        c = s_.get("cut_in") or {}
+        print(f"cut-in: {s_['outcome']} holder={s_['holder']} "
+              f"t_trigger={s_['t_trigger']} t_lane_change={s_['t_lane_change']} "
+              f"gap={c.get('gap_m')} m "
+              f"rel_speed={c.get('rel_speed_mps')} m/s ttc={c.get('ttc_s')} s")
+        if traj_out and trajlog is not None:
+            os.makedirs(os.path.dirname(os.path.abspath(traj_out)) or ".",
+                        exist_ok=True)
+            trajlog.write(traj_out, director, source="pygame")
+            print(f"trajectories {traj_out}")
+        director, trajlog = None, None
 
     def exit_drive_mode() -> None:
         nonlocal drive_mode, playing, T, live_ego, cutin_committed, cutin_phase
         nonlocal cutin_outcome, drive_profile, block_committed, block_outcome
         nonlocal live_rebase
+        finish_director()
         drive_mode = False
         live_ego = None
         drive_profile = None
@@ -2030,18 +1935,34 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
         its pin until merge / deadline, and the block holder speeds up to
         hold a station in the ego's target lane until its window closes."""
         nonlocal cutin_committed, cutin_phase, man_index, cutin_outcome
-        nonlocal block_committed, block_outcome, live_rebase
+        nonlocal block_committed, block_outcome, live_rebase, director_msg
         if live_ego is None:
             return
         e = live_ego
+        if director is not None:
+            director.tick(scenario, cutin_phase, T, director_ego())
+            cutin_phase = 0.0
+            cutin_committed = director.merged_at is not None
+            cutin_outcome = "merged" if director.merged_at is not None else None
+            msg = director.events[-1]["text"] if director.events else ""
+            if msg and msg != director_msg:
+                director_msg = msg
+                set_status(msg)
+            if block_holder() is None:
+                return
+            # a block-cut-in rides along: the director owns the cut-in, the
+            # legacy block logic below still owns the block
+        director_owns_cutin = director is not None
         changed = False
         replanned: set = set()
-        if not cutin_committed:
+        if not cutin_committed and not director_owns_cutin:
             changed = cast_cutin_roles() or changed   # roles may move mid-drive
         if not block_committed:
             changed = cast_block_roles() or changed
         for a in scenario.actors:
             if a.id == "0":
+                continue
+            if a.cutin and director_owns_cutin:
                 continue
             if a.cutin and not cutin_committed:
                 spec = a.cutin
@@ -2938,9 +2859,11 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
             "ego": (e["x"], e["y"], math.degrees(e["theta"]), e["v"]),
             "actors": {a.id: displayed_pose(a)
                        for a in scenario.actors if a.id != "0"},
-            "cutin_holder": ch.id if ch else None,
+            "cutin_holder": (director.holder if director is not None
+                             else (ch.id if ch else None)),
             "cutin_outcome": cutin_outcome,
             "cutin_committed": cutin_committed,
+            "director": director.summary() if director is not None else None,
             "block_holder": bh.id if bh else None,
             "block_outcome": block_outcome,
             "block_committed": block_committed,
@@ -3489,6 +3412,12 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
     frame_i = 0
     while running:
         dt = clock.tick(60) / 1000.0
+        if drive_mode:
+            # A long frame -- pygame's first one absorbs window start-up, often
+            # most of a second -- would otherwise advance the simulation in one
+            # jump and hand the cut-in orchestrator a clock that skipped its
+            # approach. Simulated time slows during a hitch instead.
+            dt = min(dt, 0.1)
         frame_i += 1
         if playing:
             if drive_mode and live_ego is not None:
@@ -3511,6 +3440,7 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
                 integrate_live_ego(throttle, steer, dt)
                 T += dt
                 cutin_phase += dt
+                observe_director()
                 if frame_i % 3 == 0:
                     live_resolve_cutins()
                 if on_frame is not None:
@@ -3620,6 +3550,8 @@ def run_gui(scenario: Scenario, persistence: Optional[Persistence],
 
         render_frame()
 
+    if drive_mode:
+        finish_director()
     pygame.quit()
 
 
@@ -3645,6 +3577,11 @@ def main():
                     help="with --snapshot: actor id to select")
     ap.add_argument("--time", type=float, default=0.0,
                     help="with --snapshot: paused clock time")
+    import cutin_director as cd
+    cd.add_cli_arguments(ap)
+    ap.add_argument("--traj-out", default=None, metavar="OUT.json",
+                    help="write every vehicle's driven trajectory here when "
+                         "Drive mode ends")
     args = ap.parse_args()
 
     if args.validate:
@@ -3658,6 +3595,15 @@ def main():
             sys.exit(1)
 
     scenario = load_scenario(args.scenario)
+    base_director = (None if (args.capture or args.snapshot) else
+                     cd.load_director(args.scenario, scenario,
+                                      cd.overrides_from_args(args)))
+    factory = None
+    if base_director is not None:
+        import copy as _copy
+        spec0 = base_director.spec
+        factory = lambda sc: cd.CutinDirector(_copy.deepcopy(spec0), sc)  # noqa: E731
+        print(f"cut-in: {base_director.events[-1]['text']}")
     if args.capture:
         run_gui(scenario, None, capture=args.capture, fps=args.fps, loops=args.loops)
         print(f"captured {args.capture} "
@@ -3669,7 +3615,8 @@ def main():
     else:
         sdir = args.scenarios_dir or os.path.dirname(os.path.abspath(args.scenario))
         persistence = Persistence(sdir, args.scenario)
-        run_gui(scenario, persistence)
+        run_gui(scenario, persistence, director_factory=factory,
+                traj_out=args.traj_out)
 
 
 if __name__ == "__main__":

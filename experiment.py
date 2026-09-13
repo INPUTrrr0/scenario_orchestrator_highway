@@ -276,10 +276,13 @@ class Recorder:
         self.block = {"performer": meta["cast"]["block"], "outcome": None,
                       "success": None, "t_commit": None}
         self._done_since: Optional[float] = None
+        self.director: Optional[dict] = None
 
     def on_frame(self, s: dict) -> bool:
         T = s["T"]
         self._last_T = T
+        if s.get("director") is not None:
+            self.director = s["director"]
         # sampled trajectories (decimated to record_hz)
         if T - self._last_rec >= self.rec_dt - 1e-9:
             self._last_rec = T
@@ -328,6 +331,7 @@ class Recorder:
             "duration_recorded": round(self._last_T, 3),
             "cutin": self.cutin,
             "block": self.block,
+            "director": self.director,
             "trajectory_columns": {
                 "ego": ["t", "x", "y", "heading_deg", "v"],
                 "actor": ["t", "x", "y", "heading_deg"]},
@@ -360,6 +364,11 @@ def main() -> None:
     ap.add_argument("--max-actors", type=int, default=5)
     ap.add_argument("--headless", action="store_true",
                     help="no window; ego autopilots its scripted speed")
+    import cutin_director as cd
+    cd.add_cli_arguments(ap)
+    ap.add_argument("--traj-out", default=None, metavar="OUT.json",
+                    help="also write every vehicle's trajectory in the shared "
+                         "format")
     args = ap.parse_args()
 
     if args.headless:
@@ -374,8 +383,17 @@ def main() -> None:
     print(f"seed={seed}  actors={meta['num_actors']}  "
           f"cast: cut-in={meta['cast']['cutin']} block={meta['cast']['block']}")
 
+    factory = None
+    holder = meta["cast"]["cutin"]
+    tpl = next((a.cutin for a in sc.actors if a.id == holder and a.cutin), None)
+    if tpl is not None:
+        import copy
+        spec = cd.overrides_from_args(args).apply(cd.CutinSpec.from_legacy(dict(tpl)))
+        spec.holder = holder
+        factory = lambda s_: cd.CutinDirector(copy.deepcopy(spec), s_)  # noqa: E731
     rec = Recorder(meta, record_hz=args.hz, max_time=args.max_time)
-    se.run_gui(sc, None, auto_drive=True, on_frame=rec.on_frame)
+    se.run_gui(sc, None, auto_drive=True, on_frame=rec.on_frame,
+               director_factory=factory, traj_out=args.traj_out)
     rec.write(out)
 
     r = rec.result()

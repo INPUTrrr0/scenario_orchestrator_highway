@@ -131,9 +131,9 @@ def check_script_layer(ck: Checks) -> None:
             return
     ck.check("cut-in solver surface present", True,
              "solve_closed_loop_cutin, cruise_plan, live_cutin_pin, ...")
-    ck.check("CutinOrchestrator.tick is importable",
-             hasattr(co, "CutinOrchestrator") and
-             hasattr(co.CutinOrchestrator, "tick"))
+    import cutin_director as cd
+    ck.check("cutin_director is importable",
+             hasattr(cd, "CutinDirector") and hasattr(cd.CutinDirector, "tick"))
     ck.check("rebase_scenario present", hasattr(mv, "rebase_scenario"))
 
 
@@ -625,21 +625,30 @@ def check_verify_roles(ck: Checks, cmap) -> None:
 
 
 def check_closed_loop(ck: Checks, cmap) -> None:
-    """Cut-in casting, driven headless off the real road."""
+    """The cut-in director, driven headless off the real road."""
+    import cutin_director as cd
     from . import scenarios as sc_mod
     from .closed_loop import HighwayClosedLoop
     from .highway_ego import Ego, HighwayEgoPolicy
     world = _World(cmap)
     try:
-        frame, ego_a, bg, _ = sc_mod.build(world, sc_mod.CUTIN)
+        frame = sc_mod.discover_frame(world, sc_mod.CUTIN)
     except RuntimeError as exc:
-        ck.add(_SKIP, "closed loop: cut-in casting", str(exc))
+        ck.add(_SKIP, "closed loop: cut-in director", str(exc))
         return
-    loop = HighwayClosedLoop(frame, bg, sc_mod.spec(sc_mod.CUTIN))
-    ck.check("closed loop: casting is on for cutin", loop.casting,
-             f"spec found: {loop.orch is not None}")
+    path = sc_mod.scenario_path(sc_mod.CUTIN.replace("cutin", "cutin")) \
+        if False else os.path.join(os.path.dirname(sc_mod.scenario_path(sc_mod.CUTIN)),
+                                   "scenario_cutin_single.yaml")
+    fitted, _ = sc_mod.retarget(sc_mod.load(sc_mod.CUTIN, path), frame)
+    # observed from script poses below, so the script heading model applies
+    director = cd.load_director(path, fitted, heading=cd.HEADING_SCRIPT)
+    ego_a, bg = sc_mod.split_ego(fitted)
+    loop = HighwayClosedLoop(frame, bg, sc_mod.spec(sc_mod.CUTIN),
+                             director=director)
+    ck.check("closed loop: the director runs for cutin", loop.casting,
+             f"spec: {director.spec.to_dict() if director else None}")
     x, y, h = ego_a.start
-    ego = Ego(x=x, y=y, theta=math.radians(h), v=12.0)
+    ego = Ego(x=x, y=y, theta=math.radians(h), v=13.0)
     pol = HighwayEgoPolicy(frame, ego, loop.sc, atime=0.0)
     dt = 1.0 / 60.0
     for k in range(600):                       # 10 s
@@ -649,40 +658,29 @@ def check_closed_loop(ck: Checks, cmap) -> None:
         thr, st = pol.command(now=t, dt=dt)
         pol.integrate(thr, st, dt)
         loop.advance(dt)
-    ck.check("closed loop: a cut-in actor got cast", loop.holder is not None,
-             f"holder={loop.holder} roles={loop.roles}")
-    ck.check("closed loop: the cut-in resolved",
-             loop.outcome in ("merged", "abandoned"),
-             f"outcome={loop.outcome} after {loop.n_interventions} interventions")
-    ck.check("closed loop: recasts off a hopeless holder",
-             loop.n_recasts > 0 or loop.outcome == "merged",
-             f"{loop.n_recasts} recast(s); CutinOrchestrator alone locks its "
-             f"first pick forever")
-    # The regression the whole port turned on: a holder that has drifted into
-    # the ego's lane scores zero for casting, and `cast_roles` would hand the
-    # role away on the very tick the merge is detectable.
-    from .closed_loop import StickyCutinOrchestrator
-    from .script_bridge import ROLE_CUTIN as _RC
-    ck.check("closed loop: the orchestrator is sticky on feasibility",
-             isinstance(loop.orch, StickyCutinOrchestrator),
-             "cast_roles alone drops a lock whose score has fallen to 0 — "
-             "which is every holder that is actually merging")
-    if loop.orch is not None:
-        orch = loop.orch
-        actors = loop.sc.actors
-        keep = str(actors[0].id)
-        orch.committed = False
-        orch.cutin_id = keep
-        orch.sticky_id = keep
-        # put the "holder" exactly on the ego's line, where it scores 0
-        saved = actors[0].start
-        actors[0].start = (ego.x, ego.y + 6.0, saved[2] if len(saved) > 2 else 90.0)
-        orch.cast(actors, ego, loop.sc.map.lane_width, sticky=True)
-        actors[0].start = saved
-        ck.check("closed loop: a merging holder keeps the role",
-                 orch.cutin_id == keep and orch.roles.get(actors[0].id) == _RC,
-                 f"holder {keep} on the ego's own line still holds the cut-in")
-
+        states = {}
+        for a in loop.sc.actors:
+            i = max(0, min(int(round(loop.atime / dt)), len(a.traj) - 1))
+            if a.traj:
+                ax, ay, ah = a.traj[i]
+                states[a.id] = (ax, ay, ah, a.speeds[i])
+        loop.observe(ego, t + dt, states)
+    summ = director.summary() if director else {}
+    c = summ.get("cut_in") or {}
+    ck.check("closed loop: an actor holds the cut-in", loop.holder is not None,
+             f"holder={loop.holder} scores={loop.scores}")
+    ck.check("closed loop: the trigger fired after t=3 s",
+             summ.get("t_trigger") is not None and summ["t_trigger"] > 3.0,
+             f"t_trigger={summ.get('t_trigger')}")
+    ck.check("closed loop: the actor entered the ego's lane", bool(c),
+             f"outcome={summ.get('outcome')}")
+    ck.check("closed loop: gap at the cut-in instant is on target",
+             bool(c) and abs(c["gap_error_m"]) <= 0.5,
+             f"gap {c.get('gap_m')} m, asked {director.spec.gap_m if director else '-'}")
+    ck.check("closed loop: relative speed at the cut-in instant is on target",
+             bool(c) and abs(c["rel_speed_error_mps"]) <= 1.0,
+             f"dv {c.get('rel_speed_mps')} m/s, asked "
+             f"{director.spec.rel_speed_mps if director else '-'}")
     ck.check("closed loop: it logged what it did", len(loop.events) > 0,
              f"{len(loop.events)} events; last: "
              f"{loop.events[-1].text if loop.events else '-'}")
@@ -691,7 +689,7 @@ def check_closed_loop(ck: Checks, cmap) -> None:
     frame2, _e2, bg2, _ = sc_mod.build(world, sc_mod.HARD_BRAKE)
     loop2 = HighwayClosedLoop(frame2, bg2, sc_mod.spec(sc_mod.HARD_BRAKE))
     ck.check("closed loop: hard_brake does NOT cast roles",
-             not loop2.casting and loop2.orch is None,
+             not loop2.casting and loop2.director is None,
              "scripted actors stay scripted")
 
 

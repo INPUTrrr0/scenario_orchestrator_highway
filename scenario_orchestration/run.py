@@ -102,7 +102,17 @@ SETTINGS: Dict[str, Tuple[type, Any]] = {
     "reground_every": (int, 0),
     # Orchestration.
     "casting": (bool, None),
-    "cutin_at": (float, None),
+    "cutin_at": (float, None),             # deprecated: cutin_trigger_time
+    # The cut-in (cutin_director.py). None keeps the scenario YAML's value.
+    "cutin_trigger_time": (float, None),   # allowed once t > this (s)
+    "cutin_trigger_ego_speed": (float, None),  # ...and/or ego faster than this
+    "cutin_trigger_speed_hold_s": (float, None),  # ...for longer than this (1 s)
+    "cutin_gap_m": (float, None),          # ego front to actor rear at cut-in
+    "cutin_rel_speed_mps": (float, None),  # v_actor - v_ego at cut-in
+    "cutin_mode": (str, None),             # static_commit | re_aim
+    "cutin_lc_duration_s": (float, None),
+    "num_actors": (int, None),
+    "spawn_seed": (int, None),
     "cruise": (float, 12.0),
     "interaction_gap_m": (float, 4.0),
     "lane_conflict_m": (float, 2.2),
@@ -234,6 +244,7 @@ def build_config(request: ScenarioRequest, settings: Settings,
         ego=settings["ego"], ego_mode="physics",
         casting=settings["casting"], cruise=settings["cruise"],
         cutin_at=settings["cutin_at"],
+        cutin_overrides=_cutin_overrides(settings),
         interaction_gap_m=settings["interaction_gap_m"],
         lane_conflict_m=settings["lane_conflict_m"],
         linger=settings["linger"], spectator=False, verbose=True,
@@ -251,6 +262,21 @@ def build_config(request: ScenarioRequest, settings: Settings,
     if settings["xodr"]:
         cfg.xodr = settings["xodr"]
     return cfg
+
+
+def _cutin_overrides(settings: Settings):
+    import cutin_director as cd
+    mode = settings["cutin_mode"]
+    return cd.CutinOverrides(
+        trigger_time=settings["cutin_trigger_time"],
+        trigger_ego_speed=settings["cutin_trigger_ego_speed"],
+        trigger_speed_hold_s=settings["cutin_trigger_speed_hold_s"],
+        gap_m=settings["cutin_gap_m"],
+        rel_speed_mps=settings["cutin_rel_speed_mps"],
+        mode=(str(mode).lower().replace("-", "_") if mode else None),
+        lc_duration_s=settings["cutin_lc_duration_s"],
+        num_actors=settings["num_actors"],
+        spawn_seed=settings["spawn_seed"])
 
 
 def build_ego(policy: PolicyRequest, cfg, settings: Settings,
@@ -385,6 +411,10 @@ def execute(request: ScenarioRequest, policy: PolicyRequest,
         traceback.print_exc()
         report = _salvage(run, notes)
     finally:
+        try:
+            run.write_trajectories(os.path.join(output_dir, "trajectories.json"))
+        except Exception as exc:                     # pragma: no cover
+            notes.append(f"trajectories: {type(exc).__name__}: {exc}")
         try:
             run.teardown()
         except Exception as exc:                     # pragma: no cover

@@ -47,6 +47,15 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for push rules and local checks.
 
 ## Scenarios definition and configuration 
 
+* **`scenario_cutin_single.yaml`** — the cut-in orchestrator ([`cutin_director.py`](cutin_director.py)), shared by the editor's Drive mode and the CARLA runner. You set when the cut-in is allowed (`trigger: {time_gt: 3}`, or `{ego_speed_gt: 5}` held for more than 1 s), the bumper-to-bumper gap and relative speed at the moment the actor enters your lane, `static_commit` or `re_aim`, and the actors (explicit spawns or a seed). The trigger is permission, not a command: the holder gets ready for that geometry and starts its lane change as soon as it can land it, which may be after the trigger; the rest are traffic that yields to it. Drive it yourself:
+
+   ```bash
+   .venv/bin/python scenario_editor.py scenarios/scenario_cutin_single.yaml --re-aim --rel-speed 3 --traj-out run.json
+   # press F to drive (WASD / arrows); Esc ends and writes run.json
+   ```
+
+   Every flag: `--trigger-time`, `--trigger-ego-speed`, `--trigger-speed-hold`, `--gap`, `--rel-speed`, `--static_commit` / `--re-aim`, `--lc-duration`, `--num-actors`, `--spawn-seed`. The trajectory file holds every vehicle (t, x, y, heading, speed, lane, role) plus the measured cut-in. An older actor-level `cutin: {t, along, ...}` spec is translated automatically in Drive mode; the section below describes that legacy form, which Play mode, `drive.py` and `cutin_orchestrator.py` still use.
+
 * **`scenario_cutin.yaml`** — The actor must cut-in the ego at a specific target. The window is deliberately tight. The goal is to test whether the ego can react in time (either speed up/lane change to evade the cut-in, or brake to yield to the cut-in vehicle)
    * **Cut-in target pin**
 
