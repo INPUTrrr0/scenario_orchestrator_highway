@@ -30,6 +30,76 @@ from .carla_api import carla
 # the measurement.
 ACCEL_HORIZON = 0.5      # seconds
 
+#: How long the spawn gear is held with a manual shift before the automatic
+#: gearbox carries on from it.
+SPAWN_GEAR_HOLD_S = 0.25
+
+
+class SpawnGear:
+    """Put a vehicle that spawns rolling into the gear its speed calls for.
+
+    A CARLA vehicle given a velocity at spawn rolls in neutral, and its
+    automatic gearbox engages first gear on its own about two seconds later, at
+    road speed. The clutch then spins the idling engine up through the lowest
+    ratio: measured on an empty Town04 road, the MKZ went from 7.1 to 5.2 m/s in
+    0.2 s, and at the part throttle an IDM demand maps to its engine never
+    reached the up-shift point again, so it stayed in first at 5 m/s while IDM
+    asked for +1.3 m/s^2. That looked like the ego braking for no reason.
+
+    Engaged at spawn instead, in the highest gear whose engine speed the
+    gearbox would keep (between its down- and up-shift points), the engine
+    spins up through a tall ratio, so the car loses little speed doing it, and
+    the gearbox shifts normally from there. A vehicle below walking pace, or
+    one whose physics control carries no gear table (the offline test double),
+    is left to the gearbox.
+    """
+
+    def __init__(self, hold_s: float = SPAWN_GEAR_HOLD_S):
+        self.hold_s = float(hold_s)
+        self.plan: Optional[dict] = None
+        self._decided = False
+        self._held = 0.0
+
+    @staticmethod
+    def choose(vehicle, speed: float) -> Optional[dict]:
+        """{gear, engine_rpm} for `speed` in m/s, or None to leave it alone."""
+        if speed < 1.0:
+            return None
+        try:
+            pc = vehicle.get_physics_control()
+            gears = list(pc.forward_gears)
+            final = float(pc.final_ratio)
+            max_rpm = float(pc.max_rpm)
+            radius_m = max(float(w.radius) for w in pc.wheels) / 100.0  # cm
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
+        if not gears or radius_m <= 0.0 or max_rpm <= 0.0:
+            return None
+        wheel_rpm = speed / (2.0 * math.pi * radius_m) * 60.0
+        kept, lowest_fitting = None, None
+        for number, g in enumerate(gears, start=1):
+            rpm = wheel_rpm * final * float(g.ratio)
+            if rpm <= float(g.up_ratio) * max_rpm:
+                if lowest_fitting is None:
+                    lowest_fitting = (number, rpm)
+                if rpm >= float(g.down_ratio) * max_rpm:
+                    kept = (number, rpm)
+        pick = kept or lowest_fitting or (len(gears), wheel_rpm * final
+                                          * float(gears[-1].ratio))
+        return {"gear": int(pick[0]), "engine_rpm": round(pick[1], 1),
+                "speed_mps": round(float(speed), 3)}
+
+    def control_kwargs(self, vehicle, speed: float, dt: float) -> dict:
+        """Extra `carla.VehicleControl` arguments for this step: a manual shift
+        into the spawn gear for the first `hold_s`, nothing afterwards."""
+        if not self._decided:
+            self._decided = True
+            self.plan = self.choose(vehicle, speed)
+        if self.plan is None or self._held >= self.hold_s - 1e-9:
+            return {}
+        self._held += dt
+        return {"manual_gear_shift": True, "gear": self.plan["gear"]}
+
 
 class LongitudinalPID:
     """Speed-tracking PID, the classic CARLA longitudinal controller.
@@ -68,6 +138,113 @@ class LongitudinalPID:
         return 0.0, (0.0 if -u < self.brake_deadband else min(1.0, -u))
 
 
+class AccelerationTracker:
+    """Pedals that make a CARLA vehicle realise a commanded acceleration.
+
+    For a policy whose action is an acceleration (`third_party/idm`):
+
+      u = demand feedforward + kp * lag + ki * integral(lag)
+
+    `lag` is the gap between a reference speed, which integrates the demand
+    step by step, and the measured speed. The feedforward is the demand's own
+    pedal (throttle a/3, brake -a/5: the open-loop map this replaces). The
+    integral learns what the feedforward leaves out, mostly the throttle that
+    merely holds a speed against drag -- 0.43-0.45 for the MKZ at 8-13 m/s.
+
+    Why each piece, from runs on an empty Town04 road:
+      * The reference. Targeting `v + a * ACCEL_HORIZON` instead, as
+        `CarlaEgoActuator` does, caps the error at half a second of demand
+        however far behind the car falls: it realised +0.62 of +1.26 m/s^2 and
+        sagged to 4 m/s at a target of 8. With the reference: +0.94 of +0.94.
+      * No derivative. On the measured speed it answered the car's own jolts
+        (a gear change, the last metre of a stop at -11 m/s^2) with full
+        throttle; on the error it spiked with every change of demand.
+      * The output never pedals against the demand: a car slowing faster than
+        asked (engine braking in a low gear) is not given throttle, nor one
+        pulling away harder given brake. Within the band it may: that holds a
+        speed.
+      * The reference restarts from the measured speed whenever the demand
+        changes regime (accelerating / holding / braking), so a lag built in
+        one cannot kick the next. The regimes have hysteresis (entered past
+        `enter_mps2`, left inside `exit_mps2`): IDM's demand near its desired
+        speed sits right at a single threshold, and restarting there every
+        few steps kept the integral from ever settling.
+      * Accelerating, the lag works both ways; one-sided, it let a relaunch
+        from standstill run at +4.5 m/s^2 when +1.5 was asked. Braking, it only
+        ever asks for more brake: a car that has braked harder than asked
+        keeps no credit, which had left it coasting at -1 m/s^2 toward a stop
+        it was told to make at -3.
+      * Anti-windup: the integral stops while the output is pinned.
+    """
+
+    def __init__(self, kp: float = 0.5, ki: float = 0.3,
+                 throttle_per_mps2: float = 1.0 / 3.0,
+                 brake_per_mps2: float = 1.0 / 5.0,
+                 integral_limit: float = 2.5, lag_cap: float = 2.0,
+                 v_max: float = 40.0, enter_mps2: float = 0.3,
+                 exit_mps2: float = 0.1, brake_deadband: float = 0.12):
+        self.kp, self.ki = float(kp), float(ki)
+        self.throttle_per_mps2 = float(throttle_per_mps2)
+        self.brake_per_mps2 = float(brake_per_mps2)
+        self.integral_limit = float(integral_limit)
+        self.lag_cap = float(lag_cap)
+        self.v_max = float(v_max)
+        self.enter_mps2 = float(enter_mps2)
+        self.exit_mps2 = float(exit_mps2)
+        self.brake_deadband = float(brake_deadband)
+        self.v_ref: Optional[float] = None
+        self.integral = 0.0
+        self._regime: Optional[int] = None
+
+    def reset(self) -> None:
+        self.v_ref = None
+        self.integral = 0.0
+        self._regime = None
+
+    def step(self, accel: float, v: float, dt: float) -> Tuple[float, float]:
+        """(throttle, brake) for this step; `self.v_ref` is the reference."""
+        regime = self._regime_for(accel)
+        if self.v_ref is None or regime != self._regime:
+            ref = v
+        else:
+            ref = self.v_ref + accel * dt
+        self._regime = regime
+        if regime < 0:
+            ref = min(ref, v)
+        self.v_ref = max(0.0, v - self.lag_cap,
+                         min(self.v_max, v + self.lag_cap, ref))
+        if self.v_ref <= 0.05 and accel <= 0.0:
+            return 0.0, 1.0                   # stopped and asked to stay stopped
+        lag = self.v_ref - v
+        ff = (accel * self.throttle_per_mps2 if accel >= 0.0
+              else accel * self.brake_per_mps2)
+        u = ff + self.kp * lag + self.ki * self.integral
+        lo = 0.0 if regime > 0 else -1.0
+        hi = 0.0 if regime < 0 else 1.0
+        pinned = (u >= hi and lag > 0.0) or (u <= lo and lag < 0.0)
+        if not pinned:
+            self.integral = max(-self.integral_limit,
+                                min(self.integral_limit, self.integral + lag * dt))
+        u = max(lo, min(hi, u))
+        if u >= 0.0:
+            return u, 0.0
+        # a small negative effort is engine braking, not a brake application
+        return 0.0, (0.0 if -u < self.brake_deadband else -u)
+
+    def _regime_for(self, accel: float) -> int:
+        """+1 accelerating, -1 braking, 0 holding, with hysteresis."""
+        was = self._regime or 0
+        if was > 0 and accel >= self.exit_mps2:
+            return 1
+        if was < 0 and accel <= -self.exit_mps2:
+            return -1
+        if accel > self.enter_mps2:
+            return 1
+        if accel < -self.enter_mps2:
+            return -1
+        return 0
+
+
 class CarlaEgoActuator:
     """Turns a policy's (throttle, steer) into a carla.VehicleControl.
 
@@ -91,6 +268,8 @@ class CarlaEgoActuator:
                  delta_max: float = math.radians(32),
                  v_max: float = 18.0,
                  accel_horizon: float = ACCEL_HORIZON):
+        self.vehicle = vehicle
+        self.spawn_gear = SpawnGear()
         self.pid = pid or LongitudinalPID()
         self.max_steer_deg = max_steer_deg or self._read_max_steer(vehicle)
         self.delta_max = float(delta_max)
@@ -115,5 +294,6 @@ class CarlaEgoActuator:
         v_target = max(0.0, min(self.v_max, policy.ego.v + accel * self.accel_horizon))
         throttle, brake = self.pid.step(v_target, policy.ego.v, dt)
         steer = max(-1.0, min(1.0, steer_cmd * self.steer_scale))
+        gear = self.spawn_gear.control_kwargs(self.vehicle, policy.ego.v, dt)
         return carla.VehicleControl(throttle=float(throttle), steer=float(steer),
-                                    brake=float(brake)), v_target
+                                    brake=float(brake), **gear), v_target

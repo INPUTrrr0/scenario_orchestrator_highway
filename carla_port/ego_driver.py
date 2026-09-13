@@ -57,6 +57,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from .actuation import AccelerationTracker, SpawnGear
 from .carla_obs import ObservationBuilder
 from .carla_sensors import CameraRig, rig as named_rig, specs_from
 # Annotation only (PEP 563) — keeps this driver usable with any map frame,
@@ -70,6 +71,9 @@ from .carla_adapter import BindingSet
 #: How often an external policy is asked for a decision, in Hz. 20 Hz is the
 #: CARLA Leaderboard's agent rate, which is what these policies are evaluated at.
 DEFAULT_POLICY_HZ = 20.0
+
+#: How much of the run the actuation trace in the report covers, seconds.
+ACTUATION_TRACE_S = 12.0
 
 
 class EgoDriverError(RuntimeError):
@@ -149,10 +153,18 @@ class PolicyEgoDriver(EgoDriver):
         self.calls = 0                     # control() invocations
         self.actions: List[Dict[str, Any]] = []
         self.notes: List[str] = []
-        self._control = None               # the held VehicleControl
+        self._control = None               # the VehicleControl last applied
+        #: the last decision, held until the next: {"throttle", "brake", ...}
+        #: for a policy that commands pedals, {"accel", "steer"} for one that
+        #: commands an acceleration
+        self._command: Optional[Dict[str, Any]] = None
         self._next_decision = 0.0          # seconds of driver time
         self._clock = 0.0
         self._last: Dict[str, Any] = {}
+        self.tracker = AccelerationTracker()
+        self.spawn_gear = SpawnGear()
+        #: per decision, while t < ACTUATION_TRACE_S: what was asked and done
+        self.actuation: List[List[Any]] = []
         #: the policy's own input for the most recent decision, for the
         #: recorder's vision panel. Held rather than recomputed: the rig is
         #: captured once per DECISION, not once per tick, so re-reading it here
@@ -220,9 +232,13 @@ class PolicyEgoDriver(EgoDriver):
         self.calls = 0
         self.actions.clear()
         self._control = None
+        self._command = None
         self._clock = 0.0
         self._next_decision = 0.0
         self._last = {}
+        self.tracker.reset()
+        self.spawn_gear = SpawnGear()
+        self.actuation.clear()
         resetter = getattr(self.policy, "reset", None)
         if callable(resetter):
             resetter()
@@ -236,25 +252,28 @@ class PolicyEgoDriver(EgoDriver):
 
     # ------------------------------------------------------------------ #
     def control(self, dt: float):
-        """One step: decide if due, otherwise hold the last decision."""
+        """One step: decide if due, otherwise hold the last decision.
+
+        What is held differs by action. Pedals are held as they are. An
+        acceleration is held as a DEMAND, and the speed PID turns it into
+        pedals afresh every step against the measured speed.
+        """
         from .carla_api import carla
 
         if self.ctx is None or self.observations is None:
             raise EgoDriverError("PolicyEgoDriver.control() before attach()")
         self.calls += 1
-        if self._control is not None and self._clock + 1e-9 < self._next_decision:
-            self._clock += dt
-            return self._control
-
-        interval = 1.0 / self.hz if self.hz > 0 else 0.0
-        self._next_decision = self._clock + interval
+        decided = self._command is None or self._clock + 1e-9 >= self._next_decision
+        if decided:
+            interval = 1.0 / self.hz if self.hz > 0 else 0.0
+            self._next_decision = self._clock + interval
+            action = self._act()
+            self._command = self._command_from(action)
+            self.steps += 1
+            if len(self.actions) < self.keep_actions:
+                self.actions.append(self._summarize(action))
+        self._control = self._vehicle_control(carla, dt, decided)
         self._clock += dt
-
-        action = self._act()
-        self._control = self._to_carla_control(action, carla)
-        self.steps += 1
-        if len(self.actions) < self.keep_actions:
-            self.actions.append(self._summarize(action))
         return self._control
 
     def vision(self) -> Dict[str, Any]:
@@ -366,72 +385,99 @@ class PolicyEgoDriver(EgoDriver):
         except (AttributeError, RuntimeError):
             return None
 
-    #: Acceleration -> pedals, for a policy that commands an acceleration
-    #: instead of pedals. These are osc2carla's numbers
-    #: (`osc2carla_policy_bridge.ACCEL_TO_THROTTLE / ACCEL_TO_BRAKE`) and are
-    #: deliberately not new ones: `third_party/idm` returns an acceleration
-    #: precisely so that every method converts it the SAME way, and a second
-    #: curve here would make each longitudinal comparison a comparison of two
-    #: pedal curves rather than of two policies.
-    ACCEL_TO_THROTTLE = 3.0
-    ACCEL_TO_BRAKE = 5.0
-
-    def _control_from_acceleration(self, action: Dict[str, Any]):
-        """Pedals for a policy whose action is an acceleration.
-
-        `third_party/idm` returns `acceleration_mps2` and `steer` rather than
-        pedals, and says why: every method that accepts a `control` action
-        converts an acceleration with the same mapping its own built-in IDM
-        uses, so the shared policy differs from a method's native IDM in the
-        lateral term and in nothing else. Returning pedals from the policy would
-        introduce a second mapping.
-
-        That contract was only half kept -- osc2carla implemented it, this port
-        did not, and the whole cell failed with "returned no 'control' block"
-        the moment the shared IDM was genuinely loaded rather than realized
-        natively here. This is this port's half.
-        """
-        accel = None
+    @staticmethod
+    def _acceleration_of(action: Dict[str, Any]) -> Optional[float]:
         for key in ("acceleration_mps2", "acceleration", "accel", "a"):
             if key in action:
-                accel = action[key]
-                break
-        if accel is None:
-            return None
-        try:
-            accel = float(accel)
-        except (TypeError, ValueError):
-            return None
-        return {"throttle": (accel / self.ACCEL_TO_THROTTLE if accel >= 0.0
-                             else 0.0),
-                "brake": (0.0 if accel >= 0.0
-                          else -accel / self.ACCEL_TO_BRAKE),
-                "steer": action.get("steer", 0.0)}
+                try:
+                    return float(action[key])
+                except (TypeError, ValueError):
+                    return None
+        return None
 
-    def _to_carla_control(self, action: Dict[str, Any], carla):
+    def _command_from(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """The held form of a decision.
+
+        A `control` block is the policy's own pedals and is applied as given.
+        An acceleration -- `third_party/idm` returns `acceleration_mps2` and
+        `steer` rather than pedals -- is a demand on the VEHICLE, realised by
+        `actuation.AccelerationTracker`: the demand's own pedal as feedforward,
+        plus feedback on how far the measured speed trails the speed the demand
+        integrates to, recomputed every step.
+
+        It used to be that feedforward alone, an open-loop map (throttle =
+        a/3, brake = -a/5, the numbers osc2carla's bridge uses), on the
+        argument that every method should turn an acceleration into pedals the
+        same way. In CARLA the map could not deliver the demand: the shared IDM
+        asked for +0.5 to +1.3 m/s^2 for seconds while the car held or lost
+        speed, stuck in first gear at part throttle. A comparison of policies
+        needs the vehicle to do what each policy asks, and feedback is what
+        makes it.
+        """
         control = action.get("control")
-        if not isinstance(control, dict):
-            control = self._control_from_acceleration(action)
-        if not isinstance(control, dict):
-            raise EgoDriverError(
-                f"ego policy {self.name!r} returned no 'control' block and no "
-                "acceleration. This port actuates control: a policy that emits "
-                "waypoints must also return the control its own "
-                "lateral/longitudinal controllers produce, and one that commands "
-                "an acceleration must return `acceleration_mps2`. Action keys: "
-                f"{sorted(action)}")
-        steer = _unit(control.get("steer", 0.0), "steer")
-        throttle = _clamp01(control.get("throttle", 0.0))
-        brake = _clamp01(control.get("brake", 0.0))
-        # No sign flip and no rescaling: `steer` is already normalized in CARLA's
-        # own convention (+ = right), which is how the reference agents in this
-        # family assign it to carla.VehicleControl.steer. The negation
-        # carla_ego.CarlaEgoActuator makes is there because drivev2's steer is in
-        # the SCRIPT frame, where headings run the other way.
-        return carla.VehicleControl(throttle=float(throttle), steer=float(steer),
-                                    brake=float(brake),
-                                    hand_brake=bool(control.get("hand_brake", False)),
-                                    reverse=bool(control.get("reverse", False)))
+        if isinstance(control, dict):
+            # No sign flip and no rescaling: `steer` is already normalized in
+            # CARLA's own convention (+ = right), which is how the reference
+            # agents in this family assign it to carla.VehicleControl.steer.
+            # The negation carla_ego.CarlaEgoActuator makes is there because
+            # drivev2's steer is in the SCRIPT frame, where headings run the
+            # other way.
+            return {"steer": _unit(control.get("steer", 0.0), "steer"),
+                    "throttle": _clamp01(control.get("throttle", 0.0)),
+                    "brake": _clamp01(control.get("brake", 0.0)),
+                    "hand_brake": bool(control.get("hand_brake", False)),
+                    "reverse": bool(control.get("reverse", False))}
+        accel = self._acceleration_of(action)
+        if accel is not None and math.isfinite(accel):
+            return {"accel": accel,
+                    "steer": _unit(action.get("steer", 0.0), "steer")}
+        raise EgoDriverError(
+            f"ego policy {self.name!r} returned no 'control' block and no "
+            "acceleration. This port actuates control: a policy that emits "
+            "waypoints must also return the control its own "
+            "lateral/longitudinal controllers produce, and one that commands "
+            "an acceleration must return `acceleration_mps2`. Action keys: "
+            f"{sorted(action)}")
+
+    def _speed(self) -> float:
+        """The ego's speed as CARLA reports it this step."""
+        ego = getattr(self.ctx.policy, "ego", None)
+        if ego is not None and getattr(ego, "v", None) is not None:
+            return max(0.0, float(ego.v))
+        try:
+            v = self.ctx.ego_actor.get_velocity()
+            return math.sqrt(float(v.x) ** 2 + float(v.y) ** 2 + float(v.z) ** 2)
+        except (AttributeError, RuntimeError):
+            return 0.0
+
+    def _vehicle_control(self, carla, dt: float, decided: bool):
+        cmd = self._command
+        v = self._speed()
+        v_target = None
+        if "accel" in cmd:
+            throttle, brake = self.tracker.step(cmd["accel"], v, dt)
+            v_target = self.tracker.v_ref
+        else:
+            throttle, brake = cmd["throttle"], cmd["brake"]
+        gear = self.spawn_gear.control_kwargs(self.ctx.ego_actor, v, dt)
+        control = carla.VehicleControl(
+            throttle=float(throttle), steer=float(cmd["steer"]), brake=float(brake),
+            hand_brake=bool(cmd.get("hand_brake", False)),
+            reverse=bool(cmd.get("reverse", False)), **gear)
+        if decided and self._clock < ACTUATION_TRACE_S:
+            self.actuation.append([
+                round(self._clock, 3), round(v, 3),
+                None if "accel" not in cmd else round(cmd["accel"], 3),
+                None if v_target is None else round(v_target, 3),
+                round(float(throttle), 3), round(float(brake), 3),
+                self._gear_now()])
+        return control
+
+    def _gear_now(self) -> Optional[int]:
+        try:
+            return int(self.ctx.ego_actor.get_control().gear)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return None
 
     @staticmethod
     def _summarize(action: Dict[str, Any]) -> Dict[str, Any]:
@@ -450,7 +496,14 @@ class PolicyEgoDriver(EgoDriver):
         meta: Dict[str, Any] = {
             "driver": "external_policy",
             "policy": self.name,
-            "actuates": "control",
+            "actuates": ("acceleration, realised by AccelerationTracker"
+                         if self._command and "accel" in self._command
+                         else "control"),
+            "spawn_gear": self.spawn_gear.plan,
+            "actuation_trace": {
+                "columns": ["t", "speed_mps", "accel_cmd_mps2",
+                            "reference_speed_mps", "throttle", "brake", "gear"],
+                "rows": list(self.actuation)},
             "decision_hz": self.hz,
             "decisions": self.steps,
             "control_steps": self.calls,

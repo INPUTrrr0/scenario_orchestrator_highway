@@ -722,6 +722,104 @@ def check_actuation(ck: Checks) -> None:
     ck.check("actuator: steer scale maps DELTA_MAX to the wheel limit",
              abs(abs(act.steer_scale) - math.degrees(DELTA_MAX) / 70.0) < 1e-9)
 
+    check_spawn_gear_and_tracking(ck)
+
+
+def check_spawn_gear_and_tracking(ck: Checks) -> None:
+    """The spawn gear, and an acceleration policy driven through the PID."""
+    from carla_port.actuation import SPAWN_GEAR_HOLD_S, SpawnGear
+    from carla_port.carla_api import carla
+    from carla_port.ego_driver import PolicyEgoDriver
+
+    class _Gear:
+        def __init__(self, ratio):
+            self.ratio, self.up_ratio, self.down_ratio = ratio, 0.46, 0.23
+
+    class _Wheel:
+        radius = 35.0                                   # cm, as CARLA reports
+        max_steer_angle = 70.0
+
+    class _Mkz:                                         # vehicle.lincoln.mkz_2020
+        forward_gears = [_Gear(r) for r in (4.58, 2.96, 1.91, 1.45, 1.0, 0.75)]
+        final_ratio, max_rpm = 3.21, 6500.0
+        wheels = [_Wheel()] * 4
+
+    class _Veh:
+        def __init__(self):
+            self.v = 0.0
+
+        def get_physics_control(self):
+            return _Mkz()
+
+        def get_velocity(self):
+            return carla.Vector3D(self.v, 0.0, 0.0)
+
+        def get_control(self):
+            return carla.VehicleControl()
+
+    gears = {v: (SpawnGear.choose(_Veh(), v) or {}).get("gear")
+             for v in (0.5, 7.0, 13.0, 40.0)}
+    ck.check("spawn gear: the highest gear the gearbox would keep",
+             gears == {0.5: None, 7.0: 2, 13.0: 4, 40.0: 6},
+             f"{gears} (m/s -> gear); first gear at 7 m/s is what dragged "
+             "the IDM ego from 7 to 5 m/s")
+    sg, held, dt = SpawnGear(), 0, 1.0 / 60.0
+    for _ in range(60):
+        if sg.control_kwargs(_Veh(), 13.0, dt).get("manual_gear_shift"):
+            held += 1
+    ck.check("spawn gear: held manually, then handed to the gearbox",
+             held == round(SPAWN_GEAR_HOLD_S / dt), f"{held} steps at 60 Hz")
+
+    class _Ego:
+        v = 5.0
+
+    class _Companion:
+        ego = _Ego()
+
+    class _Ctx:
+        policy = _Companion()
+        ego_actor = _Veh()
+
+    drv = PolicyEgoDriver(policy=None, name="idm")
+    drv.ctx = _Ctx()
+    drv._command = drv._command_from({"acceleration_mps2": 1.3, "steer": 0.0})
+    first = drv._vehicle_control(carla, dt, True)
+    for _ in range(int(3.0 / dt)):                      # the car does not respond
+        later = drv._vehicle_control(carla, dt, False)
+    ck.check("acceleration policy: feedback keeps pushing a car that is not "
+             "speeding up", later.throttle > first.throttle + 0.1,
+             f"throttle {first.throttle:.2f} -> {later.throttle:.2f} after 3 s "
+             "at +1.3 m/s^2 asked")
+    drv.tracker.reset()
+    _Companion.ego.v = 10.0
+    drv._command = drv._command_from({"acceleration_mps2": -6.0})
+    hard = drv._vehicle_control(carla, dt, True)
+    ck.check("acceleration policy: a hard deceleration is a hard brake",
+             hard.brake > 0.9 and hard.throttle == 0.0, f"brake={hard.brake:.2f}")
+    from carla_port.actuation import AccelerationTracker
+    trk, v, worst = AccelerationTracker(), 12.0, 0.0
+    for _ in range(120):                    # asked -3, the car slows at -6
+        thr, _brk = trk.step(-3.0, v, dt)
+        worst = max(worst, thr)
+        v = max(0.0, v - 6.0 * dt)
+    ck.check("tracker: no throttle against a braking demand", worst == 0.0,
+             f"max throttle {worst:.2f} while slowing faster than asked")
+    ck.check("tracker: a stopped car asked to stay stopped is held on the brake",
+             trk.step(-1.0, 0.0, dt) == (0.0, 1.0))
+    trk, flips, last = AccelerationTracker(), 0, None
+    for k in range(120):                    # IDM near its desired speed
+        trk.step(0.35 if k == 0 else (0.25 if k % 2 else 0.15), 8.0, dt)
+        flips += int(last is not None and trk._regime != last)
+        last = trk._regime
+    ck.check("tracker: demand dithering at a threshold does not restart it",
+             flips == 0, f"{flips} regime changes")
+    drv._command = drv._command_from({"control": {"throttle": 0.3, "brake": 0.0,
+                                                  "steer": 0.1}})
+    pedals = drv._vehicle_control(carla, dt, True)
+    ck.check("pedal policy: its own control is applied as given",   # float32
+             abs(pedals.throttle - 0.3) < 1e-6 and abs(pedals.steer - 0.1) < 1e-6,
+             f"throttle={pedals.throttle:.4f} steer={pedals.steer:.4f}")
+
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python3 -m carla_highway.validate")

@@ -342,6 +342,20 @@ F. world.tick()
 G. collect collisions, grade, capture a video frame
 ```
 
+Step E depends on what the policy returns. A policy with its own controllers
+(PlanT, TFv6, SimLingo) returns pedals, and they are applied as given. A policy
+that commands an acceleration (`third_party/idm`) is realised by
+`AccelerationTracker` (`carla_port/actuation.py`): the demand's pedal as
+feedforward plus PI feedback on how far the car trails the speed the demand
+integrates to, every step. The open-loop map it replaced left the car stuck in
+first gear at 5 m/s while IDM asked for +1.3 m/s²; on an empty Town04 road the
+tracker holds IDM's 8 m/s at 7.9–8.0 and realises 88% of the acceleration asked.
+Every physics ego is also put into the gear its spawn speed calls for
+(`SpawnGear`): CARLA spawns a rolling car in neutral and engages first gear
+about two seconds in, which cost 2 m/s in 0.2 s. The report's
+`ego_driver.actuation_trace` records speed, demand, reference, pedals and gear at
+each decision for the first 12 s.
+
 `CutinDirector.tick` re-bases the background scenario to *now*, so script-local
 time restarts at zero on every orchestration tick; `closed_loop.py` resets its
 clock accordingly. Every simulation step the runner also hands the director the
