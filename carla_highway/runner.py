@@ -216,6 +216,28 @@ def _driver_for(loaded, cfg: "RunConfig"):
                            bev=_bev_source(loaded))
 
 
+def _chooses_own_lane(policy) -> bool:
+    """Does this external ego policy pick its lane itself?
+
+    The companion's MOBIL re-plans the route (`_advance_route`) because the
+    route is the only way a lane change reaches a policy that follows one. A
+    policy with a lateral law of its own must not get that offer: it makes its
+    own decision, and `third_party/idm` measures its lateral position against
+    the route, so a route that moves under it carries its lanes along. On
+    `hard_brake` the two added up. idm_mobil's MOBIL committed to the lane on
+    its left at 1.10 s; the companion's committed to the same lane by 1.70 s,
+    with the ego under 0.2 m into the change and so still inside the
+    companion's settle tolerance; and the ego settled 7.0 m from its home lane,
+    3.5 m left of the leftmost modelled lane's centre, and hit a pole there.
+
+    `third_party/idm` declares `allows_lane_change` on both its policies
+    (IDMPolicy holds its lane, IDMMobilPolicy runs MOBIL), and either value
+    means the lane is the policy's to choose. The route-following policies
+    (tfv6, simlingo, plant2) declare nothing and keep the offer.
+    """
+    return isinstance(getattr(policy, "allows_lane_change", None), bool)
+
+
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
@@ -426,6 +448,9 @@ class HighwayRun:
         #: driven exactly like --policy
         self.external_policy = None
         self._external_policy_name: Optional[str] = None
+        #: the external policy picks its own lane, so the route stays on the
+        #: home lane and the companion's lane state says nothing about the ego
+        self._ego_chooses_lane = False
         self.ego_actor = None
         self.actuator: Optional[CarlaEgoActuator] = None
         self.bindings = None
@@ -807,6 +832,8 @@ class HighwayRun:
                 driver, loaded = _load_external_ego_driver(self.cfg, self.policy)
             self.ego_driver = driver
             self._external_policy_name = loaded.name
+            if _chooses_own_lane(loaded.policy):
+                self._hold_route(loaded.name)
             driver.attach(EgoContext(
                 world=self.world, frame=self.frame, bindings=self.bindings,
                 ego_id=self.cfg.ego, ego_actor=binding.carla_actor,
@@ -1084,7 +1111,8 @@ class HighwayRun:
         Guarded by `allow_lane_change`, which the mode spec sets
         (`ego_lane_changes`) and `--lane-change` / `--no-lane-change` override,
         so `cutin` still holds its lane: upstream drives that ego straight on
-        purpose and the scenario measures what the ACTORS do around it.
+        purpose and the scenario measures what the ACTORS do around it. A
+        policy that picks its own lane clears it as well (`_hold_route`).
         """
         pol = self.policy
         if pol is None or not pol.allow_lane_change:
@@ -1098,6 +1126,22 @@ class HighwayRun:
             note = f"lane re-planning failed ({type(exc).__name__}: {exc})"
             if note not in self.notes:
                 self.notes.append(note)
+
+    def _hold_route(self, name: str) -> None:
+        """Keep the route on the home lane for a policy that picks its own lane.
+
+        See `_chooses_own_lane` for why. The companion then never leaves the
+        home lane, so `report` and `_grade` read where the ego went off the
+        lane it is actually in rather than off the companion.
+        """
+        self._ego_chooses_lane = True
+        if not self.policy.allow_lane_change:
+            return               # the mode (`cutin`) or --no-lane-change held it
+        self.policy.allow_lane_change = False
+        msg = (f"route held on the home lane: {name} picks its own lane, and a "
+               "route lane change would be applied on top of its own")
+        self.notes.append(msg)
+        self._log(f"  {msg}")
 
     def _drive_ego(self, dt: float) -> None:
         if self.policy is None:
@@ -1115,7 +1159,8 @@ class HighwayRun:
             # line down the starting lane and no policy ever had a reason to
             # merge. Run the DECISION half only: pick the lane, walk the
             # lane-change profile, and let `reference_path` render it. Nothing
-            # here produces a throttle or a steering angle.
+            # here produces a throttle or a steering angle. A policy that picks
+            # its own lane gets a held route instead (`_chooses_own_lane`).
             self._advance_route(dt)
             b.carla_actor.apply_control(self.ego_driver.control(dt))
             return
@@ -1440,7 +1485,10 @@ class HighwayRun:
         else:                                   # overtake
             blocker = self.interactions.get("1")
             passed = bool(blocker and blocker.passed)
-            home = bool(p and p.target_lane == p.home_lane)
+            # A held route keeps the companion at home whatever the ego does.
+            home = bool(p and (p.frame.lane_index_of(p.ego.x)
+                               if self._ego_chooses_lane
+                               else p.target_lane) == p.home_lane)
             checks["passed"] = passed
             checks["home"] = home
             success = passed and home and not hit
@@ -1487,7 +1535,11 @@ class HighwayRun:
                                  else (p.n_lane_changes if p else 0)),
                 "route_lane_changes": ((p.n_lane_changes if p else 0)
                                        if self.ego_driver is not None else None),
-                "used_oncoming_lane": (p.used_oncoming if p else False),
+                "used_oncoming_lane": (
+                    any(not self.frame.lanes[ln].same_direction
+                        for _t, ln in self._lane_track)
+                    if self._ego_chooses_lane
+                    else (p.used_oncoming if p else False)),
                 "max_cross_track": round(self._xtrack_max, 3),
                 "distance": (round(self._ego_xyv[1] - self._ego_start_y, 2)
                              if self._ego_xyv else None),

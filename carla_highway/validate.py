@@ -520,6 +520,101 @@ def check_ego_policy(ck: Checks, cmap) -> None:
              "1.6 m off the ego's line is inside IDM_LANE_TOL")
 
 
+def check_route_offer(ck: Checks, cmap) -> None:
+    """Who picks the ego's lane while an external policy drives.
+
+    The companion's MOBIL offers a lane change through the route, which is how
+    a route-following policy is told to merge. A policy that picks its own lane
+    gets the route held instead: on hard_brake the offer landed on top of
+    idm_mobil's own change and put the ego two lanes over.
+    """
+    from . import scenarios as sc_mod
+    from .highway_ego import Ego, HighwayEgoPolicy
+    from .runner import HighwayRun, RunConfig, _chooses_own_lane, _harness_root
+    world = _World(cmap)
+
+    class _FollowsRoute:                    # tfv6, simlingo, plant2
+        pass
+
+    class _PicksLane:                       # third_party/idm's IDMMobilPolicy
+        allows_lane_change = True
+
+    idm_root = os.path.join(_harness_root() or "", "third_party", "idm")
+    name = "route offer: third_party/idm's policies pick their own lane"
+    if os.path.isfile(os.path.join(idm_root, "idm", "policy.py")):
+        if idm_root not in sys.path:
+            sys.path.insert(0, idm_root)
+        from idm.policy import IDMMobilPolicy, IDMPolicy
+        ck.check(name, _chooses_own_lane(IDMMobilPolicy())
+                 and _chooses_own_lane(IDMPolicy()),
+                 f"read from {idm_root}; the port keys on `allows_lane_change`")
+    else:
+        ck.add(_SKIP, name, f"no {idm_root}")
+    ck.check("route offer: a policy that declares nothing follows the route",
+             not _chooses_own_lane(_FollowsRoute()))
+
+    try:
+        frame, ego_a, bg, _ = sc_mod.build(world, sc_mod.HARD_BRAKE)
+    except RuntimeError as exc:
+        ck.add(_SKIP, "route offer: hard_brake", str(exc))
+        return
+    x, y, h = ego_a.start
+    home_x = frame.lane_center_x(frame.lane_index_of(x))
+    dt = 1.0 / 60.0
+
+    def drive(policy):
+        """~6.7 s behind the slow lead, the ego braking under IDM in its own
+        lane: all that changes is what the companion does to the route."""
+        run = HighwayRun.__new__(HighwayRun)
+        run.cfg = RunConfig(scenario=sc_mod.HARD_BRAKE, verbose=False)
+        run.notes = []
+        run.policy = HighwayEgoPolicy(
+            frame, Ego(x=x, y=y, theta=math.radians(h), v=12.0), bg, atime=0.0)
+        if _chooses_own_lane(policy):
+            run._hold_route("idm_mobil")
+        ego = run.policy.ego
+        for k in range(400):
+            run.t_sim = run.policy.atime = k * dt
+            accel = run.policy.commanded_accel(run.policy.idm_control())
+            ego.v = max(0.0, ego.v + accel * dt)
+            ego.y += ego.v * dt
+            run._advance_route(dt)
+        off = max(abs(px - home_x) for px, _py in run.policy.reference_path)
+        return run, off
+
+    run, off = drive(_FollowsRoute())
+    ck.check("route offer: a route-following policy is offered the merge",
+             run.policy.n_lane_changes == 1 and off > frame.lane_width / 2.0,
+             f"{run.policy.n_lane_changes} route change(s); the route reaches "
+             f"{off:.2f} m off the home lane")
+    run, off = drive(_PicksLane())
+    ck.check("route offer: held for a policy that picks its own lane",
+             run.policy.n_lane_changes == 0 and off < 1e-6 and bool(run.notes),
+             f"{run.policy.n_lane_changes} route change(s); the route reaches "
+             f"{off:.2f} m off the home lane")
+
+    try:
+        frame_o, ego_o, bg_o, _ = sc_mod.build(world, sc_mod.OVERTAKE)
+    except RuntimeError as exc:
+        ck.add(_SKIP, "route offer: overtake grade", str(exc))
+        return
+    run = HighwayRun.__new__(HighwayRun)
+    run.cfg = RunConfig(scenario=sc_mod.OVERTAKE, verbose=False)
+    run.notes, run.realized, run.interactions = [], [], {}
+    xo, yo, ho = ego_o.start
+    run.policy = HighwayEgoPolicy(
+        frame_o, Ego(x=xo, y=yo, theta=math.radians(ho), v=0.0), bg_o, atime=0.0)
+    run._hold_route("idm_mobil")
+    run.policy.ego.x = frame_o.lane_center_x(frame_o.lane_index_for_direction(False))
+    away = run._grade()["checks"]["home"]
+    run.policy.ego.x = xo
+    back = run._grade()["checks"]["home"]
+    ck.check("route offer: with the route held, overtake's `home` is the ego's lane",
+             not away and back,
+             f"home={away} in the oncoming lane, home={back} in its own; the "
+             "companion stays home whatever the ego does")
+
+
 def check_heading_smoothing(ck: Checks, cmap) -> None:
     """The rendered yaw must not carry the orchestrator's replan sawtooth."""
     from carla_port.carla_adapter import ScriptState
@@ -971,6 +1066,8 @@ def main(argv=None) -> int:
     if first is not None:
         print("== ego policy ==")
         check_ego_policy(ck, first)
+        print("== route offer ==")
+        check_route_offer(ck, first)
         print("== sync ==")
         check_heading_smoothing(ck, first)
         print("== verify roles ==")
