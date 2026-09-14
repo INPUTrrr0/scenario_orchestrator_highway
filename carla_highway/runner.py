@@ -185,7 +185,6 @@ def _load_external_ego_driver(cfg: "RunConfig", companion: HighwayEgoPolicy):
         sys.path.insert(0, SO_DIR)
     from contract import PolicyRequest
     import policies as pol_mod
-    from carla_port.ego_driver import EgoContext, PolicyEgoDriver
 
     if cfg.policy_request:
         req = PolicyRequest.from_json(cfg.policy_request)
@@ -207,9 +206,14 @@ def _load_external_ego_driver(cfg: "RunConfig", companion: HighwayEgoPolicy):
             raise ValueError(f"unknown --policy {cfg.policy!r}: not one of "
                              f"{sorted(POLICY_SHORTCUTS)}, {where}")
     loaded = pol_mod.load_policy(req, harness_root=None, repo_root=REPO_ROOT)
-    driver = PolicyEgoDriver(loaded.policy, name=loaded.name, hz=cfg.policy_hz,
-                             bev=_bev_source(loaded))
-    return driver, loaded
+    return _driver_for(loaded, cfg), loaded
+
+
+def _driver_for(loaded, cfg: "RunConfig"):
+    """The PolicyEgoDriver for an already-loaded ego_policy_v1 policy."""
+    from carla_port.ego_driver import PolicyEgoDriver
+    return PolicyEgoDriver(loaded.policy, name=loaded.name, hz=cfg.policy_hz,
+                           bev=_bev_source(loaded))
 
 
 # --------------------------------------------------------------------------- #
@@ -418,6 +422,9 @@ class HighwayRun:
         self.loop: Optional[HighwayClosedLoop] = None
         self.policy: Optional[HighwayEgoPolicy] = None
         self.ego_driver = None              # PolicyEgoDriver when --policy is set
+        #: a policy the harness adapter already loaded (`policies.LoadedPolicy`);
+        #: driven exactly like --policy
+        self.external_policy = None
         self._external_policy_name: Optional[str] = None
         self.ego_actor = None
         self.actuator: Optional[CarlaEgoActuator] = None
@@ -780,7 +787,12 @@ class HighwayRun:
             self.policy = None
             return
 
-        use_external = bool(self.cfg.policy or self.cfg.policy_request)
+        # The harness adapter hands over a policy it has already loaded; it used
+        # to set `external_policy` and clear --policy, and nothing read it, so a
+        # harness cell drove the built-in ego at its default parameters while
+        # reporting the requested policy as loaded.
+        use_external = bool(self.cfg.policy or self.cfg.policy_request
+                            or self.external_policy is not None)
         if use_external:
             if self.cfg.ego_mode != PHYSICS_EGO:
                 raise RuntimeError(
@@ -788,7 +800,11 @@ class HighwayRun:
                     f"ego policy: it emits carla.VehicleControl, which needs "
                     f"'{PHYSICS_EGO}'")
             binding.carla_actor.set_simulate_physics(True)
-            driver, loaded = _load_external_ego_driver(self.cfg, self.policy)
+            if self.external_policy is not None:
+                loaded = self.external_policy
+                driver = _driver_for(loaded, self.cfg)
+            else:
+                driver, loaded = _load_external_ego_driver(self.cfg, self.policy)
             self.ego_driver = driver
             self._external_policy_name = loaded.name
             driver.attach(EgoContext(
