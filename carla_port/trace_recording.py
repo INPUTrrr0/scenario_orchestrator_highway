@@ -16,7 +16,8 @@ differently. It:
 
   * finds `metrics.recording` in the harness that issued the run and imports
     the recorder from there rather than reimplementing the format;
-  * declares the static scene -- extents, reference paths, the road;
+  * declares the static scene -- extents, reference paths, the road, and the
+    scenario file the run was built from;
   * transcribes CARLA's own reading of every bound actor, each tick.
 
 What differs from the junction port, and only this:
@@ -128,13 +129,15 @@ def make_recorder(output_dir: str, rate_hz: float = TRACE_RATE_HZ,
 # --------------------------------------------------------------------------- #
 
 def declare_scene(rec, run) -> None:
-    """Actors, reference paths and the road, in CARLA world coordinates."""
+    """Actors, reference paths, the road and the scenario file, in CARLA world
+    coordinates."""
     if rec is None:
         return
     try:
         _declare_actors(rec, run)
         _declare_paths(rec, run)
         _declare_road(rec, run)
+        _declare_scenario_file(rec, run)
     except Exception as exc:                      # pragma: no cover - defensive
         run.notes.append("trace scene declaration: %s" % (exc,))
 
@@ -237,6 +240,40 @@ def _declare_road(rec, run) -> None:
                      lane_width_m=float(getattr(frame, "lane_width", 0.0) or 0.0),
                      length_m=float(getattr(frame, "length", 0.0) or 0.0),
                      lanes=lanes)
+
+
+def _declare_scenario_file(rec, run) -> None:
+    """The authored YAML this run was built from, and its content hash.
+
+    `--base` (the harness's `base_scenario`) when one was given, otherwise the
+    mode's own file from `carla_highway/scenarios.py :: SPECS`. Neither
+    `request.json` nor the report records which it was, so a run could not be
+    traced back to its scenario. The sha256 is there because the scenario files
+    are edited in place: a path names whatever the file holds today, the hash
+    names what this run loaded.
+    """
+    context = getattr(rec, "context", None)
+    cfg = getattr(run, "cfg", None)
+    if not isinstance(context, dict) or cfg is None:
+        return
+    path, source = getattr(cfg, "base", None), "base_scenario"
+    if not path:
+        # carla_port does not import carla_highway; the runner already has, so
+        # the mode table is read from the loaded module.
+        scenarios = sys.modules.get("carla_highway.scenarios")
+        if scenarios is None:
+            return
+        path, source = scenarios.scenario_path(cfg.scenario), "mode_default"
+    path = os.path.abspath(str(path))
+    context["scenario_file"] = path
+    context["scenario_file_source"] = source
+    try:
+        import hashlib
+        with open(path, "rb") as fh:
+            context["scenario_file_sha256"] = hashlib.sha256(fh.read()).hexdigest()
+    except OSError as exc:
+        context["scenario_file_sha256"] = None
+        run.notes.append("trace scenario file: %s" % (exc,))
 
 
 # --------------------------------------------------------------------------- #
