@@ -198,7 +198,7 @@ def bind_analytic(request: PolicyRequest) -> AnalyticBinding:
     v0 = binding.applied.get("IDM_V0", hw_ego.IDM_V0)
     if v0 > hw_ego.V_MAX:
         # The ego's actuation envelope, not its IDM law: the bicycle model and
-        # the longitudinal PID both clamp to V_MAX, so a desired speed above it
+        # the acceleration tracker both clamp to V_MAX, so a desired speed above it
         # is simply unreachable. Reported rather than silently raised, because
         # V_MAX is the vehicle model and the request only describes the driver.
         binding.notes.append(

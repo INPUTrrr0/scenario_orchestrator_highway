@@ -43,7 +43,7 @@ running, `Pillow` for the HUD and `ffmpeg` on PATH. Useful flags:
                      two-way road, so all three modes fit at authored scale
 --road-id N          pick the road section explicitly instead of fitting
 --min-length M       override how much straight road the scenario needs
---ego-mode MODE      physics: IDM -> PID -> VehicleControl, ego read back from
+--ego-mode MODE      physics: IDM -> acceleration tracker -> VehicleControl, read back from
                      CARLA (default).  bicycle: the policy's own kinematic
                      model, mirrored in with set_transform
 --scripted-ego       no policy; drive the ego along its maneuver plan
@@ -103,7 +103,7 @@ which alter its behaviour:
   the modules frame-agnostic. `carla_sync`'s one real use, `DT = se.DT`, became
   the literal `1/60` both script layers define.
 * `carla_collision` was already clean.
-* The longitudinal PID and the `carla.VehicleControl` conversion moved out of
+* The longitudinal controller and the `carla.VehicleControl` conversion moved out of
   `carla_ego.py` into [`carla_port/actuation.py`](../carla_port/actuation.py),
   parameterized by the vehicle limits. Both ports actuate through **one**
   controller. `ego_driver.py` already argues that re-deriving a controller
@@ -337,7 +337,7 @@ A. read the ego back from CARLA      (CARLA integrated it; CARLA is authoritativ
 B. orchestrate when due              (every DT_TICK = 0.10 s, cutin mode only)
 C. sample the script world at the current script time
 D. write the BACKGROUND actors in    (the ego is driven, not placed)
-E. actuate the ego                   (policy -> PID -> VehicleControl)
+E. actuate the ego                   (policy -> pedals -> VehicleControl)
 F. world.tick()
 G. collect collisions, grade, capture a video frame
 ```
@@ -347,14 +347,25 @@ Step E depends on what the policy returns. A policy with its own controllers
 that commands an acceleration (`third_party/idm`) is realised by
 `AccelerationTracker` (`carla_port/actuation.py`): the demand's pedal as
 feedforward plus PI feedback on how far the car trails the speed the demand
-integrates to, every step. The open-loop map it replaced left the car stuck in
-first gear at 5 m/s while IDM asked for +1.3 m/s²; on an empty Town04 road the
-tracker holds IDM's 8 m/s at 7.9–8.0 and realises 88% of the acceleration asked.
-Every physics ego is also put into the gear its spawn speed calls for
-(`SpawnGear`): CARLA spawns a rolling car in neutral and engages first gear
-about two seconds in, which cost 2 m/s in 0.2 s. The report's
-`ego_driver.actuation_trace` records speed, demand, reference, pedals and gear at
-each decision for the first 12 s.
+integrates to, every step, with throttle and brake both available whatever the
+demand — a CARLA car's engine alone brakes it at 2–6 m/s² in a low gear. The
+open-loop map it replaced left the car stuck in first gear at 5 m/s while IDM
+asked for +1.3 m/s².
+
+CARLA spawns a rolling car in neutral with its engine stopped and engages first
+gear about two seconds in, which cost 2 m/s in 0.2 s, so a physics ego spawned
+rolling goes through a spawn phase first (`SpawnGear`): the engine revs in
+neutral to the rpm of the gear the car's speed calls for (read from
+`get_telemetry_data`), the gear goes in, and the controller takes over. Until
+then an acceleration policy's car follows its demand kinematically (at most
+2 s, waiting out a hard brake); a pedal policy's car rolls with its own brake
+applied. Against IDM's speed profile from the same spawn speed, the mean error
+over the first 2 s is 0.03–0.09 m/s for an Audi TT spawned at 13 m/s under
+IDM-A/B/C, where engaging a gear at once left 1.24–2.06; a stop behind a
+standing obstacle ends 2.05 m short of it where IDM's profile ends at 2.01. The
+report's `ego_driver.actuation_trace` records speed, demand, reference, pedals
+and gear at each decision for the first 12 s, and `ego_driver.spawn_gear` the
+spawn phase.
 
 `CutinDirector.tick` re-bases the background scenario to *now*, so script-local
 time restarts at zero on every orchestration tick; `closed_loop.py` resets its

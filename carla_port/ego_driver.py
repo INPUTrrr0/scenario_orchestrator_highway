@@ -57,7 +57,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
-from .actuation import AccelerationTracker, SpawnGear
+from .actuation import AccelerationTracker, SpawnGear, horizontal_speed
 from .carla_obs import ObservationBuilder
 from .carla_sensors import CameraRig, rig as named_rig, specs_from
 # Annotation only (PEP 563) — keeps this driver usable with any map frame,
@@ -255,8 +255,8 @@ class PolicyEgoDriver(EgoDriver):
         """One step: decide if due, otherwise hold the last decision.
 
         What is held differs by action. Pedals are held as they are. An
-        acceleration is held as a DEMAND, and the speed PID turns it into
-        pedals afresh every step against the measured speed.
+        acceleration is held as a DEMAND, and `actuation.AccelerationTracker`
+        turns it into pedals afresh every step against the measured speed.
         """
         from .carla_api import carla
 
@@ -440,26 +440,27 @@ class PolicyEgoDriver(EgoDriver):
             f"{sorted(action)}")
 
     def _speed(self) -> float:
-        """The ego's speed as CARLA reports it this step."""
+        """The ego's speed over the ground as CARLA reports it this step."""
         ego = getattr(self.ctx.policy, "ego", None)
         if ego is not None and getattr(ego, "v", None) is not None:
             return max(0.0, float(ego.v))
-        try:
-            v = self.ctx.ego_actor.get_velocity()
-            return math.sqrt(float(v.x) ** 2 + float(v.y) ** 2 + float(v.z) ** 2)
-        except (AttributeError, RuntimeError):
-            return 0.0
+        return horizontal_speed(self.ctx.ego_actor)
 
     def _vehicle_control(self, carla, dt: float, decided: bool):
         cmd = self._command
         v = self._speed()
         v_target = None
-        if "accel" in cmd:
+        pedals, gear = self.spawn_gear.step(self.ctx.ego_actor, v, dt,
+                                            accel=cmd.get("accel"),
+                                            brake=cmd.get("brake", 0.0))
+        if pedals is not None:              # the spawn phase drives the car
+            self.tracker.reset(prime=True)
+            throttle, brake = pedals
+        elif "accel" in cmd:
             throttle, brake = self.tracker.step(cmd["accel"], v, dt)
             v_target = self.tracker.v_ref
         else:
             throttle, brake = cmd["throttle"], cmd["brake"]
-        gear = self.spawn_gear.control_kwargs(self.ctx.ego_actor, v, dt)
         control = carla.VehicleControl(
             throttle=float(throttle), steer=float(cmd["steer"]), brake=float(brake),
             hand_brake=bool(cmd.get("hand_brake", False)),

@@ -30,7 +30,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
-from carla_port.actuation import CarlaEgoActuator, LongitudinalPID
+from carla_port.actuation import CarlaEgoActuator
 from carla_port.carla_adapter import carla_actor_to_script_state, spawn_bindings
 from carla_port.carla_api import carla, use_fake
 from carla_port.carla_collision import CollisionMonitor
@@ -823,7 +823,6 @@ class HighwayRun:
 
         binding.carla_actor.set_simulate_physics(self.cfg.ego_mode == PHYSICS_EGO)
         self.actuator = CarlaEgoActuator(binding.carla_actor,
-                                         pid=LongitudinalPID(),
                                          delta_max=DELTA_MAX, v_max=V_MAX)
         self._log(f"ego: policy=highway IDM+lane-select"
                   f"{'' if allow_lc else ' (lane-keeping)'}, "
@@ -1665,7 +1664,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sync-mode", default=PHYSICS, choices=[PHYSICS, KINEMATIC],
                    help="how BACKGROUND actors are driven")
     p.add_argument("--ego-mode", default=PHYSICS_EGO, choices=list(EGO_MODES),
-                   help="physics: IDM -> PID -> VehicleControl, ego read back "
+                   help="physics: IDM -> acceleration tracker -> VehicleControl, ego read back "
                         "from CARLA (default). bicycle: the policy's own "
                         "kinematic model, mirrored into CARLA")
     p.add_argument("--scripted-ego", action="store_true",

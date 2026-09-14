@@ -694,17 +694,9 @@ def check_closed_loop(ck: Checks, cmap) -> None:
 
 
 def check_actuation(ck: Checks) -> None:
-    """The shared PID/actuator, and the steering handedness."""
-    from carla_port.actuation import CarlaEgoActuator, LongitudinalPID
-    from .highway_ego import DELTA_MAX, V_MAX
-
-    pid = LongitudinalPID()
-    thr, brk = pid.step(12.0, 4.0, 1.0 / 60.0)
-    ck.check("PID: accelerates when below target", thr > 0 and brk == 0.0,
-             f"throttle={thr:.2f}")
-    pid.reset()
-    thr, brk = pid.step(0.0, 8.0, 1.0 / 60.0)
-    ck.check("PID: a full stop is a brake command", brk == 1.0 and thr == 0.0)
+    """The built-in ego's actuator, and the steering handedness."""
+    from carla_port.actuation import CarlaEgoActuator
+    from .highway_ego import A_BRAKE, A_THROTTLE, DELTA_MAX, V_MAX
 
     class _Wheel:
         max_steer_angle = 70.0
@@ -716,7 +708,25 @@ def check_actuation(ck: Checks) -> None:
         def get_physics_control(self):
             return _Phys()
 
+    class _Ego:
+        v = 4.0
+
+    class _Policy:
+        ego = _Ego()
+
+        @staticmethod
+        def commanded_accel(throttle):
+            return throttle * (A_THROTTLE if throttle > 0 else A_BRAKE)
+
     act = CarlaEgoActuator(_Veh(), delta_max=DELTA_MAX, v_max=V_MAX)
+    ctl, _ref = act.control(_Policy(), 0.3, 0.0, 1.0 / 60.0)
+    ck.check("actuator: accelerates when the policy asks to",
+             ctl.throttle > 0 and ctl.brake == 0.0, f"throttle={ctl.throttle:.2f}")
+    act = CarlaEgoActuator(_Veh(), delta_max=DELTA_MAX, v_max=V_MAX)
+    _Policy.ego.v = 0.0
+    ctl, _ref = act.control(_Policy(), -0.5, 0.0, 1.0 / 60.0)
+    ck.check("actuator: a stopped car asked to brake is held on the brake",
+             ctl.brake == 1.0 and ctl.throttle == 0.0)
     ck.check("actuator: steer sign is flipped for CARLA", act.steer_scale < 0,
              f"scale={act.steer_scale:.4f} (script CCW -> CARLA CW)")
     ck.check("actuator: steer scale maps DELTA_MAX to the wheel limit",
@@ -726,8 +736,9 @@ def check_actuation(ck: Checks) -> None:
 
 
 def check_spawn_gear_and_tracking(ck: Checks) -> None:
-    """The spawn gear, and an acceleration policy driven through the PID."""
-    from carla_port.actuation import SPAWN_GEAR_HOLD_S, SpawnGear
+    """The spawn phase, and an acceleration policy driven through the tracker."""
+    from carla_port.actuation import (HOLD_THROTTLE, SPAWN_GEAR_HOLD_S,
+                                      SPAWN_MAX_S, SPAWN_REV_S, SpawnGear)
     from carla_port.carla_api import carla
     from carla_port.ego_driver import PolicyEgoDriver
 
@@ -744,15 +755,35 @@ def check_spawn_gear_and_tracking(ck: Checks) -> None:
         final_ratio, max_rpm = 3.21, 6500.0
         wheels = [_Wheel()] * 4
 
+    class _Telemetry:
+        def __init__(self, rpm):
+            self.engine_rpm = rpm
+
     class _Veh:
-        def __init__(self):
-            self.v = 0.0
+        """Rolls along +x at `v`, with `vz` of vertical speed. With
+        `rpm_per_step`, reports engine rpm that rises that much per step of
+        full throttle, as `get_telemetry_data` does on a live server."""
+
+        def __init__(self, v=0.0, vz=0.0, rpm_per_step=None):
+            self.v, self.vz = v, vz
+            self.rpm_per_step = rpm_per_step
+            self.rpm = 0.0
+            self.velocity_sets = []
 
         def get_physics_control(self):
             return _Mkz()
 
         def get_velocity(self):
-            return carla.Vector3D(self.v, 0.0, 0.0)
+            return carla.Vector3D(self.v, 0.0, self.vz)
+
+        def set_target_velocity(self, vel):
+            self.velocity_sets.append(vel.x)
+            self.v = vel.x
+
+        def get_telemetry_data(self):
+            if self.rpm_per_step is None:
+                raise AttributeError("no telemetry")
+            return _Telemetry(self.rpm)
 
         def get_control(self):
             return carla.VehicleControl()
@@ -763,12 +794,77 @@ def check_spawn_gear_and_tracking(ck: Checks) -> None:
              gears == {0.5: None, 7.0: 2, 13.0: 4, 40.0: 6},
              f"{gears} (m/s -> gear); first gear at 7 m/s is what dragged "
              "the IDM ego from 7 to 5 m/s")
-    sg, held, dt = SpawnGear(), 0, 1.0 / 60.0
-    for _ in range(60):
-        if sg.control_kwargs(_Veh(), 13.0, dt).get("manual_gear_shift"):
-            held += 1
-    ck.check("spawn gear: held manually, then handed to the gearbox",
-             held == round(SPAWN_GEAR_HOLD_S / dt), f"{held} steps at 60 Hz")
+    dt = 1.0 / 60.0
+
+    def run(veh, demand, pedal_brake=None, steps=180):
+        """(rev steps, velocity sets, manual-gear steps, plan) over `steps`."""
+        sg, revving, geared = SpawnGear(), 0, 0
+        for k in range(steps):
+            accel = None if pedal_brake is not None else demand(k * dt)
+            pedals, kw = sg.step(veh, veh.v, dt, accel=accel,
+                                 brake=pedal_brake or 0.0)
+            if pedals is not None and kw.get("gear") == 0:
+                revving += 1
+                if veh.rpm_per_step is not None and pedals[0] > 0.0:
+                    veh.rpm += veh.rpm_per_step
+            elif kw.get("manual_gear_shift"):
+                geared += 1
+        return revving, len(veh.velocity_sets), geared, sg.plan
+
+    hold = round(SPAWN_GEAR_HOLD_S / dt)
+    veh = _Veh(13.0)
+    revving, sets, geared, plan = run(veh, lambda t: -3.0 if t < 1.0 else 0.2)
+    ck.check("spawn phase (acceleration policy, no telemetry): driven "
+             "kinematically through a hard brake, engaged once it eases",
+             revving == round(1.0 / dt) and sets == revving + 1
+             and geared == hold + 1 and plan["gear"] == 3
+             and abs(plan["speed_mps"] - 10.0) < 0.1,
+             f"{revving} rev steps, {sets} velocity sets, {geared} manual-gear "
+             f"steps; engaged in gear {plan['gear']} at {plan['speed_mps']} m/s "
+             "(13 m/s braked at -3 for 1 s)")
+    veh = _Veh(13.0)
+    revving, sets, geared, plan = run(veh, lambda t: 0.5)
+    ck.check("spawn phase (no telemetry): revs for SPAWN_REV_S",
+             revving == round(SPAWN_REV_S / dt) and not plan["rpm_matched"],
+             f"{revving} rev steps")
+    veh = _Veh(13.0, rpm_per_step=60.0)                 # gear 4, ~1650 rpm
+    revving, sets, geared, plan = run(veh, lambda t: 0.5)
+    ck.check("spawn phase (telemetry): engaged on the first step the engine "
+             "is at the gear's rpm", plan["rpm_matched"]
+             and 60.0 * (revving - 1) < 0.97 * plan["engine_rpm"] <= veh.rpm,
+             f"{revving} rev steps to {veh.rpm:.0f} rpm for gear "
+             f"{plan['gear']} at {plan['engine_rpm']:.0f}")
+    veh = _Veh(13.0, rpm_per_step=60.0)
+    revving, sets, geared, plan = run(veh, None, pedal_brake=0.4)
+    ck.check("spawn phase (pedal policy): not driven, its brake applied "
+             "while the engine revs", sets == 0 and plan is not None
+             and plan["kinematic"] is False and revving > 0,
+             f"{sets} velocity sets, {revving} rev steps")
+    veh = _Veh(13.0, rpm_per_step=0.0)                  # an engine that never revs
+    revving, sets, geared, plan = run(veh, lambda t: 0.5, steps=240)
+    ck.check("spawn phase: engaged after SPAWN_MAX_S whatever the engine does",
+             revving == round(SPAWN_MAX_S / dt) and geared == hold + 1,
+             f"{revving} rev steps")
+    revving, sets, geared, plan = run(_Veh(0.0, vz=-2.4), lambda t: 1.5)
+    ck.check("spawn phase: a car settling onto the road is not rolling",
+             plan is None and revving == 0,
+             "2.4 m/s of vertical speed at spawn is left to the gearbox")
+
+    class _LateVeh(_Veh):                   # the spawn velocity lands a tick late
+        def __init__(self):
+            super().__init__(0.0)
+            self.calls = 0
+
+        def get_velocity(self):
+            self.calls += 1
+            return carla.Vector3D(0.0 if self.calls == 1 else 13.0, 0.0, 0.0)
+
+    sg, late = SpawnGear(), _LateVeh()
+    sg.step(late, 0.0, dt, accel=0.5)
+    sg.step(late, 0.0, dt, accel=0.5)
+    ck.check("spawn phase: a spawn velocity that lands a tick late still "
+             "gets one", sg.plan is not None and sg.plan["spawn_speed_mps"] == 13.0,
+             f"plan {sg.plan}")
 
     class _Ego:
         v = 5.0
@@ -776,9 +872,13 @@ def check_spawn_gear_and_tracking(ck: Checks) -> None:
     class _Companion:
         ego = _Ego()
 
+    class _NoGearbox:                       # no gear table: no spawn gear
+        def get_control(self):
+            return carla.VehicleControl()
+
     class _Ctx:
         policy = _Companion()
-        ego_actor = _Veh()
+        ego_actor = _NoGearbox()
 
     drv = PolicyEgoDriver(policy=None, name="idm")
     drv.ctx = _Ctx()
@@ -797,13 +897,25 @@ def check_spawn_gear_and_tracking(ck: Checks) -> None:
     ck.check("acceleration policy: a hard deceleration is a hard brake",
              hard.brake > 0.9 and hard.throttle == 0.0, f"brake={hard.brake:.2f}")
     from carla_port.actuation import AccelerationTracker
-    trk, v, worst = AccelerationTracker(), 12.0, 0.0
-    for _ in range(120):                    # asked -3, the car slows at -6
+    trk, v, most = AccelerationTracker(), 12.0, 0.0
+    for _ in range(60):                     # asked -3, engine braking gives -6
         thr, _brk = trk.step(-3.0, v, dt)
-        worst = max(worst, thr)
+        most = max(most, thr)
         v = max(0.0, v - 6.0 * dt)
-    ck.check("tracker: no throttle against a braking demand", worst == 0.0,
-             f"max throttle {worst:.2f} while slowing faster than asked")
+    ck.check("tracker: throttle against engine braking that overshoots a "
+             "braking demand", most > 0.3,
+             f"max throttle {most:.2f} while slowing at -6 when -3 was asked")
+    trk, v = AccelerationTracker(), 12.0
+    first = trk.step(-3.0, v, dt)[1]
+    for _ in range(60):                     # asked -3, the car slows at -1
+        _thr, brk = trk.step(-3.0, v, dt)
+        v -= 1.0 * dt
+    ck.check("tracker: more brake for a car slowing slower than asked",
+             brk > first + 0.3, f"brake {first:.2f} -> {brk:.2f} after 1 s")
+    trk.reset(prime=True)
+    ck.check("tracker: a primed reset starts from the throttle that holds a "
+             "speed", abs(trk.step(0.0, 10.0, dt)[0] - HOLD_THROTTLE) < 1e-6,
+             f"HOLD_THROTTLE={HOLD_THROTTLE}")
     ck.check("tracker: a stopped car asked to stay stopped is held on the brake",
              trk.step(-1.0, 0.0, dt) == (0.0, 1.0))
     trk, flips, last = AccelerationTracker(), 0, None
