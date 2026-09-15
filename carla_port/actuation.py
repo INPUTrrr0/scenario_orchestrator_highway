@@ -38,6 +38,12 @@ SPAWN_GEAR_HOLD_S = 0.25
 SPAWN_RPM_MATCH = 0.97
 #: An acceleration demand below this is a hard brake, which the gear waits out.
 SPAWN_BRAKING_MPS2 = -1.0
+#: The hardest the spawn phase decelerates a car kinematically. An IDM demand can
+#: ask for far more than brakes give (-48 m/s^2 for an ego spawned at 12 m/s 16 m
+#: behind a standing car), and a velocity set every step would realise it exactly.
+#: Full brake from 12 to 3 m/s on Town04 measures -9.3 (Audi A2) to -11.8 (Dodge
+#: Charger) m/s^2 over the harness's cars.
+SPAWN_MAX_BRAKING_MPS2 = -9.0
 #: The throttle that holds a speed against drag and engine braking, which the
 #: controller starts from when the spawn phase hands over. What
 #: `AccelerationTracker` settled on at 4-14 m/s on an empty Town04 road: Audi TT
@@ -93,9 +99,10 @@ class SpawnGear:
                the car's speed calls for (`choose`; the rpm is read from
                `get_telemetry_data`, or it is revved for SPAWN_REV_S without
                it). An ACCELERATION policy's car follows the demand
-               kinematically meanwhile -- its velocity is the demand
-               integrated, set every step -- and the gear waits out a hard
-               brake (below SPAWN_BRAKING_MPS2): engaging while braking hard
+               kinematically meanwhile -- its velocity is the demand, no
+               harder than SPAWN_MAX_BRAKING_MPS2, integrated and set every
+               step -- and the gear waits out a hard brake (below
+               SPAWN_BRAKING_MPS2): engaging while braking hard
                left the car up to 0.62 m/s off IDM's profile instead of 0.37.
                A PEDAL policy's car is not driven: it rolls in neutral with the
                policy's brake applied. At most SPAWN_MAX_S either way.
@@ -196,7 +203,7 @@ class SpawnGear:
              brake: float) -> Tuple[Optional[Tuple[float, float]], dict]:
         kinematic = accel is not None
         if kinematic:
-            self._v = max(0.0, self._v + accel * dt)
+            self._v = max(0.0, self._v + max(accel, SPAWN_MAX_BRAKING_MPS2) * dt)
             speed = self._v
         else:
             speed = horizontal_speed(vehicle, self._v)

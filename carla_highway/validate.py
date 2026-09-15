@@ -833,7 +833,8 @@ def check_actuation(ck: Checks) -> None:
 def check_spawn_gear_and_tracking(ck: Checks) -> None:
     """The spawn phase, and an acceleration policy driven through the tracker."""
     from carla_port.actuation import (HOLD_THROTTLE, SPAWN_GEAR_HOLD_S,
-                                      SPAWN_MAX_S, SPAWN_REV_S, SpawnGear)
+                                      SPAWN_MAX_BRAKING_MPS2, SPAWN_MAX_S,
+                                      SPAWN_REV_S, SpawnGear)
     from carla_port.carla_api import carla
     from carla_port.ego_driver import PolicyEgoDriver
 
@@ -917,6 +918,13 @@ def check_spawn_gear_and_tracking(ck: Checks) -> None:
              f"{revving} rev steps, {sets} velocity sets, {geared} manual-gear "
              f"steps; engaged in gear {plan['gear']} at {plan['speed_mps']} m/s "
              "(13 m/s braked at -3 for 1 s)")
+    veh = _Veh(12.0)
+    run(veh, lambda t: -48.0, steps=round(0.5 / dt))
+    ck.check("spawn phase (acceleration policy): no harder than "
+             "SPAWN_MAX_BRAKING_MPS2 however hard IDM brakes",
+             abs(veh.v - (12.0 + SPAWN_MAX_BRAKING_MPS2 * 0.5)) < 0.05,
+             f"{veh.v:.2f} m/s after 0.5 s of a -48 m/s^2 demand from 12 m/s "
+             f"(bound {SPAWN_MAX_BRAKING_MPS2} m/s^2)")
     veh = _Veh(13.0)
     revving, sets, geared, plan = run(veh, lambda t: 0.5)
     ck.check("spawn phase (no telemetry): revs for SPAWN_REV_S",
