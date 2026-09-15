@@ -18,7 +18,8 @@ differently. It:
     the recorder from there rather than reimplementing the format;
   * declares the static scene -- extents, reference paths, the road, and the
     scenario file the run was built from;
-  * transcribes CARLA's own reading of every bound actor, each tick.
+  * transcribes CARLA's own reading of every bound actor, each tick, and of the
+    town's traffic lights.
 
 What differs from the junction port, and only this:
 
@@ -138,6 +139,7 @@ def declare_scene(rec, run) -> None:
         _declare_paths(rec, run)
         _declare_road(rec, run)
         _declare_scenario_file(rec, run)
+        _declare_signals(rec, run)
     except Exception as exc:                      # pragma: no cover - defensive
         run.notes.append("trace scene declaration: %s" % (exc,))
 
@@ -276,6 +278,53 @@ def _declare_scenario_file(rec, run) -> None:
         run.notes.append("trace scenario file: %s" % (exc,))
 
 
+def _declare_signals(rec, run) -> None:
+    """Where the light record comes from; `capture` fills in its timeline.
+
+    None of the highway scenarios is about a signal, and the runner holds every
+    light green for the run (`--traffic-lights green`, the default) so that a
+    red in view cannot end one early. The trace still records the lights, as
+    every arm's does, so a run that met one says which and in what phase:
+    `frozen` is whether they were held, and `capture` reads back every light in
+    the town and the one governing the ego, when it is inside one's trigger
+    volume. A town with no lights declares the source "none".
+    """
+    if not callable(getattr(rec, "declare_signals", None)):
+        return
+    try:
+        lights = list(run.world.get_actors().filter("traffic.traffic_light*"))
+    except (RuntimeError, AttributeError):
+        lights = []
+    run._trace_lights = lights
+    held = bool(lights) and bool(getattr(run.cfg, "lights_green", False))
+    rec.declare_signals("simulator" if lights else "none", frozen=held,
+                        n_lights=len(lights))
+
+
+def _record_signals(rec, run) -> None:
+    """Every light's phase, and the ego's governing light's; changes are kept."""
+    lights = getattr(run, "_trace_lights", None)
+    if lights is None or not callable(getattr(rec, "signals", None)):
+        return
+    phases = {}
+    for light in lights:
+        try:
+            phases[light.id] = light.get_state()
+        except RuntimeError:                      # pragma: no cover
+            continue
+    governing = None
+    ego = next((b.carla_actor for b in run.bindings
+                if b.script_actor_id == run.cfg.ego), None)
+    if ego is not None:
+        try:
+            governing = ego.get_traffic_light()
+        except (RuntimeError, AttributeError):    # pragma: no cover
+            governing = None
+    gid = getattr(governing, "id", None)
+    rec.signals(run.t_sim, ego=phases.get(gid) if gid is not None else None,
+                lights=phases, ego_light_id=gid)
+
+
 # --------------------------------------------------------------------------- #
 # per tick
 # --------------------------------------------------------------------------- #
@@ -300,6 +349,10 @@ def capture(rec, run) -> None:
         if row is not None:
             states[binding.script_actor_id] = row
     rec.tick(run.t_sim, states)
+    try:
+        _record_signals(rec, run)
+    except Exception as exc:                      # pragma: no cover - defensive
+        run.notes.append("trace signal timeline: %s" % (exc,))
 
 
 def _from_snapshot(snap, actor):
