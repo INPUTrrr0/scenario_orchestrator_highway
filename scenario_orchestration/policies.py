@@ -263,6 +263,50 @@ def resolve_repository(request: PolicyRequest, harness_root: Optional[str],
         f"repository, and ${env_key} is not set")
 
 
+#: Request keys whose value is a path when it is one. `checkpoint` is in the
+#: contract; the rest are the conventional names a policy repository uses for a
+#: file inside its checkpoint, and are only rewritten when the rewrite lands on
+#: something that exists.
+PATH_PARAMETERS = ("weights", "checkpoint", "config", "config_path",
+                   "model_path", "weights_path")
+
+
+def _absolutize(payload: dict, root: Optional[str]) -> dict:
+    """Make a policy request's relative checkpoint paths absolute.
+
+    The harness writes them relative to ITS root -- `checkpoint:
+    third_party/checkpoints/tfv6_cvpr2026/tfv6_resnet34` -- because that is where
+    the declaration lives. The policy resolves them against the working
+    directory, which for a method subprocess is the METHOD's repository, so it
+    reported a missing checkpoint that was sitting right there ("no config.json
+    in checkpoint dir ..."). The junction port (`policies._absolutize`) and the
+    OSC2 runner's bridge do the same rewrite on the same keys.
+
+    Restored from 596f54e, which the pin to carla_port_highway_mobil dropped.
+    Rewritten only when the rewrite lands on something that exists, so a
+    genuinely missing checkpoint still fails naming the path the harness asked
+    for.
+    """
+    if not root or not os.path.isdir(root):
+        return payload
+
+    def resolve(value):
+        if not isinstance(value, str) or not value or os.path.isabs(value):
+            return value
+        candidate = os.path.join(root, value)
+        if not os.path.exists(candidate):
+            return value
+        return os.path.abspath(candidate)
+
+    payload["checkpoint"] = resolve(payload.get("checkpoint"))
+    parameters = payload.get("parameters")
+    if isinstance(parameters, dict):
+        for key in PATH_PARAMETERS:
+            if key in parameters:
+                parameters[key] = resolve(parameters[key])
+    return payload
+
+
 def load_policy(request: PolicyRequest, harness_root: Optional[str],
                 repo_root: str) -> LoadedPolicy:
     """Import a policy repository's `ego_policy_v1` entry point and build it."""
@@ -294,7 +338,8 @@ def load_policy(request: PolicyRequest, harness_root: Optional[str],
         raise PolicyTranslationError(
             f"{entry} exposes no build_policy()/make_policy() factory; "
             "ego_policy_v1 requires one")
-    policy = factory(request.to_dict() if hasattr(request, "to_dict") else request)
+    policy = factory(_absolutize(request.to_dict(), harness_root)
+                     if hasattr(request, "to_dict") else request)
     loader = getattr(policy, "load", None)
     if callable(loader):
         policy = loader() or policy
