@@ -169,6 +169,27 @@ MERGED_LAT_TOL_M = 0.5
 RECAST_MISS_MARGIN_M = 2.0
 #: The lane change's peak yaw, as `se.Maneuver.pose_at` draws it.
 LANE_CHANGE_YAW_DEG = 12.0
+#: Traffic in the ego's lane (both opt-in, see CutinSpec). `make_room`: a car
+#: ahead of the cut-in spot pulls ahead so that, when the holder lands, its
+#: rear bumper is at least ROOM_S0_M + ROOM_T_S * v past the holder's front
+#: bumper (and the next car the same past it), accelerating at ROOM_ACCEL, or
+#: up to A_MAX when that is too late. After the lane change the room is kept
+#: ROOM_AFTER_S ahead of the holder.
+ROOM_S0_M = 2.0
+ROOM_T_S = 1.0
+ROOM_ACCEL = 2.0
+ROOM_AFTER_S = 1.0
+#: `follow_ego`: a car behind the ego, in its lane or overlapping its body
+#: sideways, follows the car ahead of it (the ego first) by IDM with IDM-B's
+#: constants, braking no harder than FOLLOW_D_MAX. The plan is FOLLOW_PLAN_S
+#: of that acceleration, then its end speed, re-planned every tick.
+FOLLOW_T_S = 1.5
+FOLLOW_S0_M = 2.0
+FOLLOW_A = 1.5
+FOLLOW_B = 2.0
+FOLLOW_D_MAX = 9.0
+FOLLOW_PLAN_S = 0.5
+FOLLOW_LAT_MARGIN_M = 0.3
 
 
 # --------------------------------------------------------------------------- #
@@ -249,6 +270,10 @@ class CutinSpec:
     holder: Optional[str] = None
     #: notes from translating a legacy spec, surfaced in the report
     notes: List[str] = field(default_factory=list)
+    #: ego-lane cars ahead of the cut-in spot pull ahead to leave it free
+    make_room: bool = False
+    #: cars behind the ego in its lane follow it instead of holding speed
+    follow_ego: bool = False
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "CutinSpec":
@@ -270,7 +295,9 @@ class CutinSpec:
             rel_speed_mps=float(d.get("rel_speed_mps", 0.0)),
             mode=mode,
             lc_duration_s=float(d.get("lc_duration_s", 2.0)),
-            holder=(str(d["holder"]) if d.get("holder") is not None else None))
+            holder=(str(d["holder"]) if d.get("holder") is not None else None),
+            make_room=bool(d.get("make_room", False)),
+            follow_ego=bool(d.get("follow_ego", False)))
 
     @classmethod
     def from_legacy(cls, d: dict, lengths: Tuple[float, float] = (4.5, 4.5)
@@ -300,9 +327,14 @@ class CutinSpec:
                    lc_duration_s=float(d.get("lc_duration", 2.0)), notes=notes)
 
     def to_dict(self) -> dict:
-        return {"trigger": self.trigger.to_dict(), "gap_m": self.gap_m,
-                "rel_speed_mps": self.rel_speed_mps, "mode": self.mode,
-                "lc_duration_s": self.lc_duration_s}
+        out = {"trigger": self.trigger.to_dict(), "gap_m": self.gap_m,
+               "rel_speed_mps": self.rel_speed_mps, "mode": self.mode,
+               "lc_duration_s": self.lc_duration_s}
+        if self.make_room:
+            out["make_room"] = True
+        if self.follow_ego:
+            out["follow_ego"] = True
+        return out
 
 
 @dataclass
@@ -312,7 +344,8 @@ class SpawnSpec:
     Explicit entries: `{lane: left|right|same|<int relative>, offset_m: <m,
     centre-to-centre along the road, + ahead>, speed_mps: <m/s>}`.
     Random: `{seed, count, lanes: [left, right], offset_m: [lo, hi],
-    speed_mps: [lo, hi]}`. A random draw is kept whatever it implies for the
+    speed_mps: [lo, hi], ego_clear_m}` (`same` in `lanes` draws into the ego's
+    lane, no closer than `ego_clear_m`, default 6, centre to centre). A random draw is kept whatever it implies for the
     cut-in (the outcome is recorded); only bodies that would overlap at spawn
     are redrawn, because CARLA cannot spawn them.
     """
@@ -693,6 +726,12 @@ class CutinDirector:
         self._ready: Dict[str, Tuple[float, bool]] = {}
         self._foreseeable = False
         self._waiting_noted = False
+        #: ego-lane cars already reported as making room (one event each)
+        self._room_noted: set = set()
+        #: the lane the holder's lane change aims at, once it has started
+        self._land_lane: Optional[int] = None
+        #: cars follow_ego has driven; they keep following (see _follow_ego)
+        self._followed: set = set()
         for note in spec.notes:
             self._event(0.0, "spec", note)
         self._event(0.0, "spec",
@@ -808,7 +847,15 @@ class CutinDirector:
             holder.cutin = self.spec.to_dict()      # never yields to traffic
             self._plan_holder(holder, t, ego, a_ego, ego_lane_x, states)
         sc.simulate(horizon=SIM_HORIZON_S)
+        pushed = (self._make_room(sc, holder, t, ego, a_ego, states)
+                  if self.spec.make_room and holder is not None else set())
+        if pushed:
+            sc.simulate(horizon=SIM_HORIZON_S)
         self._yields(sc)
+        # last: a pairwise yield may have sped a follower up; IDM already brakes
+        # it for whatever it would have yielded to
+        if self.spec.follow_ego and self._follow_ego(sc, ego, states, pushed):
+            sc.simulate(horizon=SIM_HORIZON_S)
 
     # ---- phases ---- #
     def _continue(self, a: se.Actor, tau: float) -> Tuple[se.Pose, float]:
@@ -1020,6 +1067,7 @@ class CutinDirector:
         self.t_cross_plan = t + _time_at_u(u_star, self.spec.lc_duration_s)
         # lateral offset in the maneuver's convention: + is left of heading
         self.lat_offset = left_of(ego_lane_x, 0.0) - left_of(pose[0], 0.0)
+        self._land_lane = lane_index(self.map, ego_lane_x)
         self.phase = PHASE_CUTTING
         waited = t - self.t_trigger
         self._event(t, "lane_change",
@@ -1068,6 +1116,158 @@ class CutinDirector:
             a.start = road
             a.maneuvers = _hold_plan(v, u_now, lc, self.lat_offset)
             self._hold_after_cross = False
+
+    def _landing(self, holder, t, ego, a_ego, states
+                 ) -> Optional[Tuple[float, float, float]]:
+        """(time, along of the holder's centre, its speed) where the holder
+        lands in the ego's lane; None while that is not planned yet."""
+        pose, v = states[holder.id]
+        if self.phase in (PHASE_CROSSED, PHASE_MERGED):
+            return t + ROOM_AFTER_S, along_of(pose[0], pose[1]) + v * ROOM_AFTER_S, v
+        if self.phase == PHASE_CUTTING and self.t_cross_plan is not None:
+            t_land = self.t_cross_plan
+        elif self._foreseeable and holder.id in self._ready:
+            t_go, _ = self._ready[holder.id]
+            t_land = t_go + _time_at_u(self._u_star(holder.id, ego.v),
+                                       self.spec.lc_duration_s)
+        else:
+            return None
+        t_land = max(t_land, t + (self._tick_dt or 0.05))
+        dist, v_land, _ = self._rendezvous(holder.id, pose, t, ego, a_ego, t_land)
+        return t_land, along_of(pose[0], pose[1]) + dist, v_land
+
+    def _make_room(self, sc, holder, t, ego, a_ego, states) -> set:
+        """Cars ahead in the lane the holder lands in pull ahead, nearest first,
+        so it lands with room in front of it. Until its lane change starts that
+        lane is the ego's and "ahead" is ahead of the ego; from then on it is
+        the lane the change aims at and ahead of the holder, and only while the
+        ego is still in that lane. A car that governs itself or is changing
+        lanes keeps its plan but still takes up room. Returns the ids re-planned."""
+        land = self._landing(holder, t, ego, a_ego, states)
+        if land is None:
+            return set()
+        t_land, s_land, v_land = land
+        tau = t_land - t
+        ego_lane = lane_index(self.map, ego.x)
+        if self.phase == PHASE_APPROACH or self._land_lane is None:
+            lane, s_ref = ego_lane, along_of(ego.x, ego.y)
+        elif ego_lane != self._land_lane:
+            return set()
+        else:
+            hp, _ = states[holder.id]
+            lane, s_ref = self._land_lane, along_of(hp[0], hp[1])
+        ahead = []
+        for a in sc.actors:
+            if a.id in (self.ego_id, holder.id) or a.id not in states:
+                continue
+            pose, v = states[a.id]
+            s = along_of(pose[0], pose[1])
+            if lane_index(self.map, pose[0]) == lane and s > s_ref:
+                ahead.append((s, a, pose, v))
+        ahead.sort(key=lambda r: r[0])
+        front = s_land + 0.5 * self.dims.get(holder.id, (4.5, 2.0))[0]
+        v_back = v_land
+        changed: set = set()
+        for s, a, pose, v in ahead:
+            la = self.dims.get(a.id, (a.length, a.width))[0]
+            need = front + ROOM_S0_M + ROOM_T_S * v_back - (s + v * tau - 0.5 * la)
+            v_end = v
+            fixed = (getattr(a, "autonomy", "auto") == "self" or _changing_lanes(a))
+            if need > 1e-3 and not fixed:
+                acc = ROOM_ACCEL
+                if tau * tau < 2.0 * need / acc:
+                    acc = min(A_MAX, 2.0 * need / max(tau * tau, 1e-6))
+                disc = tau * tau - 2.0 * need / acc
+                t1 = tau - math.sqrt(disc) if disc > 0.0 else tau
+                t1 = min(t1, max(0.0, (se.CUTIN_MAX_SPEED - v) / acc))
+                v_end = v + acc * t1
+                gained = acc * t1 * (tau - t1) + 0.5 * acc * t1 * t1
+                a.start = (pose[0], pose[1], ROAD_HEADING_DEG)
+                a.maneuvers = ([se.Maneuver(type="go_straight", duration=t1,
+                                            intercept=v, slope=acc)]
+                               if t1 > 1e-3 else [])
+                a.maneuvers.append(se.Maneuver(type="go_straight", duration=TAIL_S,
+                                               intercept=v_end))
+                changed.add(a.id)
+                if a.id not in self._room_noted:
+                    self._room_noted.add(a.id)
+                    self._event(t, "make_room",
+                                f"actor {a.id} pulls ahead of the cut-in spot: "
+                                f"+{need:.1f} m by t={t_land:.2f}s, "
+                                f"{v:.1f} -> {v_end:.1f} m/s"
+                                + ("" if gained >= need - 0.05 else
+                                   f" (short by {need - gained:.1f} m)"),
+                                actor=a.id)
+                front = s + v * tau + gained + 0.5 * la
+            else:
+                front = s + v * tau + 0.5 * la
+            v_back = v_end
+        return changed
+
+    def _follow_ego(self, sc, ego, states, skip=()) -> bool:
+        """Cars behind the ego, in its lane or overlapping it sideways, follow
+        by IDM the nearest vehicle ahead whose body overlaps theirs sideways:
+        the ego, the holder, a car that governs itself or another follower. A
+        car keeps following once it has -- released, it would hold whatever
+        speed IDM last gave it, 0 included -- with the same rule for its lead.
+        The holder, self-governed cars, cars changing lanes and the ids in
+        `skip` lead but are not re-planned. Returns True if a plan changed."""
+        s_ego, l_ego = along_of(ego.x, ego.y), left_of(ego.x, ego.y)
+        ego_lane = lane_index(self.map, ego.x)
+        bodies = [(s_ego, l_ego, ego.v, ego.length, ego.width, self.ego_id)]
+        for a in sc.actors:
+            if a.id != self.ego_id and a.id in states:
+                pose, v = states[a.id]
+                la, wa = self.dims.get(a.id, (a.length, a.width))
+                bodies.append((along_of(pose[0], pose[1]), left_of(pose[0], pose[1]),
+                               v, la, wa, a.id))
+        by_id = {a.id: a for a in sc.actors}
+        changed = False
+        # `v` is the speed it is driving at, not a yield's replacement speed:
+        # this plan replaces the yield's, and must not jump
+        for s, l, v, la, wa, aid in bodies[1:]:
+            a = by_id[aid]
+            if (aid == self.holder or aid in skip
+                    or getattr(a, "autonomy", "auto") == "self" or _changing_lanes(a)):
+                continue
+            if aid not in self._followed:
+                beside = abs(l - l_ego) < 0.5 * (wa + ego.width) + FOLLOW_LAT_MARGIN_M
+                if not (s < s_ego and (beside or lane_index(self.map, states[aid][0][0])
+                                       == ego_lane)):
+                    continue
+                self._followed.add(aid)
+            lead = None
+            for s2, l2, v2, la2, wa2, aid2 in bodies:
+                if (aid2 == aid or s2 <= s
+                        or abs(l2 - l) >= 0.5 * (wa + wa2) + FOLLOW_LAT_MARGIN_M):
+                    continue
+                gap = (s2 - 0.5 * la2) - (s + 0.5 * la)
+                if lead is None or gap < lead[0]:
+                    lead = (gap, v2)
+            v0 = max(0.1, self.cruise.get(aid, v))
+            # above its cruise speed (a yield sped it up) it eases back at <= b
+            free = max(1.0 - (v / v0) ** 4, -FOLLOW_B / FOLLOW_A)
+            if lead is None:
+                acc = FOLLOW_A * free
+            elif lead[0] <= 0.1:
+                acc = -FOLLOW_D_MAX
+            else:
+                s_star = FOLLOW_S0_M + max(0.0, v * FOLLOW_T_S + v * (v - lead[1])
+                                           / (2.0 * math.sqrt(FOLLOW_A * FOLLOW_B)))
+                acc = FOLLOW_A * (free - (s_star / lead[0]) ** 2)
+            acc = se.clamp(acc, -FOLLOW_D_MAX, FOLLOW_A)
+            dur = FOLLOW_PLAN_S
+            if acc < 0.0 and v + acc * dur < 0.0:
+                dur = v / -acc
+            v_end = max(0.0, v + acc * dur)
+            pose = states[aid][0]
+            a.start = (pose[0], pose[1], ROAD_HEADING_DEG)
+            a.maneuvers = [se.Maneuver(type="go_straight", duration=max(dur, 1e-3),
+                                       intercept=v, slope=acc),
+                           se.Maneuver(type="go_straight", duration=TAIL_S,
+                                       intercept=v_end)]
+            changed = True
+        return changed
 
     def _yields(self, sc: se.Scenario) -> None:
         import cutin_orchestrator as co
@@ -1179,6 +1379,13 @@ class CutinDirector:
 # --------------------------------------------------------------------------- #
 # Plans
 # --------------------------------------------------------------------------- #
+def _changing_lanes(a) -> bool:
+    """Whether an actor's plan still moves it sideways (a lane change under way
+    or to come). The ego-lane paths leave such a plan alone: a straight-line
+    replacement would strand the car across the lane line."""
+    return any(getattr(m, "type", "") == "lane_change" for m in (a.maneuvers or []))
+
+
 def _cruise_toward(v: float, v_cruise: float) -> List[se.Maneuver]:
     v = max(0.0, v)
     dv = v_cruise - v
@@ -1284,6 +1491,8 @@ def spawn_actors(spawn: SpawnSpec, sc: se.Scenario, ego_id: str = EGO_ID,
         lanes = [_rel_lane(v) for v in (rnd.get("lanes") or ["left", "right"])]
         off_lo, off_hi = rnd.get("offset_m", [-30.0, 30.0])
         v_lo, v_hi = rnd.get("speed_mps", [8.0, 14.0])
+        # centre-to-centre distance a draw in the ego's own lane keeps from it
+        ego_clear = float(rnd.get("ego_clear_m", 6.0))
         n_draw = (count - len(entries)) if count is not None else int(rnd.get("count", 1))
         placed = [(_rel_lane(e.get("lane", "right")), float(e.get("offset_m", 0.0)))
                   for e in entries]
@@ -1291,7 +1500,7 @@ def spawn_actors(spawn: SpawnSpec, sc: se.Scenario, ego_id: str = EGO_ID,
             for attempt in range(200):
                 lane = rng.choice(lanes)
                 off = rng.uniform(float(off_lo), float(off_hi))
-                clash = (lane == 0 and abs(off) < 6.0) or any(
+                clash = (lane == 0 and abs(off) < ego_clear) or any(
                     pl == lane and abs(po - off) < 6.0 for pl, po in placed)
                 if not clash:
                     break
