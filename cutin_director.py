@@ -274,6 +274,8 @@ class CutinSpec:
     make_room: bool = False
     #: cars behind the ego in its lane follow it instead of holding speed
     follow_ego: bool = False
+    #: only the holder ever changes lanes, and only one cut-in happens per run
+    single_cut_in: bool = False
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "CutinSpec":
@@ -297,7 +299,8 @@ class CutinSpec:
             lc_duration_s=float(d.get("lc_duration_s", 2.0)),
             holder=(str(d["holder"]) if d.get("holder") is not None else None),
             make_room=bool(d.get("make_room", False)),
-            follow_ego=bool(d.get("follow_ego", False)))
+            follow_ego=bool(d.get("follow_ego", False)),
+            single_cut_in=bool(d.get("single_cut_in", False)))
 
     @classmethod
     def from_legacy(cls, d: dict, lengths: Tuple[float, float] = (4.5, 4.5)
@@ -334,6 +337,8 @@ class CutinSpec:
             out["make_room"] = True
         if self.follow_ego:
             out["follow_ego"] = True
+        if self.single_cut_in:
+            out["single_cut_in"] = True
         return out
 
 
@@ -855,6 +860,8 @@ class CutinDirector:
         if holder is not None:
             holder.cutin = self.spec.to_dict()      # never yields to traffic
             self._plan_holder(holder, t, ego, a_ego, ego_lane_x, states)
+        if self.spec.single_cut_in:
+            self._keep_one_cut_in(sc, states)
         sc.simulate(horizon=SIM_HORIZON_S)
         pushed = (self._make_room(sc, holder, t, ego, a_ego, states)
                   if self.spec.make_room and holder is not None else set())
@@ -1129,6 +1136,24 @@ class CutinDirector:
             a.start = road
             a.maneuvers = _hold_plan(v, u_now, lc, self.lat_offset)
             self._hold_after_cross = False
+
+    def _keep_one_cut_in(self, sc, states) -> None:
+        """Only the holder changes lanes. Background cars never plan a lane
+        change of their own (load_director strips authored ones), so a lane
+        change in anyone else's plan is left over from a holder the cut-in was
+        taken from: it is dropped, and the car keeps to its lane. Once the cut-in
+        has happened this also means no second car cuts in."""
+        for a in sc.actors:
+            if (a.id in (self.ego_id, self.holder) or a.id not in states
+                    or getattr(a, "autonomy", "auto") == "self" or not _changing_lanes(a)):
+                continue
+            pose, v = states[a.id]
+            a.start = (self.map.lane_center_x(lane_index(self.map, pose[0])), pose[1],
+                       ROAD_HEADING_DEG)
+            a.maneuvers = _cruise_toward(v, self.cruise.get(a.id, v))
+            self._event(0.0 if self._last_tick_t is None else self._last_tick_t,
+                        "single_cut_in", f"actor {a.id} drops its lane change: actor "
+                        f"{self.holder} holds the cut-in", actor=a.id)
 
     def _landing(self, holder, t, ego, a_ego, states
                  ) -> Optional[Tuple[float, float, float]]:
