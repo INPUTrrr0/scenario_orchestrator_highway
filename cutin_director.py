@@ -732,6 +732,8 @@ class CutinDirector:
         self._land_lane: Optional[int] = None
         #: cars follow_ego has driven; they keep following (see _follow_ego)
         self._followed: set = set()
+        #: cars seen in the ego's lane; never cast (only with make_room/follow_ego)
+        self._shared_lane: set = set()
         for note in spec.notes:
             self._event(0.0, "spec", note)
         self._event(0.0, "spec",
@@ -820,6 +822,13 @@ class CutinDirector:
         sc.simulate(horizon=SIM_HORIZON_S)
 
         ego_lane_x = self.map.lane_center_x(lane_index(self.map, ego.x))
+        if self.spec.make_room or self.spec.follow_ego:
+            # With traffic in the ego's lane, a car the ego has shared a lane
+            # with is never cast: an ego that changes lanes to pass a slower one
+            # would otherwise have it cut straight back in beside it.
+            ego_lane = lane_index(self.map, ego.x)
+            self._shared_lane.update(aid for aid, (pose, _) in states.items()
+                                     if lane_index(self.map, pose[0]) == ego_lane)
 
         if self.phase == PHASE_APPROACH:
             if (self.t_trigger is None
@@ -985,6 +994,10 @@ class CutinDirector:
             if abs(lane - ego_lane) != 1:
                 scores[a.id] = 0.0
                 info[a.id] = {"eligible": False, "why": "not in a lane next to the ego"}
+                continue
+            if a.id in self._shared_lane:
+                scores[a.id] = 0.0
+                info[a.id] = {"eligible": False, "why": "has shared the ego's lane"}
                 continue
             u_star = self._u_star(a.id, ego.v)
             t_go, reachable = self._earliest_start(a.id, pose, v, t, ego, a_ego,
