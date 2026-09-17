@@ -190,6 +190,9 @@ FOLLOW_B = 2.0
 FOLLOW_D_MAX = 9.0
 FOLLOW_PLAN_S = 0.5
 FOLLOW_LAT_MARGIN_M = 0.3
+#: `ego_lane_changes`: the ego counts as settled in its lane within this of the
+#: lane centre; no cut-in lane change starts while it is further out.
+EGO_SETTLED_M = 0.5
 
 
 # --------------------------------------------------------------------------- #
@@ -276,6 +279,12 @@ class CutinSpec:
     follow_ego: bool = False
     #: only the holder ever changes lanes, and only one cut-in happens per run
     single_cut_in: bool = False
+    #: follow an ego that changes lanes: re-pick the cut-in next to its new lane
+    #: (any car there), and start no lane change while it is between lanes
+    ego_lane_changes: bool = False
+    #: cars ahead of the ego in its lane drive at least this fast (and at least
+    #: as fast as the ego), so the ego has no slower car to change lanes around
+    lead_speed_mps: Optional[float] = None
 
     @classmethod
     def from_dict(cls, d: Optional[dict]) -> "CutinSpec":
@@ -300,7 +309,9 @@ class CutinSpec:
             holder=(str(d["holder"]) if d.get("holder") is not None else None),
             make_room=bool(d.get("make_room", False)),
             follow_ego=bool(d.get("follow_ego", False)),
-            single_cut_in=bool(d.get("single_cut_in", False)))
+            single_cut_in=bool(d.get("single_cut_in", False)),
+            ego_lane_changes=bool(d.get("ego_lane_changes", False)),
+            lead_speed_mps=_opt_float(d.get("lead_speed_mps")))
 
     @classmethod
     def from_legacy(cls, d: dict, lengths: Tuple[float, float] = (4.5, 4.5)
@@ -339,6 +350,10 @@ class CutinSpec:
             out["follow_ego"] = True
         if self.single_cut_in:
             out["single_cut_in"] = True
+        if self.ego_lane_changes:
+            out["ego_lane_changes"] = True
+        if self.lead_speed_mps is not None:
+            out["lead_speed_mps"] = self.lead_speed_mps
         return out
 
 
@@ -739,6 +754,8 @@ class CutinDirector:
         self._followed: set = set()
         #: cars seen in the ego's lane; never cast (only with make_room/follow_ego)
         self._shared_lane: set = set()
+        #: whether the ego is settled in its lane this tick (ego_lane_changes)
+        self._ego_settled = True
         for note in spec.notes:
             self._event(0.0, "spec", note)
         self._event(0.0, "spec",
@@ -827,13 +844,18 @@ class CutinDirector:
         sc.simulate(horizon=SIM_HORIZON_S)
 
         ego_lane_x = self.map.lane_center_x(lane_index(self.map, ego.x))
-        if self.spec.make_room or self.spec.follow_ego:
+        if (self.spec.make_room or self.spec.follow_ego) and not self.spec.ego_lane_changes:
             # With traffic in the ego's lane, a car the ego has shared a lane
             # with is never cast: an ego that changes lanes to pass a slower one
             # would otherwise have it cut straight back in beside it.
+            # `ego_lane_changes` replaces this with re-picking next to the ego's
+            # new lane and waiting for the ego to settle there (below).
             ego_lane = lane_index(self.map, ego.x)
             self._shared_lane.update(aid for aid, (pose, _) in states.items()
                                      if lane_index(self.map, pose[0]) == ego_lane)
+        # the ego is between lanes: no lane change may start beside it
+        self._ego_settled = (not self.spec.ego_lane_changes
+                             or abs(ego.x - ego_lane_x) <= EGO_SETTLED_M)
 
         if self.phase == PHASE_APPROACH:
             if (self.t_trigger is None
@@ -842,7 +864,7 @@ class CutinDirector:
             self._score_and_cast(sc, t, ego, a_ego, ego_lane_x, states)
             if self.t_trigger is not None and self.holder is not None:
                 t_go, reachable = self._ready.get(self.holder, (math.inf, False))
-                if reachable and t_go <= t + 1e-6:
+                if reachable and t_go <= t + 1e-6 and self._ego_settled:
                     self._start_lane_change(t, ego, ego_lane_x, states)
                 elif not self._waiting_noted:
                     self._waiting_noted = True
@@ -865,6 +887,8 @@ class CutinDirector:
         sc.simulate(horizon=SIM_HORIZON_S)
         pushed = (self._make_room(sc, holder, t, ego, a_ego, states)
                   if self.spec.make_room and holder is not None else set())
+        if self.spec.lead_speed_mps is not None:
+            pushed |= self._hold_lead_speed(sc, ego, states)
         if pushed:
             sc.simulate(horizon=SIM_HORIZON_S)
         self._yields(sc)
@@ -1115,9 +1139,10 @@ class CutinDirector:
             ap = self._approach_for(a.id, pose, v, t, ego, a_ego,
                                     t_go + _time_at_u(u_star, lc))
             # Not reachable yet: close in on the spot without starting to
-            # drift over. The lane change is drawn only for a start that is.
+            # drift over. The lane change is drawn only for a start that is,
+            # and not while the ego is between lanes (ego_lane_changes).
             lat = (left_of(ego_lane_x, 0.0) - left_of(pose[0], 0.0)
-                   if reachable else 0.0)
+                   if reachable and self._ego_settled else 0.0)
             a.start, a.maneuvers = road, _build_plan(t, v, ap, t_go, lc, lat, u0=0.0)
             return
         if self.phase == PHASE_CUTTING:
@@ -1136,6 +1161,35 @@ class CutinDirector:
             a.start = road
             a.maneuvers = _hold_plan(v, u_now, lc, self.lat_offset)
             self._hold_after_cross = False
+
+    def _hold_lead_speed(self, sc, ego, states) -> set:
+        """Cars ahead of the ego in its lane drive at least `lead_speed_mps`
+        and at least as fast as the ego, ramping up at ROOM_ACCEL: a slower
+        car ahead is what a lane-changing ego passes, and passing takes it away
+        from the cut-in. Only raises a plan's speed. Returns the ids re-planned."""
+        ego_lane = lane_index(self.map, ego.x)
+        s_ego = along_of(ego.x, ego.y)
+        floor = max(float(self.spec.lead_speed_mps), ego.v)
+        changed: set = set()
+        for a in sc.actors:
+            if (a.id in (self.ego_id, self.holder) or a.id not in states
+                    or getattr(a, "autonomy", "auto") == "self" or _changing_lanes(a)):
+                continue
+            pose, v = states[a.id]
+            if lane_index(self.map, pose[0]) != ego_lane or along_of(pose[0], pose[1]) <= s_ego:
+                continue
+            tail = a.maneuvers[-1] if a.maneuvers else None
+            if tail is not None and float(getattr(tail, "intercept", 0.0)) >= floor - 0.05:
+                continue            # already heading to at least the floor
+            v_end = max(floor, v)
+            t1 = max(0.0, (v_end - v) / ROOM_ACCEL)
+            a.start = (pose[0], pose[1], ROAD_HEADING_DEG)
+            a.maneuvers = ([se.Maneuver(type="go_straight", duration=t1, intercept=v,
+                                        slope=ROOM_ACCEL)] if t1 > 1e-3 else [])
+            a.maneuvers.append(se.Maneuver(type="go_straight", duration=TAIL_S,
+                                           intercept=v_end))
+            changed.add(a.id)
+        return changed
 
     def _keep_one_cut_in(self, sc, states) -> None:
         """Only the holder changes lanes. Background cars never plan a lane
